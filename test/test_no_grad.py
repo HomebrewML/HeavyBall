@@ -1,12 +1,13 @@
 from typing import List
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import set_torch, clean
 from torch import nn
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, set_torch
 
 
 class Param(nn.Module):
@@ -19,8 +20,15 @@ class Param(nn.Module):
 
 
 @pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size", [(4, 4, 4, 4), ])
-def test_closre(opt, size: List[int], depth: int = 2, iterations: int = 5, outer_iterations: int = 3):
+@pytest.mark.parametrize(
+    "size",
+    [
+        (4, 4, 4, 4),
+    ],
+)
+def test_closre(
+    opt, size: List[int], depth: int = 2, iterations: int = 5, outer_iterations: int = 3
+):
     clean()
     set_torch()
 

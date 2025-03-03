@@ -6,7 +6,7 @@ from torch._dynamo import config
 import heavyball
 import heavyball.utils
 from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, PSGDBase
+from heavyball.utils import PSGDBase, clean, set_torch
 
 config.cache_size_limit = 128
 
@@ -18,12 +18,12 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
 
     opt = getattr(heavyball, opt)
     if not issubclass(opt, PSGDBase):
-        raise pytest.skip('Only PSGD is supported')
+        raise pytest.skip("Only PSGD is supported")
 
     peaks = []
     losses = []
 
-    for q_dtype in ['float32', 'bfloat16']:
+    for q_dtype in ["float32", "bfloat16"]:
         torch.manual_seed(0x2131290)
         peaks.append([])
         losses.append([])
@@ -33,7 +33,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
             o = get_optim(opt, model.parameters(), lr=1e-3, q_dtype=q_dtype)
 
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda")).square().mean()
                 loss.backward()
                 o.step()
                 o.zero_grad()

@@ -1,19 +1,20 @@
 import copy
 import os
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch
 from torch import nn
 from torch._dynamo import config
-import torch._inductor.config as ind_cfg
 
-os.environ['TORCH_LOGS'] = '+recompiles'
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, set_torch
+
+os.environ["TORCH_LOGS"] = "+recompiles"
 
 config.cache_size_limit = 128
+
 
 @pytest.mark.parametrize("opt", heavyball.__all__)
 @pytest.mark.parametrize("size,depth", [(256, 1)])
@@ -25,7 +26,11 @@ def test_foreach(opt, size, depth: int, iterations: int = 512, outer_iterations:
     losses = []
 
     torch.manual_seed(0x123131)
-    model = nn.Sequential(*[nn.Linear(size, size, bias=False) for _ in range(depth)]).to(torch.double).cuda()
+    model = (
+        nn.Sequential(*[nn.Linear(size, size, bias=False) for _ in range(depth)])
+        .to(torch.double)
+        .cuda()
+    )
 
     for dtype in [torch.float32, torch.bfloat16]:
         torch.manual_seed(0x2131290)
@@ -37,7 +42,12 @@ def test_foreach(opt, size, depth: int, iterations: int = 512, outer_iterations:
             o = get_optim(opt, mdl.parameters(), lr=1e-4, update_clipping=None, warmup_steps=128)
             print(f"\n\n\n{dtype} {opt} {size} {depth}\n\n\n")
             for _ in range(iterations):
-                loss = mdl(torch.randn((1024, size), device='cuda', dtype=dtype)).double().abs().mean()
+                loss = (
+                    mdl(torch.randn((1024, size), device="cuda", dtype=dtype))
+                    .double()
+                    .abs()
+                    .mean()
+                )
                 loss.backward()
                 print(mdl[0].weight.double().norm().item())
                 o.step()

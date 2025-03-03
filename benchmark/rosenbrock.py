@@ -9,8 +9,7 @@ import typer
 from hyperopt import early_stop
 from torch import nn
 
-from benchmark.utils import Plotter
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import Plotter, loss_win_condition, trial
 from heavyball.utils import set_torch
 
 early_stop.no_progress_loss()
@@ -19,7 +18,7 @@ set_torch()
 
 
 def objective(x, y):
-    return (1 - x) ** 2 + 1 * (y - x ** 2) ** 2
+    return (1 - x) ** 2 + 1 * (y - x**2) ** 2
 
 
 class Model(nn.Module):
@@ -32,24 +31,31 @@ class Model(nn.Module):
 
 
 @app.command()
-def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to use (for SOAP)'),
-         dtype: List[str] = typer.Option(['float32'], help='Data type to use'), steps: int = 100,
-         weight_decay: float = 0, opt: List[str] = typer.Option(['ForeachSOAP'], help='Optimizers to use'),
-         show_image: bool = False, trials: int = 100, win_condition_multiplier: float = 1.0, ):
+def main(
+    method: List[str] = typer.Option(["qr"], help="Eigenvector method to use (for SOAP)"),
+    dtype: List[str] = typer.Option(["float32"], help="Data type to use"),
+    steps: int = 100,
+    weight_decay: float = 0,
+    opt: List[str] = typer.Option(["ForeachSOAP"], help="Optimizers to use"),
+    show_image: bool = False,
+    trials: int = 100,
+    win_condition_multiplier: float = 1.0,
+):
     dtype = [getattr(torch, d) for d in dtype]
     coords = (-7, -4)
 
     # Clean up old plots
-    for path in pathlib.Path('.').glob('rosenbrock.png'):
+    for path in pathlib.Path(".").glob("rosenbrock.png"):
         path.unlink()
 
     colors = list(matplotlib.colors.TABLEAU_COLORS.values())
-    stride = max(1, steps // 20)
     rng = random.Random(0x1239121)
     rng.shuffle(colors)
 
     if show_image:
-        model = Plotter(Model(coords), coords, x_limits=(-8, 2), y_limits=(-8, 2), should_normalize=True)
+        model = Plotter(
+            Model(coords), coords, x_limits=(-8, 2), y_limits=(-8, 2), should_normalize=True
+        )
     else:
         model = Model(coords)
     model.double()
@@ -57,15 +63,30 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
     def data():
         return None, None
 
-    model = trial(model, data, None, loss_win_condition(win_condition_multiplier * 1e-9 * (not show_image)), steps,
-                  opt[0], dtype[0], 1, 1, weight_decay, method[0], 1, 1, base_lr=1e-4, trials=trials,
-                  return_best=show_image)
+    model = trial(
+        model,
+        data,
+        None,
+        loss_win_condition(win_condition_multiplier * 1e-9 * (not show_image)),
+        steps,
+        opt[0],
+        dtype[0],
+        1,
+        1,
+        weight_decay,
+        method[0],
+        1,
+        1,
+        base_lr=1e-4,
+        trials=trials,
+        return_best=show_image,
+    )
 
     if not show_image:
         return
 
-    model.plot(save_path='rosenbrock.png')
+    model.plot(save_path="rosenbrock.png")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app()

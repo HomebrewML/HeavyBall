@@ -6,10 +6,9 @@ from torch._dynamo import config
 import heavyball
 import heavyball.utils
 from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, PSGDBase
+from heavyball.utils import PSGDBase, clean, set_torch
 
 config.cache_size_limit = 128
-
 
 
 @pytest.mark.parametrize("opt", heavyball.__all__)
@@ -17,13 +16,13 @@ config.cache_size_limit = 128
 def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations: int = 3):
     set_torch()
 
-    if 'soap' in opt.lower():
-        raise pytest.skip('soap is not supported')
+    if "soap" in opt.lower():
+        raise pytest.skip("soap is not supported")
 
     opt = getattr(heavyball, opt)
 
     if PSGDBase in opt.__mro__:
-        raise pytest.skip('PSGD is not supported')
+        raise pytest.skip("PSGD is not supported")
 
     peaks = []
     losses = []
@@ -40,7 +39,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
             o = get_optim(opt, model.parameters(), lr=1e-3, storage_dtype=dtype_name)
 
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda', dtype=dtype)).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda", dtype=dtype)).square().mean()
                 loss.backward()
                 o.step()
                 o.zero_grad()

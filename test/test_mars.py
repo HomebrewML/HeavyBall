@@ -1,11 +1,12 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, ScheduleFree
 from torch import nn
 from torch._dynamo import config
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import ScheduleFree, clean, set_torch
 
 config.cache_size_limit = 128
 
@@ -31,7 +32,7 @@ def test_mars(opt, size, depth: int, iterations: int = 16384, outer_iterations: 
             o = get_optim(opt, model.parameters(), lr=1e-5, mars=mars)
 
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda")).square().mean()
                 loss.backward()
                 o.step()
                 o.zero_grad()

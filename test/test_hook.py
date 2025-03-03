@@ -2,16 +2,17 @@ import os
 
 os.environ["TORCH_LOGS"] = "+recompiles"
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, hook_optimizer_into_model
 from torch import nn
 from torch._dynamo import config
 
-heavyball.utils.compile_mode = 'default'
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, hook_optimizer_into_model, set_torch
+
+heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
 
@@ -37,7 +38,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
             else:
                 o = get_optim(opt, model.parameters(), lr=1e-3, weight_decay=1e-4, warmup_steps=16)
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda")).square().mean()
                 loss.backward()
                 if not use_hook:
                     o.step()

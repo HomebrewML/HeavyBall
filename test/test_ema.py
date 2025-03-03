@@ -38,7 +38,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
             o = get_optim(opt, model.parameters(), lr=1e-3)
 
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda")).square().mean()
                 loss.backward()
                 o.step()
                 o.zero_grad()
@@ -50,7 +50,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 128, outer_iterations:
 
             if do_ema:
                 o.copy_emas_to_params()
-            loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+            loss = model(torch.randn((1024, size), device="cuda")).square().mean()
             losses[-1].append(loss.detach())
 
             del model, o

@@ -16,23 +16,27 @@ def get_memory():
     return torch.cuda.memory_allocated()
 
 
-expected_memory = {'adamw': {'after': 4, 'peak': 5.1}, 'soap': {'after': 7, 'peak': 14},
-                   'psgd': {'after': 4, 'peak': 11.5}, 'padam': {'after': 5, 'peak': 11.4}}
+expected_memory = {
+    "adamw": {"after": 4, "peak": 5.1},
+    "soap": {"after": 7, "peak": 14},
+    "psgd": {"after": 4, "peak": 11.5},
+    "padam": {"after": 5, "peak": 11.4},
+}
 
 
-@pytest.mark.parametrize("opt", ['ForeachPSGDKron'])
-@pytest.mark.parametrize("method", ['qr', 'newtonschulz2', 'svd', 'eigh'])
+@pytest.mark.parametrize("opt", ["ForeachPSGDKron"])
+@pytest.mark.parametrize("method", ["qr", "newtonschulz2", "svd", "eigh"])
 @pytest.mark.parametrize("size,depth", [(8192, 1), (2048, 16)])
 def test_memory(opt, method, size, depth: int, iterations: int = 5, outer_iterations: int = 3):
-    if 'soap' not in opt.lower() and method != 'qr':
-        raise pytest.skip('Only SOAP supports `method` argument')
+    if "soap" not in opt.lower() and method != "qr":
+        raise pytest.skip("Only SOAP supports `method` argument")
     set_torch()
 
     for k, v in expected_memory.items():
         if k in opt.lower():
             break
     else:
-        raise pytest.skip(f'Opt {opt} not supported')
+        raise pytest.skip(f"Opt {opt} not supported")
 
     opt = getattr(heavyball, opt)
     heavyball.utils.zeroth_power_mode = method
@@ -48,16 +52,16 @@ def test_memory(opt, method, size, depth: int, iterations: int = 5, outer_iterat
         model_allocated = get_memory()
         o = get_optim(opt, model.parameters(), lr=1e-3)
         for _ in range(iterations):
-            model(torch.randn((1, size), device='cuda')).sum().backward()
+            model(torch.randn((1, size), device="cuda")).sum().backward()
             o.step()
 
             opt_allocated = get_memory()
             o.zero_grad()
 
         del model, o
-        peak = torch.cuda.memory_stats()['allocated_bytes.all.peak']
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
-        print(f'Peak: {peak / model_allocated:.2f}x | Opt: {opt_allocated / model_allocated:.2f}x')
+        print(f"Peak: {peak / model_allocated:.2f}x | Opt: {opt_allocated / model_allocated:.2f}x")
         if i > 0:
-            assert peak / model_allocated < v['peak']
-            assert opt_allocated / model_allocated < v['after']
+            assert peak / model_allocated < v["peak"]
+            assert opt_allocated / model_allocated < v["after"]

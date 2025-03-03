@@ -10,12 +10,12 @@ Each test is tagged with categories describing specific optimization challenges:
   - Magnitude: Exploding/vanishing gradients
   - Quality: Weak/noisy/sparse/delayed signals
   - Direction: Adversarial/misleading patterns
-  
+
 - **Landscape Navigation**
   - Topology: Valleys, plateaus, saddle points
   - Complexity: Multimodality, nonconvexity
   - Dynamics: Moving targets, shifting optima
-  
+
 - **Numerical Challenges**
   - Conditioning: Ill-conditioned problems
   - Scaling: Parameter scale variations
@@ -40,7 +40,6 @@ Each test is tagged with categories describing specific optimization challenges:
 | Gradient Delay | Tests async update handling | Delayed Gradients & Async Updates | ✓ |
 | Gradient Noise Scale | Tests noise level adaptation | Variable Noise & Scaling | ✓ |
 | Grokking | Tests sudden learning after memorization | Phase Transitions & Memory | |
-| Ill-Conditioned | Tests poor conditioning optimization | Conditioning & Convergence | ✓ |
 | Layer-wise Scale | Tests multi-layer gradient scaling | Layer Variation & Balance | ✓ |
 | Loss Contour | Tests complex landscape navigation | Surface Complexity & Visualization | |
 | Momentum Utilization | Tests momentum in oscillating landscapes | Oscillations & Momentum | ✓ |

@@ -1,10 +1,11 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, PSGDBase
 from torch import nn
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import PSGDBase, clean, set_torch
 
 
 def get_memory():
@@ -45,7 +46,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 4096, outer_iterations
             clean()
 
             for _ in range(iterations):
-                loss = model(torch.randn((1, size), device='cuda')).sum()
+                loss = model(torch.randn((1, size), device="cuda")).sum()
                 loss.backward()
                 o.step()
                 o.zero_grad()
@@ -54,12 +55,14 @@ def test_foreach(opt, size, depth: int, iterations: int = 4096, outer_iterations
             del model, o
             clean()
 
-            peak = torch.cuda.memory_stats()['allocated_bytes.all.peak']
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
             if i > 0:
                 peaks[-1].append(peak)
 
     for p0, p1 in zip(*peaks):
         assert p0 > p1
-    for l0, l1 in zip(*losses):  # increase error tolerance for PSGD, as we have different RNGs -> expected differences
+    for l0, l1 in zip(
+        *losses
+    ):  # increase error tolerance for PSGD, as we have different RNGs -> expected differences
         assert torch.allclose(l0, l1, rtol=0.01 if isinstance(opt, PSGDBase) else 1e-5)

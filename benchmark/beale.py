@@ -1,19 +1,15 @@
-import copy
 import pathlib
 import random
-import time
 from typing import List
 
 import matplotlib.colors
-import matplotlib.pyplot as plt
 import torch
 import torch.backends.opt_einsum
 import typer
 from hyperopt import early_stop
-from benchmark.utils import Plotter
 from torch import nn
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import Plotter, loss_win_condition, trial
 from heavyball.utils import set_torch
 
 early_stop.no_progress_loss()
@@ -24,7 +20,7 @@ set_torch()
 def objective(x, y):
     x = x + 3
     y = y + 0.5
-    return (1.5 - x + x * y) ** 2 + (2.25 - x + x * y ** 2) ** 2 + (2.625 - x + x * y ** 3) ** 2
+    return (1.5 - x + x * y) ** 2 + (2.25 - x + x * y**2) ** 2 + (2.625 - x + x * y**3) ** 2
 
 
 class Model(nn.Module):
@@ -37,15 +33,21 @@ class Model(nn.Module):
 
 
 @app.command()
-def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to use (for SOAP)'),
-         dtype: List[str] = typer.Option(['float32'], help='Data type to use'), steps: int = 100,
-         weight_decay: float = 0, opt: List[str] = typer.Option(['ForeachSOAP'], help='Optimizers to use'),
-         show_image: bool = False, trials: int = 100, win_condition_multiplier: float = 1.0, ):
+def main(
+    method: List[str] = typer.Option(["qr"], help="Eigenvector method to use (for SOAP)"),
+    dtype: List[str] = typer.Option(["float32"], help="Data type to use"),
+    steps: int = 100,
+    weight_decay: float = 0,
+    opt: List[str] = typer.Option(["ForeachSOAP"], help="Optimizers to use"),
+    show_image: bool = False,
+    trials: int = 100,
+    win_condition_multiplier: float = 1.0,
+):
     dtype = [getattr(torch, d) for d in dtype]
     coords = (-7, -4)
 
     # Clean up old plots
-    for path in pathlib.Path('.').glob('beale.png'):
+    for path in pathlib.Path(".").glob("beale.png"):
         path.unlink()
 
     colors = list(matplotlib.colors.TABLEAU_COLORS.values())
@@ -61,16 +63,30 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
     def data():
         return None, None
 
-    model = trial(model, data, None, loss_win_condition(win_condition_multiplier * 1e-8 * (not show_image)), steps,
-                  opt[0], dtype[0], 1, 1, weight_decay, method[0], 1,  1, base_lr=1e-4, trials=trials,
-                  return_best=show_image)
+    model = trial(
+        model,
+        data,
+        None,
+        loss_win_condition(win_condition_multiplier * 1e-8 * (not show_image)),
+        steps,
+        opt[0],
+        dtype[0],
+        1,
+        1,
+        weight_decay,
+        method[0],
+        1,
+        1,
+        base_lr=1e-4,
+        trials=trials,
+        return_best=show_image,
+    )
 
     if not show_image:
         return
 
-    model.plot(save_path='beale.png')
+    model.plot(save_path="beale.png")
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app()

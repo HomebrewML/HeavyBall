@@ -1,15 +1,16 @@
 import os
 
-os.environ['TORCH_LOGS'] = '+recompiles'
+os.environ["TORCH_LOGS"] = "+recompiles"
+
+import pytest
+import torch
+from torch import nn
+from torch._dynamo import config
 
 import heavyball
 import heavyball.utils
-import pytest
-import torch
 from benchmark.utils import get_optim
 from heavyball.utils import clean, set_torch
-from torch import nn
-from torch._dynamo import config
 
 config.cache_size_limit = 128
 
@@ -32,7 +33,7 @@ def test_caution(opt, size, depth: int, iterations: int = 16, outer_iterations: 
             o = get_optim(opt, model.parameters(), lr=1e-5, caution=caution)
 
             for _ in range(iterations):
-                loss = model(torch.randn((1024, size), device='cuda')).square().mean()
+                loss = model(torch.randn((1024, size), device="cuda")).square().mean()
                 loss.backward()
                 o.step()
                 o.zero_grad()
