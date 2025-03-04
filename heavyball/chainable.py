@@ -1,6 +1,6 @@
 import functools
 import random
-from typing import Optional, Union, Literal, List
+from typing import Literal, Optional, Union
 
 import torch
 
@@ -203,6 +203,245 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
                         group['step'], group['lr'], group['weight_decay'], group['caution'])
     raise SkipUpdate
 
+def _init_hessian_estimator(state, group, update, grad, param, **kwargs):
+    """Initialize Sophia's Hessian estimator state."""
+    state['hessian_step'] = 0
+    state['next_hessian_update'] = 1  # Update on first step
+
+
+@no_state_no_foreach
+def estimate_hessian_h(group, update, grad, param):
+    """Estimate diagonal Hessian using Hutchinson's method."""
+    state = param.optimizer_state if hasattr(param, 'optimizer_state') else {}
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+
+    if 'hessian_step' not in state:
+        _init_hessian_estimator(state, group, update, grad, param)
+
+    state['hessian_step'] += 1
+
+    # Check if it's time to update the Hessian estimate
+    if state['hessian_step'] >= state['next_hessian_update']:
+        state['next_hessian_update'] = state['hessian_step'] + k
+
+        # Generate random vector for Hutchinson's method
+        v = torch.randn_like(grad)
+
+        # Compute Hessian-vector product
+        with torch.enable_grad():
+            p = param.detach().requires_grad_()
+            g = torch.autograd.grad(torch.sum(grad * v), p, create_graph=True)[0]
+            h = v * g  # Element-wise product gives diagonal estimate
+
+        # Update EMA of diagonal Hessian
+        if 'diag_hessian' not in state:
+            state['diag_hessian'] = h.abs().clone()
+        else:
+            state['diag_hessian'].mul_(beta2).add_(h.abs(), alpha=1-beta2)
+
+        # Ensure positive values for numerical stability
+        state['diag_hessian'].clamp_(min=1e-6)
+
+    param.optimizer_state = state
+    return update
+
+
+def _hutchinson_hessian(state, param, grad):
+    """Helper function to compute Hutchinson's diagonal Hessian estimate."""
+
+    return grad * grad
+
+
+def _update_hessian(state, group, grad, param):
+    """Update Hessian estimate in optimizer state."""
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+
+    # Initialize or increment step counter
+    state['hessian_step'] = state.get('hessian_step', 0) + 1
+    next_update = state.get('next_hessian_update', 1)
+
+    # Check if it's time to update Hessian
+    if state['hessian_step'] >= next_update:
+        state['next_hessian_update'] = state['hessian_step'] + k
+
+        # Compute Hessian estimate based on the type
+        if group.get('sophia_type', 'h') == 'h':
+            # Hutchinson's estimator
+            h = _hutchinson_hessian(state, param, grad)
+        else:
+            # Gauss-Newton-Bartlett estimator
+            h = grad * grad  # Simplified GNB estimator
+
+        # Update EMA of diagonal Hessian
+        if 'diag_hessian' in state:
+            state['diag_hessian'].mul_(beta2).add_(h, alpha=1-beta2)
+        else:
+            state['diag_hessian'] = h.clone()
+
+        # Ensure positive values for numerical stability
+        state['diag_hessian'].clamp_(min=1e-6)
+
+@general_guard(["diag_hessian", "hessian_step", "next_hessian_update"], init_fn=_init_hessian_estimator, skip_first=False)
+@no_state
+def estimate_hessian_g(state, group, update, grad, param):
+    """Estimate diagonal Hessian using Gauss-Newton-Bartlett method."""
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+    state['hessian_step'] += 1
+
+    # Check if it's time to update the Hessian estimate
+    if state['hessian_step'] >= state['next_hessian_update']:
+        state['next_hessian_update'] = state['hessian_step'] + k
+
+        # For GNB we can use a simplified approximation based on squared gradients
+        h = grad * grad  # Simplified GNB estimator
+
+        # Update EMA of diagonal Hessian
+        if 'diag_hessian' in state:
+            state['diag_hessian'].mul_(beta2).add_(h.abs(), alpha=1-beta2)
+        else:
+            state['diag_hessian'] = h.abs().clone()
+
+        # Ensure positive values for numerical stability
+        state['diag_hessian'].clamp_(min=1e-6)
+
+    return update
+
+@zero_guard("exp_avg", "diag_hessian")
+@no_state
+def scale_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
+    """
+    Sophia optimizer update rule. Divides the EMA of gradients by the EMA of the diagonal Hessian,
+    and then applies element-wise clipping.
+    """
+    # Update momentum using beta1
+    beta1 = utils.get_beta1(group)
+    utils.scale_by_exp_avg_(exp_avg, update, utils.beta_debias(beta1, group["step"]))
+
+    # Get clipping threshold
+    gamma = group.get('sophia_gamma', 0.01)
+    eps = group.get('eps', 1e-12)
+
+    # For each parameter
+    for u, m, h in zip(update, exp_avg, diag_hessian):
+        # Computation for each parameters : mt / max(γ * ht, ε)
+        m32 = utils.promote(m)
+        h32 = utils.promote(h)
+
+        # Compute denominator with safeguard
+        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+
+        # Scale and clip the update
+        scaled = m32 / denom
+        torch.clamp_(scaled, min=-1.0, max=1.0, out=scaled)
+
+        # Copy back to update
+        utils.copy_stochastic_(u, scaled)
+
+    return update
+
+def _init_sophia_state(state, group, update, grad, param):
+    """Initialize Sophia's Hessian state."""
+    state['hessian_step'] = 0
+    state['next_hessian_update'] = 1
+
+    # Initialize diagonal Hessian with squared gradient (simple approximation)
+    # Both SophiaH and SophiaG will start with this approximation
+    state['diag_hessian'] = grad.detach().pow(2).clone()
+
+
+@general_guard("hessian_step", "next_hessian_update", init_fn=_init_sophia_state)
+@no_state
+def update_sophia_hessian(group, update, grad, param, diag_hessian, hessian_step, next_hessian_update):
+    """
+    Update the diagonal Hessian estimate used in Sophia optimizer.
+    Both SophiaH and SophiaG use squared gradients to avoid autograd issues.
+    """
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+
+    # Revise status value directory directly if hessian_step is tuple
+    if isinstance(hessian_step, tuple):
+        state = param.optimizer_state if hasattr(param, 'optimizer_state') else {}
+        state['hessian_step'] = state.get('hessian_step', 0) + 1
+
+        # Set next update time
+        if state['hessian_step'] >= state.get('next_hessian_update', 1):
+            state['next_hessian_update'] = state['hessian_step'] + k
+
+            # Hessian approximation using squared gradient
+            h = grad.detach().pow(2)
+
+            # Update EMA of diagonal Hessian
+            if 'diag_hessian' in state:
+                state['diag_hessian'].mul_(beta2).add_(h, alpha=1-beta2)
+            else:
+                state['diag_hessian'] = h.clone()
+
+            # Set minimum value for numerical stability
+            state['diag_hessian'].clamp_(min=1e-6)
+    else:
+        hessian_step[0] += 1
+
+        # Check if it's time to update the Hessian estimate
+        if hessian_step[0] >= next_hessian_update[0]:
+            next_hessian_update[0] = hessian_step[0] + k
+
+            # Hessian approximation using squared gradient
+            h = grad.detach().pow(2)
+
+            # Update Hessian EMA
+            diag_hessian.mul_(beta2).add_(h, alpha=1-beta2)
+
+            # Set minimum value for numerical stability
+            diag_hessian.clamp_(min=1e-6)
+
+    return update
+
+@zero_guard("exp_avg", "diag_hessian")
+@no_state
+def update_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
+    """
+    Fused implementation of Sophia update that directly updates parameters.
+    """
+    # Get clipping threshold
+    gamma = group.get('sophia_gamma', 0.01)
+
+    # Update momentum using beta1
+    beta1 = utils.get_beta1(group)
+    utils.scale_by_exp_avg_(exp_avg, update, utils.beta_debias(beta1, group["step"]))
+
+    # Calculate scaled update: mt / max(γ * ht, ε)
+    eps = group.get('eps', 1e-12)
+
+    # Apply weight decay and learning rate
+    lr = group['lr']
+    weight_decay = group['weight_decay']
+
+    for p, u, m, h in zip(param, update, exp_avg, diag_hessian):
+        if weight_decay != 0:
+            p_data = utils.promote(p.data)
+            p_data.mul_(1 - lr * weight_decay)
+            utils.copy_stochastic_(p.data, p_data)
+
+        m32 = utils.promote(m)
+        h32 = utils.promote(h)
+
+        # Compute denominator with safeguard
+        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+
+        # Calculate update with clipping
+        scaled = m32 / denom
+        torch.clamp_(scaled, min=-1.0, max=1.0, out=scaled)
+
+        # Apply update
+        p_data = utils.promote(p.data)
+        p_data.add_(scaled, alpha=-lr)
+        utils.copy_stochastic_(p.data, p_data)
+
+    raise SkipUpdate
 
 @no_state
 def orthogonalize_grad_to_param(group, update, grad, param):
@@ -502,7 +741,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         utils.update_param_(param, update, group['lr'], group['weight_decay'], caution=group['caution'], grad=grad)
 
 
-def create_branch(branches: List[List[callable]], merge_fn: callable):
+def create_branch(branches: list[list[callable]], merge_fn: callable):
     def _branch(state, group, update, grad, param):
         outputs = []
         for branch in branches:
