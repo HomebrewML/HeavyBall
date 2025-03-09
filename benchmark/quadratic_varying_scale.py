@@ -1,11 +1,10 @@
-import itertools
 from typing import List
 
-import heavyball
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import typer
+
 from benchmark.utils import param_norm_win_condition, trial
 from heavyball.utils import set_torch
 

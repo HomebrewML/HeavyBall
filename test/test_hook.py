@@ -2,14 +2,15 @@ import os
 
 os.environ["TORCH_LOGS"] = "+recompiles"
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, hook_optimizer_into_model
 from torch import nn
 from torch._dynamo import config
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, hook_optimizer_into_model, set_torch
 
 heavyball.utils.compile_mode = 'default'
 config.cache_size_limit = 128

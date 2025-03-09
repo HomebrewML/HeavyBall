@@ -3,10 +3,9 @@ repos:
   rev: v0.9.9
   hooks:
     - id: ruff
+      args: [--fix]
       types_or: [python, jupyter]
-    - id: ruff-format
-      args: [--diff]
-      types_or: [python, jupyter]
+
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v5.0.0
   hooks:

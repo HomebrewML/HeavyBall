@@ -15,6 +15,7 @@ from typing import List
 import torch
 import torch.nn as nn
 import typer
+
 from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 

@@ -1,7 +1,6 @@
 import os
 from datetime import datetime
 
-import heavyball
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -12,6 +11,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import MNIST
 from torchvision.transforms import v2
 from torchvision.utils import make_grid
+
+import heavyball
 
 heavyball.utils.compile_mode = 'default'
 heavyball.utils.set_torch()

@@ -1,10 +1,11 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
+from torch import nn
+
+import heavyball
+import heavyball.utils
 from benchmark.utils import get_optim
 from heavyball.utils import clean, set_torch
-from torch import nn
 
 
 def get_memory():
@@ -62,5 +63,5 @@ def test_clip(opt, method, size, depth: int, iterations: int = 100, outer_iterat
 
         print(f'Peak: {peak / model_allocated:.2f}x | Opt: {opt_allocated / model_allocated:.2f}x')
         if i > 0:
-            assert peak / model_allocated < v['peak']
-            assert opt_allocated / model_allocated < v['after']
+            assert peak / model_allocated < v['peak'] # noqa : E722
+            assert opt_allocated / model_allocated < v['after'] # noqa : E722

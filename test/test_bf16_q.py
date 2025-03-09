@@ -6,7 +6,7 @@ from torch._dynamo import config
 import heavyball
 import heavyball.utils
 from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, PSGDBase
+from heavyball.utils import PSGDBase, clean, set_torch
 
 config.cache_size_limit = 128
 

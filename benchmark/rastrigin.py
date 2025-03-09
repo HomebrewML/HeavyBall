@@ -1,9 +1,7 @@
-import copy
+import math
 import pathlib
 import random
-import time
 from typing import List
-import math
 
 import matplotlib.colors
 import matplotlib.pyplot as plt
@@ -11,10 +9,10 @@ import torch
 import torch.backends.opt_einsum
 import typer
 from hyperopt import early_stop
-from utils import Plotter
 from torch import nn
+from utils import Plotter
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 early_stop.no_progress_loss()

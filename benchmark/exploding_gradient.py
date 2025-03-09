@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 import typer
 
-from heavyball.utils import set_torch
 from benchmark.utils import param_norm_win_condition, trial
+from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()
@@ -27,7 +27,7 @@ class ExplodingGradient(nn.Module):
         super().__init__()
         self.param = nn.Parameter(torch.randn(dim))
         self.scale = 5.0  # Controls how quickly gradients grow
-        
+
     def forward(self):
         # Creates exponentially growing gradients
         # Gradient will be scale * exp(|param|) * sign(param)
@@ -48,7 +48,7 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
 
     for args in itertools.product(method, dtype, [dim], opt, [weight_decay]):
         m, d, dim, o, wd = args
-        
+
         model = ExplodingGradient(dim)
 
         def data():

@@ -1,5 +1,3 @@
-import os
-import itertools
 from typing import List
 
 import torch
@@ -8,9 +6,8 @@ import torch.nn as nn
 import typer
 from torch.nn import functional as F
 
-import heavyball
-from heavyball.utils import set_torch
 from benchmark.utils import loss_win_condition, trial
+from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()

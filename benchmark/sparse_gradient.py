@@ -5,7 +5,7 @@ import torch.backends.opt_einsum
 import typer
 from torch import nn
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -25,7 +25,7 @@ class Model(nn.Module):
         new_mask = (torch.rand_like(self.param) < self.sparsity).float()
         mask = (new_mask + self.prev_mask) > 0  # Union of current and previous mask
         self.prev_mask.copy_(new_mask)
-        
+
         return (self.param * mask.float()).square().mean()
 
 

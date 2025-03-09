@@ -1,5 +1,3 @@
-import pathlib
-import random
 from typing import List
 
 import torch
@@ -7,7 +5,7 @@ import torch.backends.opt_einsum
 import typer
 from torch import nn
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)

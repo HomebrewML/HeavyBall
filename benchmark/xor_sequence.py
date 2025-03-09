@@ -1,14 +1,13 @@
-import itertools
 from typing import List
 
-import heavyball
 import torch
 import torch.backends.opt_einsum
 import torch.nn as nn
 import typer
+from torch.nn import functional as F
+
 from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
-from torch.nn import functional as F
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()

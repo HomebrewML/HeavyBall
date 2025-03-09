@@ -1,15 +1,15 @@
 import copy
 import os
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch
 from torch import nn
 from torch._dynamo import config
-import torch._inductor.config as ind_cfg
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, set_torch
 
 os.environ['TORCH_LOGS'] = '+recompiles'
 

@@ -6,7 +6,7 @@ import torch.backends.opt_einsum
 import typer
 from torch import nn
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -28,18 +28,18 @@ class Model(nn.Module):
         """Test optimizer's ability to handle delayed gradients."""
         total_loss = 0
         self.step += 1
-        
+
         for param, delay, queue in zip(self.params, self.delays, self.grad_queues):
             # Current loss for this parameter
             loss = param.square().mean()
-            
+
             # Store the gradient in the queue
             queue.append(loss)
-            
+
             # Only add to total loss when we have enough history
             if len(queue) == queue.maxlen and self.step % (delay + 1) == 0:
                 total_loss = total_loss + queue[0]  # Use oldest gradient
-                
+
         return total_loss / len(self.params)
 
 
