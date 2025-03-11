@@ -4,7 +4,7 @@ import math
 import random
 import string
 import warnings
-from typing import List, Optional, Tuple, Callable, Union
+from typing import Callable, Optional, Union
 from unittest.mock import patch
 
 import numpy as np
@@ -35,7 +35,6 @@ def decorator(func):
 
     @functools.wraps(func)
     def _fn(*args, **kwargs):
-        disable = compile_mode_recommended_to_none is None
         if is_compiling() or compile_mode_recommended_to_none is None:
             return func(*args, **kwargs)
         nonlocal compiled
@@ -65,8 +64,8 @@ einsum_base = string.ascii_lowercase
 
 
 @decorator_knowngood
-def _compilable_schedule_free_(p: List[Tensor], z: List[Tensor], ckp1: Tensor, update: List[Tensor], lr: Tensor,
-                               beta1: Tensor, decay: float, grad: List[Tensor], caution):
+def _compilable_schedule_free_(p: list[Tensor], z: list[Tensor], ckp1: Tensor, update: list[Tensor], lr: Tensor,
+                               beta1: Tensor, decay: float, grad: list[Tensor], caution):
     for op, oz, u_, g_ in zip(p, z, update, grad):
         u_ = u_.view_as(op)
         p_, z_, u_ = map(promote, (op, oz, u_))
@@ -81,8 +80,8 @@ def _compilable_schedule_free_(p: List[Tensor], z: List[Tensor], ckp1: Tensor, u
         copy_stochastic_(oz, z_)
 
 
-def schedule_free_(lr: float, weight_lr_power: float, weight_sum: float, beta1: float, parameters: List[Tensor],
-                   z: List[Tensor], update: List[Tensor], grad: List[Tensor], caution: bool = False, r: float = 0.0,
+def schedule_free_(lr: float, weight_lr_power: float, weight_sum: float, beta1: float, parameters: list[Tensor],
+                   z: list[Tensor], update: list[Tensor], grad: list[Tensor], caution: bool = False, r: float = 0.0,
                    step: int = 0, decay: float = 0.0):
     weight = abs(lr) ** weight_lr_power * max(step, 1) ** r
     weight_sum = weight_sum + weight
@@ -164,8 +163,8 @@ def eps_sqrt(item, eps):
 
 
 @decorator_knowngood
-def _compilable_exp_avg_sq_(state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor,
-                            out: List[Optional[Tensor]]):
+def _compilable_exp_avg_sq_(state: list[Tensor], grad: list[Tensor], beta2: Tensor, eps: Tensor,
+                            out: list[Optional[Tensor]]):
     g32 = promote(grad)
     s32 = _lerp(state, torch._foreach_mul(g32, g32), beta2)
 
@@ -185,7 +184,7 @@ def exp_avg_sq_(state, grad, beta2, eps, out=None):
 
 
 @decorator_knowngood
-def _compilable_scale_by_exp_avg_sq_(state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor):
+def _compilable_scale_by_exp_avg_sq_(state: list[Tensor], grad: list[Tensor], beta2: Tensor, eps: Tensor):
     g32 = promote(grad)
     denom = _compilable_exp_avg_sq_(state, g32, beta2, eps, [None])
     out = torch._foreach_div(g32, denom)
@@ -213,7 +212,7 @@ def scale_by_exp_avg_(state, grad, beta):
 
 
 @decorator_knowngood
-def _compilable_agc_(parameters: List[Tensor], gradients: List[Tensor], clip_val: float, minimum: float, eps: float):
+def _compilable_agc_(parameters: list[Tensor], gradients: list[Tensor], clip_val: float, minimum: float, eps: float):
     p32, g32 = [list(map(promote, x)) for x in (parameters, gradients)]
     p_norm = torch._foreach_norm(p32)
     g_norm = torch._foreach_norm(g32)
@@ -226,7 +225,7 @@ def _compilable_agc_(parameters: List[Tensor], gradients: List[Tensor], clip_val
     copy_stochastic_list_(gradients, g32)
 
 
-def adaptive_gradient_clipping_(parameters: List[Tensor], gradients: List[Tensor], clip_val: float,
+def adaptive_gradient_clipping_(parameters: list[Tensor], gradients: list[Tensor], clip_val: float,
                                 minimum: float = 1e-3, eps: float = 1e-8):
     if clip_val <= 0:
         return gradients
@@ -293,7 +292,7 @@ def ortho(x):
     if zeroth_power_mode == 'qr':
         return torch.linalg.qr(x).Q
     if zeroth_power_mode == 'svd':
-        u, s, v = torch.linalg.svd(x)
+        u, _s, v = torch.linalg.svd(x)
         return u @ v.T
     raise NotImplementedError(f"Unknown zeroth_power_mode: {zeroth_power_mode}")
 
@@ -356,7 +355,7 @@ def inplace_orthogonal_(x: Tensor, mode: str, out: Tensor, scale_mode: str):
     elif mode == 'qr':
         y = torch.linalg.qr(promote(x)).Q
     elif mode == 'svd':
-        u, s, v = torch.linalg.svd(promote(x))
+        u, _s, v = torch.linalg.svd(promote(x))
         y = u @ v.T
     else:
         raise NotImplementedError(f"Unknown zeroth_power_mode: {mode}")
@@ -377,7 +376,7 @@ def _compilable_scatter_set(target, source, index):
 
 
 # @decorator_knowngood
-def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], exp_avg: Optional[Tensor] = None):
+def get_orthogonal_matrix_QR(GG: list[Tensor], Q: list[Tensor], exp_avg: Optional[Tensor] = None):
     """
     Computes the eigenbases of the preconditioner using one round of power iteration
     followed by torch.linalg.qr decomposition, and updates exp_avg in-place from old to new eigenspace.
@@ -453,7 +452,7 @@ def get_orthogonal_matrix(mat, max_eps: float = 1e-3, min_eps: float = 1e-30):
         while True:
             try:
                 eye = torch.eye(m.shape[0], device=m.device, dtype=m.dtype)
-                eigval, eigvec = torch.linalg.eigh(m + eps * eye)
+                _eigval, eigvec = torch.linalg.eigh(m + eps * eye)
                 eigvec = eigvec.to(device=device, dtype=dtype)
                 break
             except torch.OutOfMemoryError:
@@ -478,7 +477,7 @@ def get_orthogonal_matrix(mat, max_eps: float = 1e-3, min_eps: float = 1e-30):
 
 
 @decorator_knowngood
-def _compilable_stochastic_lerp_(x: List[Tensor], y: List[Tensor], a: Union[float, int, Tensor]):
+def _compilable_stochastic_lerp_(x: list[Tensor], y: list[Tensor], a: Union[float, int, Tensor]):
     for x_, y_ in zip(x, y):
         x32 = promote(x_)
         y32 = promote(y_)
@@ -507,7 +506,7 @@ def get_beta2(group):
     raise ValueError("Beta2 not found in group.")
 
 
-def stochastic_lerp_(x: List[Tensor], y: List[Tensor], a: Union[float, int, Tensor]):
+def stochastic_lerp_(x: list[Tensor], y: list[Tensor], a: Union[float, int, Tensor]):
     x, y = list_guard(x, y)
     a = scalar_guard(a, x[0])
     _compilable_stochastic_lerp_(x, y, a)
@@ -541,28 +540,28 @@ def scalar_guard(*args):
 
 
 @decorator_knowngood
-def _compilable_stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor]):
+def _compilable_stochastic_add_(x: list[Tensor], y: list[Tensor], alpha: Union[float, int, Tensor]):
     for x_, y_ in zip(x, y):
         x32 = promote(x_)
         y32 = promote(y_)
         copy_stochastic_(x_, x32 + y32 * alpha)
 
 
-def stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor] = 1):
+def stochastic_add_(x: list[Tensor], y: list[Tensor], alpha: Union[float, int, Tensor] = 1):
     x, y = list_guard(x, y)
     alpha = scalar_guard(alpha, x[0])
     _compilable_stochastic_add_(x, y, alpha)
 
 
 @decorator_knowngood
-def _compilable_stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
+def _compilable_stochastic_multiply_(x: list[Tensor], y: list[Tensor]):
     for x_, y_ in zip(x, y):
         x32 = promote(x_)
         y32 = promote(y_)
         copy_stochastic_(x_, x32 * y32)
 
 
-def stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
+def stochastic_multiply_(x: list[Tensor], y: list[Tensor]):
     x, y = list_guard(x, y)
     _compilable_stochastic_multiply_(x, y)
 
@@ -602,7 +601,7 @@ def promote(x):
     return x
 
 
-def min_dtype(xs: List[Tensor]):
+def min_dtype(xs: list[Tensor]):
     dtypes = [x.dtype for x in xs]
     for d in (torch.float32, torch.bfloat16, torch.float16):
         if all(x in (d, torch.float32, torch.float64) for x in dtypes):
@@ -875,13 +874,13 @@ class StatefulOptimizer(torch.optim.Optimizer):
         return loss
 
 
-def copy_stochastic_list_(target: List[Tensor], source: List[Tensor]):
+def copy_stochastic_list_(target: list[Tensor], source: list[Tensor]):
     for t, s in zip(target, source):
         copy_stochastic_(t, s)
 
 
 @decorator_knowngood
-def _lerp(state: List[Tensor], grad: List[Tensor], beta):
+def _lerp(state: list[Tensor], grad: list[Tensor], beta):
     ea32 = list(map(promote, state))
     grad = list(map(promote, grad))
     beta = promote(beta)
@@ -891,7 +890,7 @@ def _lerp(state: List[Tensor], grad: List[Tensor], beta):
 
 
 @decorator_knowngood
-def _compilable_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: Tensor, beta2: Tensor,
+def _compilable_adam_(exp_avg: list[Tensor], exp_avg_sq: list[Tensor], grad: list[Tensor], beta1: Tensor, beta2: Tensor,
                       step: Tensor, eps: Tensor):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
@@ -903,7 +902,7 @@ def _compilable_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: Lis
     copy_stochastic_list_(grad, u32)
 
 
-def adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: float, beta2: float, step: int,
+def adam_(exp_avg: list[Tensor], exp_avg_sq: list[Tensor], grad: list[Tensor], beta1: float, beta2: float, step: int,
           eps: float = 1e-8):
     exp_avg, exp_avg_sq, grad = map(list_guard, (exp_avg, exp_avg_sq, grad))
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
@@ -912,8 +911,8 @@ def adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], b
 
 
 @decorator_knowngood
-def _fused_compilable_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-                            grad: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, decay: Tensor, lr: Tensor,
+def _fused_compilable_adam_(y: list[Tensor], exp_avg: list[Tensor], exp_avg_sq: list[Tensor], update: list[Tensor],
+                            grad: list[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, decay: Tensor, lr: Tensor,
                             eps: Tensor, caution: bool):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
@@ -925,8 +924,8 @@ def _fused_compilable_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: 
     _compilable_update_(y, u32, decay, lr, caution, g32)
 
 
-def fused_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-                grad: List[Tensor], beta1: float, beta2: float, step: int, lr: float, eps: float, decay: float,
+def fused_adam_(y: list[Tensor], exp_avg: list[Tensor], exp_avg_sq: list[Tensor], update: list[Tensor],
+                grad: list[Tensor], beta1: float, beta2: float, step: int, lr: float, eps: float, decay: float,
                 caution: bool):
     y, exp_avg, exp_avg_sq, grad = list_guard(y, exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, lr = scalar_guard(beta1, beta2, step, lr, y[0])
@@ -934,7 +933,7 @@ def fused_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor]
 
 
 @decorator_knowngood
-def _compilable_laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: Tensor,
+def _compilable_laprop_(exp_avg: list[Tensor], exp_avg_sq: list[Tensor], grad: list[Tensor], beta1: Tensor,
                         beta2: Tensor, step: Tensor, eps: Tensor):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
@@ -946,7 +945,7 @@ def _compilable_laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: L
     copy_stochastic_list_(grad, gp32)
 
 
-def laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: float, beta2: float, step: int,
+def laprop_(exp_avg: list[Tensor], exp_avg_sq: list[Tensor], grad: list[Tensor], beta1: float, beta2: float, step: int,
             eps: float = 1e-8):
     exp_avg, exp_avg_sq, grad = list_guard(exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
@@ -955,8 +954,8 @@ def laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor],
 
 
 @decorator_knowngood
-def _fused_compilable_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-                              grad: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, lr: Tensor, decay: Tensor,
+def _fused_compilable_laprop_(y: list[Tensor], exp_avg: list[Tensor], exp_avg_sq: list[Tensor], update: list[Tensor],
+                              grad: list[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, lr: Tensor, decay: Tensor,
                               caution: bool, eps: Tensor):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
@@ -968,8 +967,8 @@ def _fused_compilable_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq
     _compilable_update_(y, u32, decay, lr, caution, gp32)
 
 
-def fused_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-                  grad: List[Tensor], beta1: float, beta2: float, step: int, lr: float, decay: float, caution: bool,
+def fused_laprop_(y: list[Tensor], exp_avg: list[Tensor], exp_avg_sq: list[Tensor], update: list[Tensor],
+                  grad: list[Tensor], beta1: float, beta2: float, step: int, lr: float, decay: float, caution: bool,
                   eps: float = 1e-8):
     exp_avg, exp_avg_sq, grad, y = list_guard(exp_avg, exp_avg_sq, grad, y)
     beta1, beta2, step, lr, eps = scalar_guard(beta1, beta2, step, lr, eps, exp_avg[0])
@@ -978,7 +977,7 @@ def fused_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tenso
 
 @decorator_knowngood
 def _fused_compilable_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution):
-    u32, g32, exp_avg_sq32, exp_avg32 = [list(map(promote, x)) for x in [update, grad, exp_avg_sq, exp_avg]]
+    u32, g32, exp_avg_sq32, _exp_avg32 = [list(map(promote, x)) for x in [update, grad, exp_avg_sq, exp_avg]]
     _compilable_update_(y, u32, decay, lr, caution, g32)
 
     beta1 = beta_debias(beta1, step)
@@ -997,7 +996,7 @@ def fused_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, e
 
 @decorator_knowngood
 def _compilable_adopt_(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps):
-    g32, exp_avg32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, exp_avg, exp_avg_sq]]
+    g32, _exp_avg32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, exp_avg, exp_avg_sq]]
     update = [e.clone() for e in exp_avg]
 
     beta1 = beta_debias(beta1, step)
@@ -1016,7 +1015,7 @@ def adopt(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps: float = 1e-8):
     return grad
 
 
-def stochastic_round_list_(ref: List[Tensor], source: List[Tensor]):
+def stochastic_round_list_(ref: list[Tensor], source: list[Tensor]):
     return [stochastic_round_(r, s) for r, s in zip(ref, source)]
 
 
@@ -1044,8 +1043,8 @@ def copy_stochastic_(target: Tensor, source: Tensor):
 
 
 @decorator_knowngood
-def _compilable_update_(p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Tensor, caution: bool,
-                        g: List[Optional[Tensor]]):
+def _compilable_update_(p: list[Tensor], u: list[Tensor], decay: Tensor, lr: Tensor, caution: bool,
+                        g: list[Optional[Tensor]]):
     for u_, g_, p_ in zip(u, g, p):  # lr is data-dependent -> can't compile a foreach
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
@@ -1055,8 +1054,8 @@ def _compilable_update_(p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Ten
         copy_stochastic_(p_, p32_)
 
 
-def update_param_(param: List[Tensor], update: List[Tensor], lr: float, decay: float, caution: bool = False,
-                  grad: List[Tensor] = None):
+def update_param_(param: list[Tensor], update: list[Tensor], lr: float, decay: float, caution: bool = False,
+                  grad: list[Tensor] = None):
     param, update, grad = list_guard(param, update, grad)
     lr = scalar_guard(lr, param[0])
     if not caution:
@@ -1082,7 +1081,7 @@ def get_soap_precond_schedule(precond_scheduler):
     return _inner
 
 
-def _max_idx(x: List[int]):
+def _max_idx(x: list[int]):
     return len(x) - 1 - np.argmax(x[::-1])  # we want to start counting from the back, as torch is fan-out/fan-in
 
 
@@ -1357,7 +1356,7 @@ def l1_weight_decay_to_ema_(p, ema, ema_decay, weight_decay):
 
 
 @decorator_knowngood
-def _compilable_sign_(grad: List[Tensor], graft: bool):
+def _compilable_sign_(grad: list[Tensor], graft: bool):
     for g_ in grad:
         gs = g_.sign()
         if graft:
@@ -1365,7 +1364,7 @@ def _compilable_sign_(grad: List[Tensor], graft: bool):
         copy_stochastic_(g_, gs)
 
 
-def sign_(grad: List[Tensor], graft: bool = True):
+def sign_(grad: list[Tensor], graft: bool = True):
     grad = list_guard(grad)
     _compilable_sign_(grad, graft)
     return grad
@@ -1392,8 +1391,65 @@ def trust_region_clip_(grad, lerp=0.9, scale=1.5):
     return grad
 
 
+@decorator_knowngood
+def _compilable_group_update_norm_(updates: list[Tensor], params: list[Tensor], eps: Tensor):
+    """
+    Applies grouped update normalization as described in the AdaLomo paper.
+
+    For each parameter, scales the update by the RMS of the parameter
+    divided by the RMS of the update, clamping to ensure stability.
+
+    Args:
+        updates: List of parameter updates
+        params: List of parameters
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized updates
+    """
+    u32 = list(map(promote, updates))
+    p32 = list(map(promote, params))
+
+    for u, p in zip(u32, p32):
+        # Calculate RMS values
+        u_rms = torch.sqrt(torch.mean(u * u))
+        p_rms = torch.sqrt(torch.mean(p * p))
+
+        # Calculate scaling factor:
+        # û_{t,i} = u_{t,i}/max(1, RMS(u_{t,i})) × max(ε, RMS(θ_{t-1,i}))
+        scale = torch.max(torch.tensor(1.0, device=u.device, dtype=u.dtype), u_rms)
+        norm_factor = torch.max(eps, p_rms)
+
+        # Apply normalization
+        u.div_(scale).mul_(norm_factor)
+
+    copy_stochastic_list_(updates, u32)
+    return updates
+
+
+def group_update_norm_(updates: list[Tensor], params: list[Tensor], eps: float = 1e-8):
+    """
+    Wrapper for compilable group update normalization.
+
+    This function normalizes updates with respect to parameter scale to stabilize training.
+    It is especially useful when training large language models, where gradient magnitudes
+    can vary significantly across layers.
+
+    Args:
+        updates: List of parameter updates
+        params: List of parameters
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized updates
+    """
+    updates, params = list_guard(updates, params)
+    eps = scalar_guard(eps, updates[0])
+    return _compilable_group_update_norm_(updates, params, eps)
+
+
 @decorator
-def triu_to_line(Q_list: List[Tensor]):
+def triu_to_line(Q_list: list[Tensor]):
     out = []
     for q in Q_list:
         if q.dim() < 2:
@@ -1410,7 +1466,7 @@ def _triu_shape(numel):
 
 
 @decorator
-def line_to_triu(Q_list: List[Tuple[Optional[List[int]], Tensor]]):
+def line_to_triu(Q_list: list[tuple[Optional[list[int]], Tensor]]):
     new = []
     for shape, q in Q_list:
         if shape is not None:
@@ -1511,7 +1567,7 @@ def mars_correction(g, old_g, beta1, gamma):
 
 
 @decorator_knowngood
-def _compilable_orthogonalization(weight: List[Tensor], grad: List[Tensor], eps: Tensor, graft: bool = True):
+def _compilable_orthogonalization(weight: list[Tensor], grad: list[Tensor], eps: Tensor, graft: bool = True):
     """
     Implements OrthoGrad from "Grokking at the Edge of Numerical Stability" (https://arxiv.org/abs/2501.04697)
     """
