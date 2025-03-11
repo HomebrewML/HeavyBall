@@ -10,12 +10,12 @@ Each test is tagged with categories describing specific optimization challenges:
   - Magnitude: Exploding/vanishing gradients
   - Quality: Weak/noisy/sparse/delayed signals
   - Direction: Adversarial/misleading patterns
-  
+
 - **Landscape Navigation**
   - Topology: Valleys, plateaus, saddle points
   - Complexity: Multimodality, nonconvexity
   - Dynamics: Moving targets, shifting optima
-  
+
 - **Numerical Challenges**
   - Conditioning: Ill-conditioned problems
   - Scaling: Parameter scale variations

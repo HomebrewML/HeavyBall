@@ -3,10 +3,11 @@ from typing import List
 import torch
 import torch.backends.opt_einsum
 import typer
-from benchmark.utils import trial, param_norm_win_condition
-from heavyball.utils import set_torch
 from torch import nn
 from torch.nn import functional as F
+
+from benchmark.utils import param_norm_win_condition, trial
+from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()

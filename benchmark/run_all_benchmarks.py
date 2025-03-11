@@ -21,10 +21,10 @@ def last_match(pattern, text):
 def run_benchmark(script, opt, steps, dtype, trials):
     base = {'name': script.replace('.py', ''), 'opt': opt}
 
-    import sys
     import io
-    import time
     import pathlib
+    import sys
+    import time
 
     sys.path.append(str(pathlib.Path(__file__).parent.resolve()))
     stdout = sys.stdout
@@ -46,7 +46,7 @@ def run_benchmark(script, opt, steps, dtype, trials):
         }
         # Run the main function
         module.main(**arguments)
-    except Exception as e:
+    except Exception:
         output = sys.stdout.getvalue()
         error = traceback.format_exc()
     else:
@@ -191,7 +191,7 @@ def main(opt: list[str] = typer.Option([], help='Optimizers'), steps: int = 100_
                         'error': str(exc),
                     }
                 result_queue.put(result)
-            except:
+            except: # noqa E722
                 break
 
     # Start worker processes

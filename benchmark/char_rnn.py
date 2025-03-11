@@ -1,5 +1,3 @@
-import datetime
-import os
 from pathlib import Path
 from typing import List
 
@@ -9,9 +7,8 @@ import torch.nn as nn
 import typer
 from torch.nn import functional as F
 
-import heavyball
-from heavyball.utils import set_torch
 from benchmark.utils import loss_win_condition, trial
+from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()
@@ -60,7 +57,7 @@ def main(
     chars = torch.frombuffer(text, dtype=torch.uint8).cuda().long()
 
     # Create holdout set
-    holdout = chars[:(sequence + 1) * batch].view(batch, sequence + 1)
+    _holdout = chars[:(sequence + 1) * batch].view(batch, sequence + 1)
     chars = chars[(sequence + 1) * batch:]
     offsets = torch.arange(0, sequence + 1, device='cuda').repeat(batch, 1)
 

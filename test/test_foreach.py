@@ -1,10 +1,11 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, PSGDBase
 from torch import nn
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import PSGDBase, clean, set_torch
 
 
 def get_memory():

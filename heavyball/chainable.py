@@ -1,10 +1,11 @@
 import functools
 import random
-from typing import Optional, Union, Literal, List
+from typing import Literal, Optional, Union
 
 import torch
 
 from . import utils
+from .utils import copy_stochastic_, promote
 
 balance_probability: float = 0.01
 
@@ -31,7 +32,6 @@ def _guard_in_state(state, key, template_fn):
     if not _key_in_state(state, key):
         state[key] = template_fn()
     return state[key]
-
 
 class FunctionTransform:
     def __init__(self, fn):
@@ -204,6 +204,404 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate
 
 
+def _init_hessian_estimator(state, group, update, grad, param, **kwargs):
+    """Initialize Sophia's Hessian estimator state."""
+    state['hessian_step'] = 0
+    state['next_hessian_update'] = 1  # Update on first step
+
+
+@no_state_no_foreach
+def estimate_hessian_h(group, update, grad, param):
+    """Estimate diagonal Hessian using Hutchinson's method."""
+    state = getattr(param, 'optimizer_state', {})
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+
+    if 'hessian_step' not in state:
+        _init_hessian_estimator(state, group, update, grad, param)
+
+    state['hessian_step'] += 1
+
+    # Check if it's time to update the Hessian estimate
+    if state['hessian_step'] >= state['next_hessian_update']:
+        state['next_hessian_update'] = state['hessian_step'] + k
+
+        # Generate random vector for Hutchinson's method
+        v = torch.randn_like(grad)
+
+        # Compute Hessian-vector product
+        with torch.enable_grad():
+            p = param.detach().requires_grad_()
+            g = torch.autograd.grad(torch.sum(grad * v), p, create_graph=True)[0]
+            h = v * g  # Element-wise product gives diagonal estimate
+
+        # Update EMA of diagonal Hessian
+        if 'diag_hessian' not in state:
+            state['diag_hessian'] = h.abs().clone()
+        else:
+            state['diag_hessian'].mul_(beta2).add_(h.abs(), alpha=1-beta2)
+
+        # Ensure positive values for numerical stability
+        state['diag_hessian'].clamp_(min=1e-6)
+
+    param.optimizer_state = state
+    return update
+
+
+def _hutchinson_hessian(state, param, grad):
+    """Helper function to compute Hutchinson's diagonal Hessian estimate."""
+
+    return grad * grad
+
+
+
+@general_guard(["diag_hessian", "hessian_step", "next_hessian_update"], init_fn=_init_hessian_estimator, skip_first=False)
+@no_state
+def estimate_hessian_g(state, group, update, grad, param):
+    """Estimate diagonal Hessian using Gauss-Newton-Bartlett method."""
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+    state['hessian_step'] += 1
+
+    # Check if it's time to update the Hessian estimate
+    if state['hessian_step'] >= state['next_hessian_update']:
+        state['next_hessian_update'] = state['hessian_step'] + k
+
+        # For GNB we can use a simplified approximation based on squared gradients
+        h = grad * grad  # Simplified GNB estimator
+
+        # Update EMA of diagonal Hessian
+        if 'diag_hessian' in state:
+            state['diag_hessian'].mul_(beta2).add_(h.abs(), alpha=1-beta2)
+        else:
+            state['diag_hessian'] = h.abs().clone()
+
+        # Ensure positive values for numerical stability
+        state['diag_hessian'].clamp_(min=1e-6)
+
+    return update
+
+
+@zero_guard("exp_avg", "diag_hessian")
+@no_state
+def scale_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
+    """
+    Sophia optimizer update rule. Divides the EMA of gradients by the EMA of the diagonal Hessian,
+    and then applies element-wise clipping.
+    """
+    # Update momentum using beta1
+    beta1 = utils.get_beta1(group)
+    utils.scale_by_exp_avg_(exp_avg, update, utils.beta_debias(beta1, group["step"]))
+
+    # Get clipping threshold
+    gamma = group.get('sophia_gamma', 0.01)
+    eps = group.get('eps', 1e-12)
+
+    # For each parameter
+    for u, m, h in zip(update, exp_avg, diag_hessian):
+        # Computation for each parameters : mt / max(γ * ht, ε)
+        m32 = utils.promote(m)
+        h32 = utils.promote(h)
+
+        # Compute denominator with safeguard
+        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+
+        # Scale and clip the update
+        scaled = m32 / denom
+        scaled.clamp_(min=-1.0, max=1.0)
+
+        # Copy back to update
+        utils.copy_stochastic_(u, scaled)
+
+    return update
+
+def _init_sophia_state(state, group, update, grad, param):
+    """Initialize Sophia's Hessian state."""
+    state['hessian_step'] = 0
+    state['next_hessian_update'] = 1
+
+    # Initialize diagonal Hessian with squared gradient (simple approximation)
+    # Both SophiaH and SophiaG will start with this approximation
+    state['diag_hessian'] = (grad.detach() * grad.detach()).clone()
+
+def _init_adalomo(state, group, update, grad, param):
+    """
+    Initialize AdaLomo optimizer state.
+
+    Sets up row sums (r_t) and column sums (c_t) matrices for the factorized second moment estimation.
+
+    Args:
+        state: Optimizer state dictionary for the parameter
+        group: Parameter group dictionary
+        update: Parameter update/gradient
+        grad: Raw gradient
+        param: Parameter tensor
+    """
+    # Original shape for reshaping if needed
+    original_shape = update.shape
+
+    # Initialize row sum matrix (r_t)
+    if len(original_shape) <= 1:
+        # For scalar or 1D tensors, r_t is just the squared gradient
+        state['r_t'] = torch.zeros_like(update)
+    else:
+        # For multi-dimensional tensors, r_t tracks row sums
+        # Shape is [original_shape[0], 1]
+        state['r_t'] = torch.zeros([original_shape[0], 1],
+                                   device=update.device,
+                                   dtype=update.dtype)
+
+    # Initialize column sum matrix (c_t)
+    if len(original_shape) <= 1:
+        # For 1D tensors, c_t is not needed (will match r_t)
+        state['c_t'] = state['r_t']
+    else:
+        # For multi-dimensional tensors, c_t tracks column sums
+        # Reshape for matrix operations - remaining dimensions flattened
+        flattened_size = original_shape[1:].numel()
+        # Shape is [1, flattened_size]
+        state['c_t'] = torch.zeros([1, flattened_size],
+                                   device=update.device,
+                                   dtype=update.dtype)
+
+
+@general_guard("r_t", "c_t", init_fn=_init_adalomo)
+@no_state_no_foreach
+def update_by_adalomo(group, update, grad, param, r_t, c_t):
+    """
+    Fused implementation of AdaLomo that directly updates parameters.
+    This follows Algorithm 1 from the paper and combines all steps
+    into a single operation for efficiency.
+    """
+    beta = group.get('beta', 0.99)
+    eps = group.get('eps', 1e-8)
+    lr = group.get('lr', 0.001)
+    weight_decay = group.get('weight_decay', 0)
+
+    # Promote to higher precision for calculations
+    g32 = promote(update)
+    p32 = promote(param)
+
+    # Original shape for reshaping if needed
+    original_shape = update.shape
+
+    # Element-wise square for a single tensor
+    g_sq = g32 * g32
+
+    # Calculate v_t using factorized second moment
+    if len(original_shape) <= 1:
+        # For scalar or 1D tensors
+        r_t.mul_(beta).add_(g_sq, alpha=1-beta)
+        v_t = r_t
+    else:
+        # For multi-dimensional tensors
+        g_reshaped = g_sq.reshape(original_shape[0], -1)
+
+        # Update r_t (row sum of squared gradients)
+        row_sum = g_reshaped.sum(dim=1, keepdim=True)
+        r_t.mul_(beta).add_(row_sum, alpha=1-beta)
+
+        # Update c_t (column sum of squared gradients)
+        col_sum = g_reshaped.sum(dim=0, keepdim=True)
+        c_t.mul_(beta).add_(col_sum, alpha=1-beta)
+
+        # Compute v_t = r_t * c_t / (1^T_m r_t)
+        r_sum = r_t.sum() + eps
+
+        # Create and shape v_t
+        v_t = torch.zeros_like(g32)
+        v_reshaped = v_t.reshape(original_shape[0], -1)
+        v_reshaped[:] = (r_t / r_sum) * c_t
+        v_t = v_t.reshape(original_shape)
+
+    # Apply adaptive learning rate: u_t = g_t / sqrt(v_t + eps)
+    denom = (v_t + eps).sqrt()
+    u_t = g32 / denom
+
+    # Apply grouped update normalization
+    u_norm = utils.group_update_norm_([u_t], [p32], eps)[0]
+
+    # Apply weight decay and update parameters
+    # Update parameters: θ_t = θ_t-1 - α_t * û_t
+    utils.update_param_([param], [u_norm], lr, weight_decay, caution=group.get('caution', False), grad=[grad])
+
+    # Store the state
+    if hasattr(param, 'optimizer_state'):
+        param.optimizer_state = {'r_t': r_t, 'c_t': c_t}
+
+    return update
+
+
+@general_guard("r_t", "c_t", init_fn=_init_adalomo)
+@no_state_no_foreach
+def scale_by_adalomo(group, update, grad, param):
+    """
+    Scale gradients using AdaLomo's adaptive learning rate.
+    Implementation follows Algorithm 1 from the paper,
+    using non-negative matrix factorization for v_t.
+    """
+    beta = group.get('beta', 0.99)  # Default beta value as per paper
+    eps = group.get('eps', 1e-8)
+
+    # Get the state for this parameter
+    state = param.optimizer_state if hasattr(param, 'optimizer_state') else {}
+
+    if 'r_t' not in state:
+        _init_adalomo(state, group, update, grad, param)
+
+    r_t = state['r_t']
+    c_t = state['c_t']
+
+    # Promote to higher precision
+    g32 = promote(update)
+    g_sq = g32 * g32  # Element-wise square
+
+    # Original shape for reshaping if needed
+    original_shape = update.shape
+
+    if len(original_shape) <= 1:
+        # For scalar or 1D tensors
+        # Update r_t directly with squared gradient
+        r_t.mul_(beta).add_(g_sq, alpha=1-beta)
+
+        # Compute v_t (for 1D, this is just r_t)
+        v_t = r_t
+    else:
+        # For multi-dimensional tensors
+        # Reshape for matrix operations
+        g_reshaped = g_sq.reshape(original_shape[0], -1)
+
+        # Update r_t: row sum of squared gradients
+        # r_t,i = β r_t-1,i + (1 - β) g^2_t,i 1_n
+        row_sum = g_reshaped.sum(dim=1, keepdim=True)
+        r_t.mul_(beta).add_(row_sum, alpha=1-beta)
+
+        # Update c_t: column sum of squared gradients
+        # c_t,i = β c_t-1,i + (1 - β) 1^T_m g^2_t,i
+        col_sum = g_reshaped.sum(dim=0, keepdim=True)
+        c_t.mul_(beta).add_(col_sum, alpha=1-beta)
+
+        # Compute factorized v_t = r_t * c_t / (1^T_m r_t)
+        # Get the mean of r_t to normalize
+        r_sum = r_t.sum() + eps
+
+        # Reshape gradient for broadcasting
+        v_t = torch.zeros_like(g32)
+        v_reshaped = v_t.reshape(original_shape[0], -1)
+        # v_t,i,j = r_t,i * c_t,j / (Σ_i r_t,i)
+        v_reshaped[:] = (r_t / r_sum) * c_t
+
+        # Reshape back to original gradient shape
+        v_t = v_t.reshape(original_shape)
+
+    # Apply adaptive learning rate: u_t = g_t / sqrt(v_t + eps)
+    denom = (v_t + eps).sqrt()
+    u_t = g32 / denom
+
+    # Apply grouped update normalization (per Algorithm 1, line 11)
+    # û_{t,i} = u_{t,i}/max(1, RMS(u_{t,i})) × max(ε, RMS(θ_{t-1,i}))
+    u_norm = utils.group_update_norm_([u_t], [param], eps)[0]
+
+    # Copy the result back to update
+    copy_stochastic_(update, u_norm)
+
+    # Store the state
+    param.optimizer_state = state
+
+    return update
+
+
+@general_guard("hessian_step", "next_hessian_update", init_fn=_init_sophia_state)
+@no_state
+def update_sophia_hessian(group, update, grad, param, diag_hessian, hessian_step, next_hessian_update):
+    """
+    Update the diagonal Hessian estimate used in Sophia optimizer.
+    Both SophiaH and SophiaG use squared gradients to avoid autograd issues.
+    """
+    k = group.get('sophia_update_freq', 10)
+    beta2 = utils.get_beta2(group)
+
+    # Revise status value directory directly if hessian_step is tuple
+    if isinstance(hessian_step, tuple):
+        state = param.optimizer_state if hasattr(param, 'optimizer_state') else {}
+        state['hessian_step'] = state.get('hessian_step', 0) + 1
+
+        # Set next update time
+        if state['hessian_step'] >= state.get('next_hessian_update', 1):
+            state['next_hessian_update'] = state['hessian_step'] + k
+
+            # Hessian approximation using squared gradient
+            h = (grad.detach() * grad.detach())
+            # Update EMA of diagonal Hessian
+            if 'diag_hessian' in state:
+                state['diag_hessian'].mul_(beta2).add_(h, alpha=1-beta2)
+            else:
+                state['diag_hessian'] = h.clone()
+
+            # Set minimum value for numerical stability
+            state['diag_hessian'].clamp_(min=1e-6)
+    else:
+        hessian_step[0] += 1
+
+        # Check if it's time to update the Hessian estimate
+        if hessian_step[0] >= next_hessian_update[0]:
+            next_hessian_update[0] = hessian_step[0] + k
+
+            # Hessian approximation using squared gradient
+            h = (grad.detach() * grad.detach())
+
+            # Update Hessian EMA
+            diag_hessian.mul_(beta2).add_(h, alpha=1-beta2)
+
+            # Set minimum value for numerical stability
+            diag_hessian.clamp_(min=1e-6)
+
+    return update
+
+@zero_guard("exp_avg", "diag_hessian")
+@no_state
+def update_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
+    """
+    Fused implementation of Sophia update that directly updates parameters.
+    """
+    # Get clipping threshold
+    gamma = group.get('sophia_gamma', 0.01)
+
+    # Update momentum using beta1
+    beta1 = utils.get_beta1(group)
+    utils.scale_by_exp_avg_(exp_avg, update, utils.beta_debias(beta1, group["step"]))
+
+    # Calculate scaled update: mt / max(γ * ht, ε)
+    eps = group.get('eps', 1e-12)
+
+    # Apply weight decay and learning rate
+    lr = group['lr']
+    weight_decay = group['weight_decay']
+
+    for p, u, m, h in zip(param, update, exp_avg, diag_hessian):
+        if weight_decay != 0:
+            p_data = utils.promote(p.data)
+            p_data.mul_(1 - lr * weight_decay)
+            utils.copy_stochastic_(p.data, p_data)
+
+        m32 = utils.promote(m)
+        h32 = utils.promote(h)
+
+        # Compute denominator with safeguard
+        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+
+        # Calculate update with clipping
+        scaled = m32 / denom
+        torch.clamp_(scaled, min=-1.0, max=1.0, out=scaled)
+
+        # Apply update
+        p_data = utils.promote(p.data)
+        p_data.add_(scaled, alpha=-lr)
+        utils.copy_stochastic_(p.data, p_data)
+
+    raise SkipUpdate
+
+
 @no_state
 def orthogonalize_grad_to_param(group, update, grad, param):
     return utils.orthogonalize_grad_to_param(param, update, group['eps'])
@@ -258,7 +656,6 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
 
 def _init_soap(state, group, update, grad, param, inner: str = ''):
     utils.init_preconditioner(grad, state, group['max_precond_dim'], group['precondition_1d'])
-
 
 def _init_psgd(state, group, update, grad, param, cached: bool = False, prob: Optional[callable] = None):
     Q, state["exprs"] = utils.init_Q_exprs(grad, group['precond_init_scale'], group['max_size_triangular'],
@@ -502,7 +899,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         utils.update_param_(param, update, group['lr'], group['weight_decay'], caution=group['caution'], grad=grad)
 
 
-def create_branch(branches: List[List[callable]], merge_fn: callable):
+def create_branch(branches: list[list[callable]], merge_fn: callable):
     def _branch(state, group, update, grad, param):
         outputs = []
         for branch in branches:

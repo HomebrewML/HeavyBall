@@ -1,3 +1,4 @@
+import math
 import pathlib
 import random
 from typing import List
@@ -6,11 +7,10 @@ import matplotlib.colors
 import torch
 import torch.backends.opt_einsum
 import typer
-from utils import Plotter
 from torch import nn
-import math
+from utils import Plotter
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -45,9 +45,9 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
     for path in pathlib.Path('.').glob('plateau_navigation.png'):
         path.unlink()
 
-    img = None
+    _img = None
     colors = list(matplotlib.colors.TABLEAU_COLORS.values())
-    stride = max(1, steps // 20)
+    _stride = max(1, steps // 20)
     rng = random.Random(0x1239121)
     rng.shuffle(colors)
 

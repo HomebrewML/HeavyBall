@@ -1,12 +1,13 @@
 from typing import List
 
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import set_torch, clean
 from torch import nn
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import clean, set_torch
 
 
 class Param(nn.Module):
@@ -31,7 +32,7 @@ def test_closure(opt, size: List[int], depth: int = 2, iterations: int = 5, oute
         model = nn.Sequential(*[Param(size) for _ in range(depth)]).cuda()
         o = get_optim(opt, model.parameters(), lr=1e-3)
 
-        def _closure():
+        def _closure(model=model):
             loss = model(torch.randn((1, size[0]), device='cuda')).sum()
             loss.backward()
             return loss
