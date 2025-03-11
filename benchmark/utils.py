@@ -6,16 +6,15 @@ import random
 import sys
 import time
 import warnings
-from datetime import datetime
-from multiprocessing import Value
 from typing import Union
 
-import heavyball.utils
 import hyperopt
 import numpy as np
 import torch
 from torch import nn
 from torch._dynamo import config
+
+import heavyball.utils
 
 config.cache_size_limit = 2 ** 16
 
@@ -73,7 +72,7 @@ class Validator:
         self.ema_states = torch.zeros((self.emas,), dtype=torch.float64, device='cuda')
         es = self.ema_start + 1
         self.update_factor = 2.0 ** (-torch.arange(es, 20 + es, dtype=torch.float64, device='cuda'))
-        self.ema_failures = FailureCounter(ema_mapping);
+        self.ema_failures = FailureCounter(ema_mapping)
         self.triu_indices = torch.triu_indices(self.emas, self.emas, offset=1)
 
         self.global_min_loss = torch.tensor((float('inf'),) * steps, dtype=torch.float64, device='cuda')
@@ -177,7 +176,7 @@ class Plotter(nn.Module):
 
     def plot(self, title=None, save_path=None):
         """Create contour plot with optimization trajectory.
-        
+
         Args:
             title: Optional title for the plot
             save_path: Optional path to save the plot

@@ -125,7 +125,7 @@ def get_orthogonal_matrix(mat):
             continue
         try:
             _, Q = torch.linalg.eigh(m + 1e-30 * torch.eye(m.shape[0], device=m.device))
-        except:
+        except Exception:
             _, Q = torch.linalg.eigh(m.to(torch.float64) + 1e-30 * torch.eye(m.shape[0], device=m.device))
             Q = Q.to(m.dtype)
         Q = torch.flip(Q, [1])
@@ -237,7 +237,7 @@ _size = 16
 @pytest.mark.parametrize('beta', [0.5, 0.9, 0.99])
 @torch.no_grad()
 def test_init(size, max_precond, merge_dims, precondition_1d, beta):
-    grad, ref_state, new_state = _init(size, max_precond, merge_dims, precondition_1d, beta)
+    _grad, ref_state, new_state = _init(size, max_precond, merge_dims, precondition_1d, beta)
     _check(ref_state, new_state)
 
 
@@ -260,7 +260,7 @@ def test_ggt(size, max_precond, merge_dims, precondition_1d, beta, iterations: i
 @pytest.mark.parametrize('beta', [0.5, 0.9, 0.99])
 @torch.no_grad()
 def test_update(size, max_precond, merge_dims, precondition_1d, beta, iterations: int = 5):
-    for grad, ref_state, new_state in _updated(size, max_precond, merge_dims, precondition_1d, beta, iterations):
+    for _grad, ref_state, new_state in _updated(size, max_precond, merge_dims, precondition_1d, beta, iterations):
         _check(ref_state, new_state)
 
 

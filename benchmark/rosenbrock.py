@@ -9,8 +9,7 @@ import typer
 from hyperopt import early_stop
 from torch import nn
 
-from benchmark.utils import Plotter
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import Plotter, loss_win_condition, trial
 from heavyball.utils import set_torch
 
 early_stop.no_progress_loss()
@@ -44,7 +43,7 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
         path.unlink()
 
     colors = list(matplotlib.colors.TABLEAU_COLORS.values())
-    stride = max(1, steps // 20)
+#    stride = max(1, steps // 20)
     rng = random.Random(0x1239121)
     rng.shuffle(colors)
 

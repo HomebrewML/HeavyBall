@@ -5,7 +5,7 @@ import torch.backends.opt_einsum
 import typer
 from torch import nn
 
-from benchmark.utils import trial, loss_win_condition
+from benchmark.utils import loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -24,7 +24,7 @@ class Model(nn.Module):
         """Test optimizer's ability to handle different gradient scales across layers."""
         # Each layer contributes equally to the loss but has very different scales
         return (self.layer1.square().mean() * 1e-3 +
-                self.layer2.square().mean() + 
+                self.layer2.square().mean() +
                 self.layer3.square().mean() * 1e3) / 3
 
 

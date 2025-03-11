@@ -6,10 +6,11 @@ import matplotlib.colors
 import torch
 import torch.backends.opt_einsum
 import typer
-from benchmark.utils import trial, param0_win_condition
-from heavyball.utils import set_torch
 from torch import nn
 from utils import Plotter
+
+from benchmark.utils import param0_win_condition, trial
+from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
 set_torch()
@@ -42,9 +43,7 @@ def main(method: List[str] = typer.Option(['qr'], help='Eigenvector method to us
     for path in pathlib.Path('.').glob('saddle_point.png'):
         path.unlink()
 
-    img = None
     colors = list(matplotlib.colors.TABLEAU_COLORS.values())
-    stride = max(1, steps // 20)
     rng = random.Random(0x1239121)
     rng.shuffle(colors)
 

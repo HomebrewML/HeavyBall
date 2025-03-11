@@ -7,7 +7,7 @@ from torch import nn
 import heavyball
 import heavyball.utils
 from benchmark.utils import get_optim
-from heavyball.utils import set_torch, clean
+from heavyball.utils import clean, set_torch
 
 
 class Param(nn.Module):

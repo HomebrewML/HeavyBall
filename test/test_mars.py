@@ -1,11 +1,12 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
-from benchmark.utils import get_optim
-from heavyball.utils import clean, set_torch, ScheduleFree
 from torch import nn
 from torch._dynamo import config
+
+import heavyball
+import heavyball.utils
+from benchmark.utils import get_optim
+from heavyball.utils import ScheduleFree, clean, set_torch
 
 config.cache_size_limit = 128
 

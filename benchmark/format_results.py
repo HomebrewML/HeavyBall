@@ -1,14 +1,10 @@
-import colorsys
 import re
-from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import typer
-from matplotlib.colors import LinearSegmentedColormap, to_rgba
-from matplotlib.patches import Rectangle, FancyBboxPatch
+from matplotlib.patches import Rectangle
 
 
 def parse_loss(loss_str):
@@ -139,7 +135,7 @@ def create_visual_matrix(success_matrix, attempts_matrix, runtime_matrix, loss_m
         row_runtime = runtime_matrix.loc[idx]
 
         # Find best performer (successful with minimum attempts, then minimum runtime)
-        successful_mask = row_success == True
+        successful_mask = row_success
         if successful_mask.any():
             min_attempts = row_attempts[successful_mask].min()
             min_attempts_mask = (row_attempts == min_attempts) & successful_mask
@@ -159,7 +155,7 @@ def create_visual_matrix(success_matrix, attempts_matrix, runtime_matrix, loss_m
             attempts = attempts_matrix.iloc[i, j]
             runtime = runtime_matrix.iloc[i, j]
             normalized = normalized_attempts.iloc[i, j]
-            is_best = best_performers.iloc[i, j] == True
+            is_best = best_performers.iloc[i, j]
 
             # Get cell color
             color = get_color_for_cell(normalized, success, is_best)
@@ -219,7 +215,7 @@ def create_visual_matrix(success_matrix, attempts_matrix, runtime_matrix, loss_m
             normalized_data = data  # Already normalized for percentages
 
         # Plot bars
-        bars = ax.barh(range(len(data)), data.values, color=[cmap(x) for x in normalized_data])
+        _bars = ax.barh(range(len(data)), data.values, color=[cmap(x) for x in normalized_data])
 
         # Add value labels
         for i, v in enumerate(data.values):
@@ -287,7 +283,7 @@ def main(file: str = 'benchmark_results.md'):
     success_matrix, attempts_matrix, runtime_matrix, loss_matrix = create_result_matrix(df)
 
     # Create the enhanced visual matrix
-    fig = create_visual_matrix(success_matrix, attempts_matrix, runtime_matrix, loss_matrix)
+    _fig = create_visual_matrix(success_matrix, attempts_matrix, runtime_matrix, loss_matrix)
 
     # Save with high quality
     plt.savefig('benchmark_matrix.png', dpi=300, bbox_inches='tight', facecolor='white', pad_inches=0.5)

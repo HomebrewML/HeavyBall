@@ -1,10 +1,11 @@
-import heavyball
-import heavyball.utils
 import pytest
 import torch
+from torch import nn
+
+import heavyball
+import heavyball.utils
 from benchmark.utils import get_optim
 from heavyball.utils import clean, set_torch
-from torch import nn
 
 
 def get_memory():
@@ -24,6 +25,7 @@ def test_clip(opt, method, size, depth: int, iterations: int = 100, outer_iterat
     set_torch()
 
     opt = getattr(heavyball, opt)
+    v = {'peak': float('inf'), 'after': float('inf')}
 
     for i in range(outer_iterations):
         model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
@@ -64,3 +66,5 @@ def test_clip(opt, method, size, depth: int, iterations: int = 100, outer_iterat
         if i > 0:
             assert peak / model_allocated < v['peak']
             assert opt_allocated / model_allocated < v['after']
+
+        v = {'peak': peak / model_allocated, 'after': opt_allocated / model_allocated}
