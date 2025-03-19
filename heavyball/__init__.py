@@ -560,6 +560,7 @@ Muon = ForeachMuon
 SignLaProp = ForeachSignLaProp
 SophiaH = SophiaH
 SophiaG = SophiaH
+AdaLomo = ForeachAdaLomo
 
 
 __all__ = ["Muon", "RMSprop", "PrecondSchedulePaLMSOAP", "PSGDKron", "PurePSGD", "DelayedPSGD", "CachedPSGDKron",
@@ -568,4 +569,5 @@ __all__ = ["Muon", "RMSprop", "PrecondSchedulePaLMSOAP", "PSGDKron", "PurePSGD",
            "ForeachAdamW", "ForeachSFAdamW",
            "ForeachLaProp", "ForeachADOPT", "ForeachSOAP", "ForeachPSGDKron", "ForeachPurePSGD", "ForeachDelayedPSGD",
            "ForeachCachedPSGDKron", "ForeachCachedDelayedPSGDKron", "ForeachRMSprop", "ForeachMuon",
-           'ForeachCachedNewtonPSGD', 'OrthoLaProp', 'LaPropOrtho', 'SignLaProp', "SophiaH", "SophiaG"]
+           'ForeachCachedNewtonPSGD', 'OrthoLaProp', 'LaPropOrtho', 'SignLaProp', "SophiaH", "SophiaG",
+           "ForeachAdaLomo", "AdaLomo"]

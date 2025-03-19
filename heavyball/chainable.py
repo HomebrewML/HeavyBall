@@ -304,7 +304,7 @@ def scale_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
         h32 = utils.promote(h)
 
         # Compute denominator with safeguard
-        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+        denom = (gamma * h32).clamp(min=eps)
 
         # Scale and clip the update
         scaled = m32 / denom
