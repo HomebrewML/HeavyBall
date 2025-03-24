@@ -5,7 +5,7 @@ from typing import Literal, Optional, Union
 import torch
 
 from . import utils
-from .utils import copy_stochastic_, promote
+from .utils import decorator_knowngood, modify_closure
 
 balance_probability: float = 0.01
 
@@ -231,8 +231,8 @@ def estimate_hessian_h(group, update, grad, param):
 
         # Compute Hessian-vector product
         with torch.enable_grad():
-            p = param.detach().requires_grad_()
-            g = torch.autograd.grad(torch.sum(grad * v), p, create_graph=True)[0]
+            loss = modify_closure(lambda: torch.sum(grad * v))
+            g = torch.autograd.grad(loss, param, create_graph=True)[0]
             h = v * g  # Element-wise product gives diagonal estimate
 
         # Update EMA of diagonal Hessian
@@ -364,155 +364,74 @@ def _init_adalomo(state, group, update, grad, param):
                                    device=update.device,
                                    dtype=update.dtype)
 
+def _adalomo_factorized_v_t(update, state, beta, eps):
+    """
+    Computes v_t using AdaLomo's factorized second moment estimation.
+    This function is shared by both scale_by_adalomo and update_by_adalomo.
+    """
+    original_shape = update.shape
+
+    if len(original_shape) <= 1:
+        # Scalar or 1D case
+        state['r_t'].mul_(beta).add_(update * update, alpha=1 - beta)
+        return state['r_t']
+    else:
+        # Multi-dimensional case
+        g_sq = update * update
+        g_reshaped = g_sq.reshape(original_shape[0], -1)
+
+        row_sum = g_reshaped.sum(dim=1, keepdim=True)
+        state['r_t'].mul_(beta).add_(row_sum, alpha=1 - beta)
+
+        col_sum = g_reshaped.sum(dim=0, keepdim=True)
+        state['c_t'].mul_(beta).add_(col_sum, alpha=1 - beta)
+
+        r_sum = state['r_t'].sum() + eps
+        v_t = (state['r_t'] / r_sum) * state['c_t']
+        return v_t.reshape(original_shape)
 
 @general_guard("r_t", "c_t", init_fn=_init_adalomo)
 @no_state_no_foreach
 def update_by_adalomo(group, update, grad, param, r_t, c_t):
     """
-    Fused implementation of AdaLomo that directly updates parameters.
-    This follows Algorithm 1 from the paper and combines all steps
-    into a single operation for efficiency.
+    Fused AdaLomo update with parameter modification.
     """
     beta = group.get('beta', 0.99)
     eps = group.get('eps', 1e-8)
     lr = group.get('lr', 0.001)
     weight_decay = group.get('weight_decay', 0)
 
-    # Promote to higher precision for calculations
-    g32 = promote(update)
-    p32 = promote(param)
+    state = {'r_t': r_t, 'c_t': c_t}
+    v_t = _adalomo_factorized_v_t(update, state, beta, eps)
 
-    # Original shape for reshaping if needed
-    original_shape = update.shape
-
-    # Element-wise square for a single tensor
-    g_sq = g32 * g32
-
-    # Calculate v_t using factorized second moment
-    if len(original_shape) <= 1:
-        # For scalar or 1D tensors
-        r_t.mul_(beta).add_(g_sq, alpha=1-beta)
-        v_t = r_t
-    else:
-        # For multi-dimensional tensors
-        g_reshaped = g_sq.reshape(original_shape[0], -1)
-
-        # Update r_t (row sum of squared gradients)
-        row_sum = g_reshaped.sum(dim=1, keepdim=True)
-        r_t.mul_(beta).add_(row_sum, alpha=1-beta)
-
-        # Update c_t (column sum of squared gradients)
-        col_sum = g_reshaped.sum(dim=0, keepdim=True)
-        c_t.mul_(beta).add_(col_sum, alpha=1-beta)
-
-        # Compute v_t = r_t * c_t / (1^T_m r_t)
-        r_sum = r_t.sum() + eps
-
-        # Create and shape v_t
-        v_t = torch.zeros_like(g32)
-        v_reshaped = v_t.reshape(original_shape[0], -1)
-        v_reshaped[:] = (r_t / r_sum) * c_t
-        v_t = v_t.reshape(original_shape)
-
-    # Apply adaptive learning rate: u_t = g_t / sqrt(v_t + eps)
+    # Compute adaptive learning rate update
     denom = (v_t + eps).sqrt()
-    u_t = g32 / denom
-
-    # Apply grouped update normalization
-    u_norm = utils.group_update_norm_([u_t], [p32], eps)[0]
+    u_t = update / denom
+    u_norm = utils.group_update_norm_([u_t], [param], eps)[0]
 
     # Apply weight decay and update parameters
-    # Update parameters: θ_t = θ_t-1 - α_t * û_t
     utils.update_param_([param], [u_norm], lr, weight_decay, caution=group.get('caution', False), grad=[grad])
-
-    # Store the state
-    if hasattr(param, 'optimizer_state'):
-        param.optimizer_state = {'r_t': r_t, 'c_t': c_t}
 
     return update
 
 
 @general_guard("r_t", "c_t", init_fn=_init_adalomo)
 @no_state_no_foreach
-def scale_by_adalomo(group, update, grad, param):
+def scale_by_adalomo(group, update, grad, param, r_t, c_t):
     """
     Scale gradients using AdaLomo's adaptive learning rate.
-    Implementation follows Algorithm 1 from the paper,
-    using non-negative matrix factorization for v_t.
+    Uses factorized second moment estimation.
     """
-    beta = group.get('beta', 0.99)  # Default beta value as per paper
+    beta = group.get('beta', 0.99)
     eps = group.get('eps', 1e-8)
 
-    # Get the state for this parameter
-    state = param.optimizer_state if hasattr(param, 'optimizer_state') else {}
+    state = {'r_t': r_t, 'c_t': c_t}
+    v_t = _adalomo_factorized_v_t(update, state, beta, eps)
 
-    if 'r_t' not in state:
-        _init_adalomo(state, group, update, grad, param)
-
-    r_t = state['r_t']
-    c_t = state['c_t']
-
-    # Promote to higher precision
-    g32 = promote(update)
-    g_sq = g32 * g32  # Element-wise square
-
-    # Original shape for reshaping if needed
-    original_shape = update.shape
-
-    if len(original_shape) <= 1:
-        # For scalar or 1D tensors
-        # Update r_t directly with squared gradient
-        r_t.mul_(beta).add_(g_sq, alpha=1-beta)
-
-        # Compute v_t (for 1D, this is just r_t)
-        v_t = r_t
-    else:
-        # For multi-dimensional tensors
-        # Reshape for matrix operations
-        g_reshaped = g_sq.reshape(original_shape[0], -1)
-
-        # Update r_t: row sum of squared gradients
-        # r_t,i = β r_t-1,i + (1 - β) g^2_t,i 1_n
-        row_sum = g_reshaped.sum(dim=1, keepdim=True)
-        r_t.mul_(beta).add_(row_sum, alpha=1-beta)
-
-        # Update c_t: column sum of squared gradients
-        # c_t,i = β c_t-1,i + (1 - β) 1^T_m g^2_t,i
-        col_sum = g_reshaped.sum(dim=0, keepdim=True)
-        c_t.mul_(beta).add_(col_sum, alpha=1-beta)
-
-        # Compute factorized v_t = r_t * c_t / (1^T_m r_t)
-        # Get the mean of r_t to normalize
-        r_sum = r_t.sum() + eps
-
-        # Reshape gradient for broadcasting
-        v_t = torch.zeros_like(g32)
-        v_reshaped = v_t.reshape(original_shape[0], -1)
-        # v_t,i,j = r_t,i * c_t,j / (Σ_i r_t,i)
-        v_reshaped[:] = (r_t / r_sum) * c_t
-
-        # Reshape back to original gradient shape
-        v_t = v_t.reshape(original_shape)
-
-    # Apply adaptive learning rate: u_t = g_t / sqrt(v_t + eps)
+    # Compute adaptive update
     denom = (v_t + eps).sqrt()
-    u_t = g32 / denom
-
-    # Apply grouped update normalization (per Algorithm 1, line 11)
-    # û_{t,i} = u_{t,i}/max(1, RMS(u_{t,i})) × max(ε, RMS(θ_{t-1,i}))
-    u_rms = torch.sqrt(torch.mean(u_t * u_t))
-    param_rms = torch.sqrt(torch.mean(param * param))
-
-    scale_factor = u_rms.clamp(min=1.0)
-    norm_factor = param_rms.clamp(min=eps)
-
-    u_norm = u_t / scale_factor * norm_factor
-
-    # Copy the result back to update
-    copy_stochastic_(update, u_norm)
-
-    # Store the state
-    param.optimizer_state = state
+    u_t = update / denom
+    utils.copy_stochastic_(update, u_t)  # Ensure safe copy
 
     return update
 
@@ -566,6 +485,7 @@ def update_sophia_hessian(group, update, grad, param, diag_hessian, hessian_step
 
 @zero_guard("exp_avg", "diag_hessian")
 @no_state
+@decorator_knowngood
 def update_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
     """
     Fused implementation of Sophia update that directly updates parameters.
@@ -594,18 +514,16 @@ def update_by_sophia(group, update, grad, param, exp_avg, diag_hessian):
         h32 = utils.promote(h)
 
         # Compute denominator with safeguard
-        denom = torch.maximum(gamma * h32, torch.tensor(eps, device=h32.device, dtype=h32.dtype))
+        denom = (gamma * h32).clamp(min=eps)
 
         # Calculate update with clipping
         scaled = m32 / denom
-        torch.clamp_(scaled, min=-1.0, max=1.0, out=scaled)
+        scaled.clamp_(min=-1.0, max=1.0)
 
         # Apply update
-        p_data = utils.promote(p.data)
-        p_data.add_(scaled, alpha=-lr)
-        utils.copy_stochastic_(p.data, p_data)
+        utils.copy_stochastic_(u, scaled)
 
-    raise SkipUpdate
+    return update
 
 
 @no_state
