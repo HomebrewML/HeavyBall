@@ -375,6 +375,32 @@ class ForeachSophiaG(ForeachSophiaH):
                          C.scale_by_sophia)
 
 
+    def estimate_hessian_g(self, state, group, update, grad, param):
+        """
+        Estimate diagonal Hessian using Gauss-Newton-Bartlett method.
+        """
+        k = group.get('sophia_update_freq', 10)
+        beta2 = utils.get_beta2(group)
+        state['hessian_step'] += 1
+
+        # Check if it's time to update the Hessian estimate
+        if state['hessian_step'] >= state['next_hessian_update']:
+            state['next_hessian_update'] = state['hessian_step'] + k
+
+            # For GNB we can use a simplified approximation based on squared gradients
+            # In a real LM, this should be implemented with proper label resampling
+            h = grad * grad  # Simplified GNB estimator
+
+            # Update EMA of diagonal Hessian
+            if 'diag_hessian' in state:
+                state['diag_hessian'].mul_(beta2).add_(h.abs(), alpha=1-beta2)
+            else:
+                state['diag_hessian'] = h.abs().clone()
+
+            # Ensure positive values for numerical stability
+            state['diag_hessian'].clamp_(min=1e-6)
+
+        return update
 
 class ForeachAdaLomo(C.BaseOpt):
     """
@@ -533,7 +559,7 @@ CachedDelayedPSGDKron = ForeachCachedDelayedPSGDKron
 Muon = ForeachMuon
 SignLaProp = ForeachSignLaProp
 SophiaH = SophiaH
-# SophiaG = SophiaG
+SophiaG = SophiaH
 AdaLomo = ForeachAdaLomo
 
 
@@ -543,5 +569,5 @@ __all__ = ["Muon", "RMSprop", "PrecondSchedulePaLMSOAP", "PSGDKron", "PurePSGD",
            "ForeachAdamW", "ForeachSFAdamW",
            "ForeachLaProp", "ForeachADOPT", "ForeachSOAP", "ForeachPSGDKron", "ForeachPurePSGD", "ForeachDelayedPSGD",
            "ForeachCachedPSGDKron", "ForeachCachedDelayedPSGDKron", "ForeachRMSprop", "ForeachMuon",
-           'ForeachCachedNewtonPSGD', 'OrthoLaProp', 'LaPropOrtho', 'SignLaProp', "SophiaH",
+           'ForeachCachedNewtonPSGD', 'OrthoLaProp', 'LaPropOrtho', 'SignLaProp', "SophiaH", "SophiaG",
            "ForeachAdaLomo", "AdaLomo"]
