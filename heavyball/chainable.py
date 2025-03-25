@@ -97,12 +97,20 @@ class GeneralGuard(FunctionTransform):  # We can't guard against reuse in the ge
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         vars = []
         skip_update = False
+        # Note: The logic here assumes fn operates per-parameter due to loop structure
         for p, g, u in zip(param, grad, update):
             st = state(p)
+            # Initialize state if keys are missing for the current parameter p
             skip_update |= _inplace_guard_(st, self.names, lambda: self.init_fn(st, group, u, g, p, **kwargs))
+            # Collect state variables for the current parameter p
             vars.append([st[name] if isinstance(name, str) else st.get(name[0], name[1]) for name in self.names])
+
         if skip_update and self.skip_first:
             raise SkipUpdate
+
+        # Call the wrapped function with collected state variables (transposed)
+        # The original function fn will receive state variables corresponding to each parameter
+        # E.g., if names = ["U", "V"], it receives (*args, all_U_values, all_V_values, **kwargs)
         return self.fn(state, group, update, grad, param, *args, *zip(*vars), **kwargs)
 
 
@@ -115,14 +123,25 @@ class NoStateNoForeach(FunctionTransform):
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         updates = []
         skip_update = False
-        for a in zip(update, grad, param, *args):
+        # Iterate through individual parameters/gradients/updates
+        for idx, single_param in enumerate(param):
+            single_update = update[idx]
+            single_grad = grad[idx]
+            single_args = [a[idx] for a in args]  # Assuming args are lists aligned with params
             try:
-                updates.append(self.fn(group, *a, **kwargs))
+                # Pass the state dictionary specific to this parameter
+                param_state = state(single_param)
+                # Call the function with individual items + unpacked state vars
+                result = self.fn(group, single_update, single_grad, single_param, *single_args, **param_state, **kwargs)
+                updates.append(result)
             except SkipUpdate:
                 skip_update = True
+                # If fused, the update was already done. No need to append anything.
                 pass
-        if skip_update:
+        if skip_update and not updates:  # If all updates were skipped (likely fused)
             raise SkipUpdate
+        elif skip_update and updates:  # Should not happen if fused correctly
+            raise RuntimeError("Mixed skipped and non-skipped updates in no_state_no_foreach")
         return updates
 
 
@@ -700,7 +719,13 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
     update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
     if not skip_update and update is not None:
-        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+        # Apply weight decay *before* the final update if not decoupled
+        if not group.get("decoupled_weight_decay", False) and group["weight_decay"] != 0:
+            [p.add_(p.data, alpha=group["weight_decay"]) for p in param]  # WD = WD + P
+
+        utils.update_param_(
+            param, update, group["lr"], 0.0, caution=group["caution"], grad=grad
+        )  # WD handled above or inside fused step
 
 
 def create_branch(branches: List[List[callable]], merge_fn: callable):
@@ -742,28 +767,30 @@ class ChainOpt(utils.StatefulOptimizer):
             return
         p, g = zip(*vals)
 
+        # Determine current step
+        state_ref = self.state_(p[0])
+        step = state_ref.get("step", 0)
+        step += 1
+        # Update step in group and state for all params
+        group["step"] = step
         for param in p:
-            state = self.state_(param)
-            if "step" in state:
-                step = state["step"]
-            elif self.compile_step:
-                step = utils.scalar_guard(0, param)
-            else:
-                step = 0
-            break
+            self.state_(param)["step"] = step
 
-        group["step"] = state["step"] = step = step + 1
-        group["prev_lr"] = group["lr"] = group["base_lr"] * step / max(step, group["warmup_steps"] + 1)
+        # Warmup LR
+        group["prev_lr"] = group["lr"] = group["base_lr"] * min(1.0, step / max(1, group["warmup_steps"]))
 
+        # Apply optimizer chain
         if not group["foreach"] or len(p) == 1:
             for param, grad in zip(p, g):
+                # Pass state_ function, not the dict directly
                 chain(self.state_, group, [grad], [param], *self.fns)
         else:
+            # Pass state_ function, not the dict directly
             chain(self.state_, group, g, p, *self.fns)
 
         group["caution"] = caution
-        group["lr"] = group["prev_lr"]
-        group["step"] = None
+        # group["lr"] = group["prev_lr"] # LR is handled within chain for fused optimizers now
+        # group["step"] = None # Step needs to persist in state
 
 
 use_default = object()
@@ -789,21 +816,17 @@ def default(a, b):
     return b if a is use_default else a
 
 
-# not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
+# Map scaling functions to their fused update equivalents
 _scale_to_update_map = {
-    scale_by_delayed_psgd.get_fn(): update_by_delayed_psgd,  #
-    scale_by_psgd.get_fn(): update_by_psgd,  #
-    scale_by_adam.get_fn(): update_by_adam,  #
-    scale_by_laprop.get_fn(): update_by_laprop,  #
+    scale_by_psgd.get_fn(): update_by_psgd,
+    scale_by_delayed_psgd.get_fn(): update_by_delayed_psgd,
+    scale_by_adam.get_fn(): update_by_adam,
+    scale_by_laprop.get_fn(): update_by_laprop,
     scale_by_adopt.get_fn(): update_by_adopt,
+    # scale_by_psgd_lra is implicitly fused, map it to itself (or a dummy update func if needed)
+    # scale_by_psgd_lra.get_fn(): update_by_psgd_lra # Placeholder if we create a separate update func
 }
-_scale_to_update_map_inv = {
-    update_by_delayed_psgd.get_fn(): scale_by_delayed_psgd,  #
-    update_by_psgd.get_fn(): scale_by_psgd,  #
-    update_by_adam.get_fn(): scale_by_adam,  #
-    update_by_laprop.get_fn(): scale_by_laprop,  #
-    update_by_adopt.get_fn(): scale_by_adopt,
-}
+_scale_to_update_map_inv = {v: k for k, v in _scale_to_update_map.items()}
 
 
 class BaseOpt(ChainOpt):
@@ -834,6 +857,7 @@ class BaseOpt(ChainOpt):
     update_clipping: str_or_fn = None
     palm: bool = False
     auto_fuse: bool = True
+    compile_step: bool = False  # Default value for compile_step
 
     def __init__(
         self,
@@ -857,14 +881,19 @@ class BaseOpt(ChainOpt):
         if isinstance(fn, FunctionTransform):
             fn = fn.get_fn()
 
+        # Check if the last function is a fused update function
+        is_fused = fn in _scale_to_update_map_inv
+
         if default(update_clipping, self.update_clipping) is None:
-            if self.auto_fuse:
-                if fn in _scale_to_update_map:
-                    fn = _scale_to_update_map[fn]
-                    if args is not None:
-                        fn = functools.partial(fn, *args, **kwargs)
-                    fns = tuple(fns)[:-1] + (fn,)
+            # Try to fuse if auto_fuse is enabled and the last function is a scale function
+            if self.auto_fuse and fn in _scale_to_update_map:
+                fn = _scale_to_update_map[fn]
+                if args is not None:
+                    fn = functools.partial(fn, *args, **kwargs)
+                fns = tuple(fns)[:-1] + (fn,)
+                is_fused = True  # Mark as fused
         elif fn in _scale_to_update_map_inv:
+            # If update clipping exists, and the last fn is an update_by_*, unfuse it
             if not self.auto_fuse:
                 raise ValueError(
                     "update_clipping is currently not compatible with update_by_* functions. "
@@ -874,15 +903,30 @@ class BaseOpt(ChainOpt):
             if args is not None:
                 fn = functools.partial(fn, *args, **kwargs)
             fns = tuple(fns)[:-1] + (fn,)
+            is_fused = False  # Mark as not fused
+
+        # Handle LR and Weight Decay based on whether the step is fused
+        defaults["decoupled_weight_decay"] = defaults.get("decoupled_weight_decay", False)
+        if is_fused:
+            # If fused, the chainable function handles LR and possibly WD.
+            # Set optimizer's lr=1.0 and wd=0.0 to avoid double application.
+            defaults["_original_lr"] = defaults.get("lr", 1.0)  # Store original LR if needed inside chainable
+            defaults["_original_wd"] = defaults.get("weight_decay", 0.0)  # Store original WD
+            defaults["lr"] = 1.0
+            if not defaults["decoupled_weight_decay"]:
+                defaults["weight_decay"] = 0.0  # Non-decoupled WD handled in chainable
+        # else: LR and WD applied by the base ChainOpt.chain function
 
         self.compile_step = default(compile_step, self.compile_step)
         self.promote = default(promote, self.promote)
         if default(palm, self.palm):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
-            fns = (apply_to_idx(gradient_clipping, 2),) + fns
+            grad_clip_func = _get_clip_fn(gradient_clipping, self.gradient_clipping)
+            fns = (apply_to_idx(grad_clip_func, 2),) + fns  # Apply to grad (index 2)
         if default(update_clipping, self.update_clipping) is not None:
-            fns = fns + (apply_to_idx(update_clipping, 2),)
+            update_clip_func = _get_clip_fn(update_clipping, self.update_clipping)
+            fns = fns + (apply_to_idx(update_clip_func, 2),)  # Apply to update (index 2)
 
         super().__init__(params, defaults, foreach, *fns)
 
@@ -914,3 +958,131 @@ class ScheduleFree(BaseOpt):
                         p32 = utils.promote(p.data)
                         p32.lerp_(end=z, weight=1 - beta1)
                         utils.copy_stochastic_(p.data, p32)
+
+
+def _init_psgd_lra(state, group, update, grad, param):
+    num_params = param.numel()
+    rank = group["rank_of_approximation"]
+    rank = min(rank, num_params)
+    dtype = _storage_dtype(group)  # Use storage dtype
+    device = param.device
+
+    # Add +10 to rank denominator for numerical stability, as in original PSGD
+    u_init_std = (num_params * (rank + 10)) ** -0.5
+    state["U"] = torch.randn(num_params, rank, dtype=dtype, device=device) * u_init_std
+    state["V"] = torch.randn(num_params, rank, dtype=dtype, device=device) * u_init_std
+
+    # Initialize 'd' based on group setting, or None if dynamic init is needed
+    if group["preconditioner_init_scale"] is not None:
+        state["d"] = torch.ones(num_params, 1, dtype=dtype, device=device) * group["preconditioner_init_scale"]
+    else:
+        state["d"] = None  # Will be initialized on first update
+
+    state["m"] = None  # Momentum buffer
+
+
+@general_guard("U", "V", "d", "m", init_fn=_init_psgd_lra, skip_first=False)
+@no_state_no_foreach  # This decorator means the function processes one param at a time
+def scale_by_psgd_lra(group, update, grad, param, U, V, d, m):
+    """
+    Performs a single PSGD LRA step for one parameter.
+    Includes preconditioner update and parameter update (fused).
+    """
+    num_params = param.numel()
+    # Ensure rank is valid for this parameter
+    rank = min(group["rank_of_approximation"], num_params)
+    if U.shape[1] != rank:  # Adjust U,V shape if rank was capped
+        u_init_std = (num_params * (rank + 10)) ** -0.5
+        U = torch.randn(num_params, rank, dtype=U.dtype, device=U.device) * u_init_std
+        V = torch.randn(num_params, rank, dtype=V.dtype, device=V.device) * u_init_std
+
+    grad_flat = grad.detach().flatten().view(-1, 1)  # Use detach()
+
+    # --- Momentum ---
+    if group["momentum"] > 0:
+        beta1 = group["momentum"]
+        if m is None:
+            # Initialize momentum buffer m if it's the first step or momentum was turned on
+            m = torch.zeros_like(grad_flat)  # Initialize with zeros is safer
+            m.add_(grad_flat, alpha=1 - beta1)
+        else:
+            m.mul_(beta1).add_(grad_flat, alpha=1 - beta1)
+        current_update = m  # Use momentum buffer as the effective gradient/update
+    else:
+        m = None  # Clear momentum buffer if momentum is zero
+        current_update = grad_flat
+
+    tiny = torch.finfo(grad.dtype).tiny
+
+    # --- Preconditioner Update ---
+    if (
+        precond_schedule(group, group["preconditioner_update_probability"], name=f"psgd_lra_prob_{id(param)}")
+        or d is None
+    ):
+        if group["preconditioner_type"] == "Newton":
+            # Check if HVP info is available (calculated by StatefulOptimizer._handle_closure)
+            vs_flat = getattr(param, "vector", None)
+            Hvs_flat = getattr(param, "hessian_vector", None)
+
+            if vs_flat is None or Hvs_flat is None:
+                # Fallback or error if HVP is needed but not provided
+                if group["exact_hessian_vector_product"]:
+                    raise RuntimeError(
+                        "PSGD LRA (Newton) requires HVP. Ensure closure is provided and hessian_approx=True in optimizer."
+                    )
+                else:  # Approximate using damped gradient if exact HVP failed
+                    vs_flat, Hvs_flat = utils.damped_pair_vg(current_update)
+            else:
+                vs_flat = vs_flat.detach().flatten().view(-1, 1)
+                Hvs_flat = Hvs_flat.detach().flatten().view(-1, 1)
+                # Apply L2 regularization if specified
+                if group["l2_regularization"] > 0:
+                    Hvs_flat.add_(vs_flat, alpha=group["l2_regularization"])
+
+            # Initialize 'd' dynamically if needed
+            if d is None:
+                d = (
+                    (torch.mean(vs_flat * vs_flat)) ** (1 / 4)
+                    * (torch.mean(Hvs_flat**4)) ** (-1 / 8)
+                    * torch.ones(num_params, 1, dtype=U.dtype, device=U.device)
+                )
+
+            # Update U, V, d using HVP
+            utils.psgd_lra_update_precond_(
+                U, V, d, vs_flat, Hvs_flat, group["lr_preconditioner"], group["step_normalizer"], tiny
+            )
+
+        else:  # Whitening type
+            # Initialize 'd' dynamically if needed
+            if d is None:
+                # Use gradient statistics for initialization
+                grad_abs_mean_pow4 = torch.mean((torch.abs(grad_flat)) ** 4)
+                # Handle potential grad_abs_mean_pow4 being zero
+                init_scale_d = grad_abs_mean_pow4 ** (-1 / 8) if grad_abs_mean_pow4 > tiny else 1.0
+                d = init_scale_d * torch.ones(num_params, 1, dtype=U.dtype, device=U.device)
+
+            # Update U, V, d using gradient (damped pair)
+            vs_flat, Hvs_flat = utils.damped_pair_vg(current_update)  # Hvs_flat is actually the damped grad here
+            utils.psgd_lra_update_precond_(
+                U, V, d, vs_flat, Hvs_flat, group["lr_preconditioner"], group["step_normalizer"], tiny
+            )
+
+    # --- Preconditioned Gradient ---
+    # Apply preconditioner Q = (I + UV')*diag(d) -> P = Q'Q
+    pre_grad = utils.precond_grad_psgd_lra_(U, V, d, current_update)
+
+    # Effective learning rate for parameters
+    lr = group["lr_params"]
+
+    # --- Parameter Update ---
+    delta = lr * pre_grad
+
+    # Apply decoupled weight decay if enabled
+    if group["decoupled_weight_decay"] and group["weight_decay"] > 0:
+        param.data.add_(param.data, alpha=-group["weight_decay"] * group["lr_params"])
+
+    param.data.sub_(delta.view_as(param.data))
+    raise SkipUpdate  # Indicate that the update was applied internally
+
+
+# =====================================

@@ -542,6 +542,81 @@ class ForeachPSGDKron(C.BaseOpt):
         )
 
 
+# === Added ForeachPSGDLRA ===
+class ForeachPSGDLRA(C.BaseOpt):
+    """
+    Implements the low-rank approximation (LRA) preconditioner based on psgd_torch.
+    Original source: https://github.com/lixilinx/psgd_torch/blob/master/preconditioned_stochastic_gradient_descent.py
+    """
+
+    hessian_approx = True  # LRA needs HVP
+
+    def __init__(
+        self,
+        params,
+        lr=0.01,  # Maps to lr_params in psgd.LRA
+        rank_of_approximation: int = 10,
+        preconditioner_init_scale=None,
+        lr_preconditioner=None,
+        momentum=0.0,
+        grad_clip_max_norm=None,
+        preconditioner_update_probability=1.0,
+        step_normalizer="2nd",
+        exact_hessian_vector_product: bool = True,  # Note: HeavyBall handles HVP calculation
+        preconditioner_type="Newton",
+        weight_decay=0.0,  # Added for compatibility
+        warmup_steps=0,  # Added for compatibility
+        foreach: bool = True,
+        storage_dtype: str = "float32",
+        mars: bool = False,  # Not used by LRA directly, but kept for consistency
+        caution: bool = False,  # Not used by LRA directly, but kept for consistency
+        mars_gamma: float = 0.0025,  # Not used by LRA directly, but kept for consistency
+        palm: bool = C.use_default,  # Not used by LRA directly, but kept for consistency
+        beta2_scale: float = 0.8,  # Dummy, LRA doesn't use beta2
+        l2_regularization=0.0,
+        decoupled_weight_decay=False,
+        gradient_clipping: C.str_or_fn = C.use_default,  # Use standard heavyball clipping
+        update_clipping: C.str_or_fn = C.use_default,  # Use standard heavyball clipping
+    ):
+        defaults = locals()
+        # Map psgd.LRA names to heavyball names where needed or pass through
+        defaults["lr_params"] = defaults.pop("lr")  # Use lr_params internally
+        defaults["weight_decay"] = defaults.pop("l2_regularization") if not decoupled_weight_decay else 0.0
+        defaults.pop("self")
+        params = defaults.pop("params")
+
+        # Set default lr_preconditioner based on step_normalizer like in psgd.LRA
+        if lr_preconditioner is None:
+            defaults["lr_preconditioner"] = 0.1 if step_normalizer == "2nd" else 0.01
+        else:
+            defaults["lr_preconditioner"] = lr_preconditioner
+
+        # Note: Heavyball's BaseOpt applies lr and weight_decay *after* the chain.
+        # Since scale_by_psgd_lra applies the update itself (fused),
+        # we set BaseOpt's lr to 1 and weight_decay to 0, and handle them inside scale_by_psgd_lra.
+        # Keep the original lr_params and weight_decay/l2_regularization in defaults for access inside the chainable function.
+        original_lr = defaults["lr_params"]
+        original_wd = defaults["weight_decay"]
+        defaults["lr"] = 1.0
+        defaults["weight_decay"] = 0.0
+        # Restore original values for internal use
+        defaults["lr_params"] = original_lr
+        defaults["weight_decay"] = original_wd
+
+        super().__init__(
+            params,
+            defaults,
+            foreach,
+            gradient_clipping,
+            update_clipping,
+            palm,  # Pass palm setting
+            C.scale_by_psgd_lra,  # The core scaling/update function
+        )
+
+
+# ===========================
+
+
 class ForeachPurePSGD(ForeachPSGDKron):
     exp_avg_input: bool = False
 
@@ -581,12 +656,15 @@ CachedPSGDKron = ForeachCachedPSGDKron
 CachedDelayedPSGDKron = ForeachCachedDelayedPSGDKron
 Muon = ForeachMuon
 SignLaProp = ForeachSignLaProp
+PSGDLRA = ForeachPSGDLRA  # Alias
 
 __all__ = [
     "Muon",
     "RMSprop",
     "PrecondSchedulePaLMSOAP",
     "PSGDKron",
+    "ForeachPSGDLRA",
+    "PSGDLRA",  # Added Alias
     "PurePSGD",
     "DelayedPSGD",
     "CachedPSGDKron",
