@@ -2073,29 +2073,19 @@ def _psgd_precond_update_(
             update = promote(update)
             if store_triu_as_line:
                 update = triu_to_line([update])[0][1]
-
-        copy_stochastic_(oq, q - q * update * precond_lr)
+        lb_state.lerp_(update.square().mean(), 1.0 - lower_bount_beta)
+        copy_stochastic_(oq, q - q * update / lb_state.clamp(min=1e-7) * precond_lr)
 
 
 @decorator_knowngood
 def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
-    """
-    I: Identity
-    U: Update / gg / target
-    Q: q, preconditioner
-    scale: scalar scale
-    ---
-    U = T * scale - I
-    F = I - U  # = 2I - U * scale
-    O = F @ Q @ F - Q
-    """
     out = []
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:
             target = 1 / gg.numel() ** 0.5
         else:
             target = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) / gg.size(0) ** 0.5
-        out.append(target - promote(gg) / gg.norm())
+        out.append(promote(gg) / gg.norm() - target)
     return out
 
 
