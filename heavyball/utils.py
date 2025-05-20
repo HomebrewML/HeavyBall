@@ -1616,10 +1616,12 @@ def init_Q_exprs(
 
 @decorator_knowngood
 def psgd_balance_Q(Q):
-    norms = [promote(q.norm(float("inf"))).log() for q in Q]
-    target = sum([math.log(max(1, q.numel()) if q.ndim < 2 else q.size(0)) for q in Q])
-    for q, n in zip(Q, norms):
-        q *= (target - n).exp()
+    sizes = [max(1, q.numel()) if q.ndim < 2 else q.size(0) for q in Q]
+    total_numel = np.prod(sizes)
+    for q, s in zip(Q, sizes):
+        n = q.abs().max()
+        target = s / total_numel
+        q *= target / n
 
 
 @decorator_knowngood
@@ -2077,8 +2079,9 @@ def _psgd_precond_update_(
             update = triu_to_line([update])[0][1]
         norm = update.abs().max()
         update = q * promote(update)
-        lb = _lerp([lb_state], [norm], beta)[0]
-        copy_stochastic_(oq, q - update / lb.clamp(min=1e-7) * precond_lr)
+        lb = _lerp([lb_state], [norm], beta)[0].maximum(norm)
+        copy_stochastic_(lb_state, lb)
+        copy_stochastic_(oq, q - update / lb.clamp(min=1) * precond_lr)
 
 
 @decorator_knowngood
