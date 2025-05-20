@@ -1615,9 +1615,9 @@ def init_Q_exprs(
 @decorator_knowngood
 def psgd_balance_Q(Q):
     norms = [promote(q.norm(float("inf"))).log() for q in Q]
-    geometric_mean = sum([n for n in norms]) / len(Q)
+    target = sum([math.log(max(1, q.numel()) if q.ndim < 2 else q.size(0)) for q in Q])
     for q, n in zip(Q, norms):
-        q *= (geometric_mean - n).exp()
+        q *= (target - n).exp()
 
 
 @decorator_knowngood
@@ -1994,11 +1994,9 @@ def _psgd_default_preconditioner_grad(
     for q, (x, y) in zip(Q, terms):
         x = promote(x)
         y = promote(y)
-        update = x - y
-        if q.ndim < 2:
-            update = q * update
-        else:
-            update = (q @ update).triu()
+        update = x / x.norm() - y / y.norm()
+        if q.ndim == 2:
+            update = update.triu()
         out.append(update)
     return out
 
@@ -2071,22 +2069,16 @@ def _psgd_precond_update_(
             oq = oq[1]
 
         q = promote(oq)
-        if update.ndim < 2:
-            lb = update.norm(float("inf"))
-        else:
-            lb = max_singular_value(update, None, power_iter=power_iter)
+        if update.ndim == 2:
             update = promote(update)
             if store_triu_as_line:
                 update = triu_to_line([update])[0][1]
 
-        lb = promote(lb)
-        lb = lb.maximum(promote(lb_state) + (lb - promote(lb_state)) * (1 - lower_bount_beta))
-        copy_stochastic_(lb_state, lb)
-        copy_stochastic_(oq, q - update / lb * precond_lr)
+        copy_stochastic_(oq, q - q * update * precond_lr)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], numel: int):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
     """
     I: Identity
     U: Update / gg / target
@@ -2100,15 +2092,10 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], numel: int
     out = []
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:
-            scale = max(1, gg.numel()) / numel
-            target = promote(gg)
-            update = target * scale - 1
-            out.append(q - (1 - update) * q * (1 - update))
+            target = 1 / gg.numel() ** 0.5
         else:
-            scale = gg.size(0) / numel
-            gg = 2 * torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) - gg * scale
-            update = q - gg @ q @ gg
-            out.append(update + update.T)  # make matrix symmetric
+            target = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) / gg.size(0) ** 0.5
+        out.append(target - promote(gg) / gg.norm())
     return out
 
 
@@ -2137,11 +2124,12 @@ def inverse_free_psgd_update_precond(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
     G = psgd_precond_grad(G, Q)
-    terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-    matmuled = _psgd_quad_preconditioner_grad(terms, Q, G.numel())
-    _psgd_precond_update_(
-        matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
+    for _ in range(1):
+        terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
+        matmuled = _psgd_quad_preconditioner_grad(terms, Q)
+        _psgd_precond_update_(
+            matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
+        )
     return G
 
 
