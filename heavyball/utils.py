@@ -2073,8 +2073,8 @@ def _psgd_precond_update_(
             update = promote(update)
             if store_triu_as_line:
                 update = triu_to_line([update])[0][1]
-        lb_state.lerp_(update.square().mean(), 1.0 - lower_bount_beta)
-        copy_stochastic_(oq, q - q * update / lb_state.clamp(min=1e-7) * precond_lr)
+        lb = _lerp([lb_state], [update.square().mean()], 1.0 - lower_bount_beta)[0]
+        copy_stochastic_(oq, q - q * update / lb.clamp(min=1e-7) * precond_lr)
 
 
 @decorator_knowngood
@@ -2114,12 +2114,11 @@ def inverse_free_psgd_update_precond(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
     G = psgd_precond_grad(G, Q)
-    for _ in range(1):
-        terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-        matmuled = _psgd_quad_preconditioner_grad(terms, Q)
-        _psgd_precond_update_(
-            matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-        )
+    terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
+    matmuled = _psgd_quad_preconditioner_grad(terms, Q)
+    _psgd_precond_update_(
+        matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
+    )
     return G
 
 
