@@ -18,6 +18,8 @@ from torch._dynamo.exc import TorchDynamoException
 from torch.backends import cudnn, opt_einsum
 from torch.utils._pytree import tree_map
 
+import heavyball.utils
+
 compile_mode = "max-autotune-no-cudagraphs"
 dynamic = False
 compile_mode_recommended_to_none = None
@@ -2038,6 +2040,7 @@ def psgd_update_precond(
     running_lower_bound: List[Tensor],
     lower_bount_beta: float,
     power_iter: int,
+    step: Tensor,
 ) -> None:
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     Q = _balance_to_triu(oq)
@@ -2048,9 +2051,7 @@ def psgd_update_precond(
     terms = [(compiled_einsum(exprG, A, A), compiled_einsum(exprG, conjB, conjB)) for exprG in exprGs]
     del A, conjB, V
     updates = _psgd_default_preconditioner_grad(terms, Q)
-    _psgd_precond_update_(
-        updates, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
+    _psgd_precond_update_(updates, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     return None
 
 
@@ -2062,8 +2063,11 @@ def _psgd_precond_update_(
     lower_bount_beta: Tensor,
     precond_lr: Tensor,
     store_triu_as_line: bool,
-    power_iter: int,
+    step: Tensor,
 ):
+    step.add_(1)
+    beta = heavyball.utils.beta_debias(lower_bount_beta, step)
+
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
             oq = oq[1]
@@ -2073,7 +2077,7 @@ def _psgd_precond_update_(
             update = promote(update)
             if store_triu_as_line:
                 update = triu_to_line([update])[0][1]
-        lb = _lerp([lb_state], [update.square().mean()], 1.0 - lower_bount_beta)[0]
+        lb = _lerp([lb_state], [update.square().mean()], beta)[0]
         copy_stochastic_(oq, q - q * update / lb.clamp(min=1e-7) * precond_lr)
 
 
@@ -2102,6 +2106,7 @@ def inverse_free_psgd_update_precond(
     running_lower_bound: List[Tensor],
     lower_bount_beta: float,
     power_iter: int,
+    step: Tensor,
 ) -> Tensor:
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     assert V is None
@@ -2116,9 +2121,7 @@ def inverse_free_psgd_update_precond(
     G = psgd_precond_grad(G, Q)
     terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
     matmuled = _psgd_quad_preconditioner_grad(terms, Q)
-    _psgd_precond_update_(
-        matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
+    _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     return G
 
 
