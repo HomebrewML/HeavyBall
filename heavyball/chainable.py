@@ -787,9 +787,9 @@ def scale_by_delayed_psgd(
     update_to_precond,
     Q,
     Q_cache,
-    step: Tensor,
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
+    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
