@@ -2069,7 +2069,7 @@ def _psgd_precond_update_(
         update = promote(update)
         lb = _lerp([lb_state], [norm], beta)[0]
         copy_stochastic_(lb_state, lb)
-        copy_stochastic_(oq, q - update / lb * precond_lr)
+        copy_stochastic_(oq, q - update / lb.sqrt().clamp(min=1e-8) * precond_lr)
 
 
 @decorator_knowngood
