@@ -1615,16 +1615,6 @@ def init_Q_exprs(
 
 
 @decorator_knowngood
-def psgd_balance_Q(Q):
-    sizes = [max(1, q.numel()) if q.ndim < 2 else q.size(0) for q in Q]
-    total_numel = np.prod(sizes)
-    for q, s in zip(Q, sizes):
-        n = q.abs().max()
-        target = s / total_numel
-        q *= target / n
-
-
-@decorator_knowngood
 def _lra_flatten_and_balance(U: List[Tensor], V: List[Tensor], d: List[Tensor]):
     u_norm = sum(u.square().sum().double() for u in U)
     v_norm = sum(v.square().sum().double() for v in V)
@@ -1998,7 +1988,7 @@ def _psgd_default_preconditioner_grad(
     for q, (x, y) in zip(Q, terms):
         x = promote(x)
         y = promote(y)
-        update = x / x.norm() - y / y.norm()
+        update = x - y
         if q.ndim == 2:
             update = update.triu()
         out.append(update)
@@ -2006,11 +1996,9 @@ def _psgd_default_preconditioner_grad(
 
 
 @decorator_knowngood
-def _balance_to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
+def to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
     if isinstance(Q[0], tuple):
-        psgd_balance_Q([o[1] for o in Q])
         return line_to_triu(Q, symmetric_output)
-    psgd_balance_Q(Q)
     return Q
 
 
@@ -2045,7 +2033,7 @@ def psgd_update_precond(
     step: Tensor,
 ) -> None:
     """Update Kronecker product preconditioner Q with pair (V, G)."""
-    Q = _balance_to_triu(oq)
+    Q = to_triu(oq)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
 
@@ -2078,10 +2066,10 @@ def _psgd_precond_update_(
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
         norm = update.abs().max()
-        update = q * promote(update)
-        lb = _lerp([lb_state], [norm], beta)[0].maximum(norm)
+        update = promote(update)
+        lb = _lerp([lb_state], [norm], beta)[0]
         copy_stochastic_(lb_state, lb)
-        copy_stochastic_(oq, q - update / lb.clamp(min=1) * precond_lr)
+        copy_stochastic_(oq, q - update / lb * precond_lr)
 
 
 @decorator_knowngood
@@ -2089,10 +2077,10 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
     out = []
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:
-            target = 1 / gg.numel() ** 0.5
+            target = 1
         else:
-            target = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) / gg.size(0) ** 0.5
-        out.append(promote(gg) / gg.norm() - target)
+            target = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
+        out.append(promote(gg) - target)
     return out
 
 
@@ -2117,7 +2105,7 @@ def inverse_free_psgd_update_precond(
     assert velocity is None
     del V, ortho_method, velocity
 
-    Q = _balance_to_triu(oq, True)
+    Q = to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
