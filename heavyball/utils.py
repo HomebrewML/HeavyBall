@@ -2065,7 +2065,7 @@ def _psgd_precond_update_(
         q = promote(oq)
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        norm = update.abs().max()
+        norm = update.square().mean()
         update = promote(update)
         lb = _lerp([lb_state], [norm], beta)[0]
         copy_stochastic_(lb_state, lb)
