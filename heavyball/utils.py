@@ -2061,14 +2061,18 @@ def _psgd_precond_update_(
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
             oq = oq[1]
+        if update.ndim == 2:
+            update = update + update.T  # enforce symmetric matrix
 
         q = promote(oq)
-        if store_triu_as_line and update.ndim == 2:
-            update = triu_to_line([update])[0][1]
+
         norm = update.square().mean()
         update = promote(update)
         lb = _lerp([lb_state], [norm], beta)[0]
         copy_stochastic_(lb_state, lb)
+
+        if store_triu_as_line and update.ndim == 2:
+            update = triu_to_line([update])[0][1]
         copy_stochastic_(oq, q - update / lb.sqrt().clamp(min=1e-8) * precond_lr)
 
 
