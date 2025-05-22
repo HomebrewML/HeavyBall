@@ -32,12 +32,16 @@ base_args = {
     "beta": 0.9,
     "max_size_triangular": 2**16,
     "split": False,
-    "precond_grad_accum": True,
+    "precond_grad_accum": False,
     "momentum_into_precond_update": True,
     "eps": 1e-8,
     "weight_decay": 0,
     "precond_update_power_iterations": 8,
-    "dampening": 2**-18,
+    "dampening": 2**-24,
+    "preconditioner_update_probability": 1.0,
+    "store_triu_as_line": False,
+    "update_clipping": None,
+    "delayed": True,
 }
 
 
@@ -447,7 +451,7 @@ def trial(
     random_trials: int = 10,
 ):
     group = min(group, steps)
-    heavyball.utils.set_torch()
+    heavyball.utils.set_torch(einsum_strategy="heavyball")
 
     if isinstance(opt, list):
         opt = opt[0]
