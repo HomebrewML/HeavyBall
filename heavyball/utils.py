@@ -2087,7 +2087,7 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor]):
         So, we minimize `MSE(S, I)`
         Gradient:
             d_S = S - I
-            d_G = G @ d_S + d_S @ G.T
+            d_G = G @ d_S + (d_S.T @ G.T).T
     """
     out = []
     for gg in GG:
@@ -2095,11 +2095,11 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor]):
         if gg.ndim < 2:
             S = gg * gg
             d_S = S - 1
-            d_G = 2 * gg * d_S
+            d_G = d_S * gg
         else:
             S = gg @ gg.T
             d_S = S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
-            d_G = gg @ d_S + d_S @ gg.T
+            d_G = d_S @ gg
         out.append(d_G)
     return out
 
