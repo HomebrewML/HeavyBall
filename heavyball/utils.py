@@ -2086,7 +2086,19 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = T
         JVP (for step size):
             Compute JVP of d_G w.r.t. G, with G as the tangent vector.
             Use JVP to estimate curvature and compute step size.
-
+        JVP Math:
+            # JVP computation: d_G = d_S @ gg, where d_S = S - I, S = gg @ gg.T
+            # Tangent vector is gg
+            # Differentiate d_G w.r.t. gg:
+            # d_G = (gg @ gg.T - I) @ gg
+            # Let G = gg, S = G @ G.T, d_S = S - I, d_G = d_S @ G
+            # Compute d(d_G)/d(G) * G
+            # d_S/d(G) * G = (G @ G.T + G @ G.T) = 2 * G @ G.T
+            # d_G/d(G) * G = (d_S/d(G) * G) @ G + d_S @ G
+            #              = (2 * G @ G.T) @ G + d_S @ G
+            #              = 2 * (G @ G.T) @ G + (G @ G.T - I) @ G
+            #              = 2 * G @ (G.T @ G) + (G @ G.T) @ G - G
+            # jvp = 2 * (gg @ (gg.T @ gg)) + (gg @ gg.T) @ gg - gg
     Args:
         GG: List of gradient tensors.
         compute_step_size: If True, computes the optimal step size using JVP.
@@ -2100,48 +2112,25 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = T
 
     for gg in GG:
         gg = promote(gg)
-        curvature = 1
+        jvp = None
 
         if gg.ndim < 2:  # Scalar/Vector
             S = gg * gg
             d_S = S - 1
             d_G = d_S * gg
-
-            if compute_step_size:
-                # JVP computation: d_G = d_S * gg, where d_S = S - 1, S = gg * gg
-                # Tangent vector is gg
-                # Differentiate d_G w.r.t. gg: d_G = (gg * gg - 1) * gg
-                # JVP: d(d_G)/d(gg) * gg
-                # Let f = d_G = (gg * gg - 1) * gg
-                # df/d(gg) = 3 * gg * gg - 1
-                # JVP = (3 * gg * gg - 1) * gg
-                jvp = (3 * S - 1) * gg
-                # Approximate step size using curvature: step_size ≈ 1 / |JVP|
-                curvature = jvp.abs().clamp(min=1e-8)
-        else:  # Matrix
+            jvp = (3 * S - 1) * gg
+        else:
             S = gg @ gg.T
             d_S = S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
             d_G = d_S @ gg
+            jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
 
-            if compute_step_size:
-                # JVP computation: d_G = d_S @ gg, where d_S = S - I, S = gg @ gg.T
-                # Tangent vector is gg
-                # Differentiate d_G w.r.t. gg:
-                # d_G = (gg @ gg.T - I) @ gg
-                # Let G = gg, S = G @ G.T, d_S = S - I, d_G = d_S @ G
-                # Compute d(d_G)/d(G) * G
-                # d_S/d(G) * G = (G @ G.T + G @ G.T) = 2 * G @ G.T
-                # d_G/d(G) * G = (d_S/d(G) * G) @ G + d_S @ G
-                #              = (2 * G @ G.T) @ G + d_S @ G
-                #              = 2 * (G @ G.T) @ G + (G @ G.T - I) @ G
-                #              = 2 * G @ (G.T @ G) + (G @ G.T) @ G - G
-                # jvp = 2 * (gg @ (gg.T @ gg)) + (gg @ gg.T) @ gg - gg
-                jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
-                # Approximate step size using curvature: step_size ≈ 1 / ||JVP||_F
-                curvature = jvp.norm().clamp(min=1e-8)
-
+        if compute_step_size:
+            jvp = jvp.norm().clamp(min=1e-8)
+        else:
+            jvp = 1
         # step_size = 1 / curvature
-        out_grads.append(d_G / curvature)
+        out_grads.append(d_G / jvp)
 
     return out_grads
 
