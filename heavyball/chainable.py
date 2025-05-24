@@ -469,7 +469,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
-    state["running_lower_bound"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((2,), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.int64)
     if group["adaptive"]:
         state["velocity"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]

@@ -2057,6 +2057,7 @@ def _psgd_precond_update_(
 ):
     step.add_(1)
     beta = heavyball.utils.beta_debias(lower_bount_beta, step)
+    additive = step % 2
 
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
@@ -2068,12 +2069,16 @@ def _psgd_precond_update_(
 
         norm = update.square().mean()
         update = promote(update)
-        lb = _lerp([lb_state], [norm], beta)[0]
-        copy_stochastic_(lb_state, lb)
+        state = torch.index_select(lb_state, 0, additive)
+        lb = _lerp([state], [norm], beta)[0]
+        new = torch.where(torch.arange(lb_state.numel(), device=additive.device) == additive, lb, lb_state)
+        copy_stochastic_(lb_state, new)
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        copy_stochastic_(oq, q - update / lb.sqrt().clamp(min=1e-8) * precond_lr)
+        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
+        update = torch.where(additive > 0, update, update * q)
+        copy_stochastic_(oq, q - update)
 
 
 @decorator_knowngood
@@ -2129,10 +2134,11 @@ def inverse_free_psgd_update_precond(
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
-    G = psgd_precond_grad(G, Q)
-    terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-    matmuled = _psgd_quad_preconditioner_grad(terms)
-    _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
+    for i in range(power_iter):
+        G = psgd_precond_grad(G, Q)
+        terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
+        matmuled = _psgd_quad_preconditioner_grad(terms)
+        _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     return G
 
 
