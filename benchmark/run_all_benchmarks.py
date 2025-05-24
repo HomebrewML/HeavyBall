@@ -199,9 +199,9 @@ def worker(task_queue, result_queue, worker_index, difficulties: list, timeout: 
             except Empty:
                 result_queue.put(None)
                 return
-
-            inner_difficulties = difficulties.copy()
-            for _ in range(len(difficulties)):
+            script, *diff = script.split("===")
+            inner_difficulties = diff if diff else difficulties.copy()
+            for _ in range(len(inner_difficulties)):
                 d = inner_difficulties.pop(0)
                 try:
                     result = run_benchmark(script, o, steps, dtype, trials, seed, d)
@@ -253,6 +253,7 @@ def main(
     mars: bool = False,
     unscaled_caution: bool = False,
     seeds: int = 4,
+    full_parallel: bool = False,
     difficulties: list[str] = typer.Option([], help=f"{_difficulty_order} or any combination of these"),
 ):
     multiprocessing.set_start_method("spawn", force=True)  # spawn appears to be safer with CUDA MPS
@@ -300,7 +301,11 @@ def main(
 
     total_tasks = 0
     for script, o, i in itertools.product(benchmarks, opt, range(seeds)):
-        task_queue.put((script, o, steps, dtype, trials, i))
+        if full_parallel:
+            for d in difficulties:
+                task_queue.put((f"{script}==={d}", o, steps, dtype, trials, i))
+        else:
+            task_queue.put((script, o, steps, dtype, trials, i))
         total_tasks += len(difficulties)
 
     if not total_tasks:
