@@ -18,8 +18,6 @@ from torch._dynamo.exc import TorchDynamoException
 from torch.backends import cudnn, opt_einsum
 from torch.utils._pytree import tree_map
 
-import heavyball.utils
-
 compile_mode = "max-autotune-no-cudagraphs"
 dynamic = False
 compile_mode_recommended_to_none = None
@@ -2056,8 +2054,6 @@ def _psgd_precond_update_(
     step: Tensor,
 ):
     step.add_(1)
-    alpha = 1 - heavyball.utils.beta_debias(lower_bount_beta, step)
-    additive = step % 2
 
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
@@ -2069,21 +2065,15 @@ def _psgd_precond_update_(
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        update = torch.where(additive > 0, update, update * q)
-        norm = update.square().mean()
         update = promote(update)
-
-        state = torch.index_select(lb_state, 0, additive)
-        lb = state + (norm - state) * alpha
-        lb_state.scatter_(0, additive, lb)
-
-        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
-        copy_stochastic_(oq, q - update)
+        copy_stochastic_(oq, q - update * precond_lr)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor]):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = True):
     """
+    Computes the preconditioned gradient and optionally the optimal step size using fwdAD.
+
     Idea:
         Preconditioned gradient (`G`) should be orthogonal
         Target:
@@ -2093,20 +2083,67 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor]):
         Gradient:
             d_S = S - I
             d_G = G @ d_S + (d_S.T @ G.T).T
+        JVP (for step size):
+            Compute JVP of d_G w.r.t. G, with G as the tangent vector.
+            Use JVP to estimate curvature and compute step size.
+
+    Args:
+        GG: List of gradient tensors.
+        compute_step_size: If True, computes the optimal step size using JVP.
+
+    Returns:
+        Tuple[List[Tensor], List[Tensor] or None]:
+            - List of preconditioned gradients (d_G).
+            - List of step sizes (if compute_step_size is True), else None.
     """
-    out = []
+    out_grads = []
+
     for gg in GG:
         gg = promote(gg)
-        if gg.ndim < 2:
+        curvature = 1
+
+        if gg.ndim < 2:  # Scalar/Vector
             S = gg * gg
             d_S = S - 1
             d_G = d_S * gg
-        else:
+
+            if compute_step_size:
+                # JVP computation: d_G = d_S * gg, where d_S = S - 1, S = gg * gg
+                # Tangent vector is gg
+                # Differentiate d_G w.r.t. gg: d_G = (gg * gg - 1) * gg
+                # JVP: d(d_G)/d(gg) * gg
+                # Let f = d_G = (gg * gg - 1) * gg
+                # df/d(gg) = 3 * gg * gg - 1
+                # JVP = (3 * gg * gg - 1) * gg
+                jvp = (3 * S - 1) * gg
+                # Approximate step size using curvature: step_size ≈ 1 / |JVP|
+                curvature = jvp.abs().clamp(min=1e-8)
+        else:  # Matrix
             S = gg @ gg.T
             d_S = S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
             d_G = d_S @ gg
-        out.append(d_G)
-    return out
+
+            if compute_step_size:
+                # JVP computation: d_G = d_S @ gg, where d_S = S - I, S = gg @ gg.T
+                # Tangent vector is gg
+                # Differentiate d_G w.r.t. gg:
+                # d_G = (gg @ gg.T - I) @ gg
+                # Let G = gg, S = G @ G.T, d_S = S - I, d_G = d_S @ G
+                # Compute d(d_G)/d(G) * G
+                # d_S/d(G) * G = (G @ G.T + G @ G.T) = 2 * G @ G.T
+                # d_G/d(G) * G = (d_S/d(G) * G) @ G + d_S @ G
+                #              = (2 * G @ G.T) @ G + d_S @ G
+                #              = 2 * (G @ G.T) @ G + (G @ G.T - I) @ G
+                #              = 2 * G @ (G.T @ G) + (G @ G.T) @ G - G
+                # jvp = 2 * (gg @ (gg.T @ gg)) + (gg @ gg.T) @ gg - gg
+                jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
+                # Approximate step size using curvature: step_size ≈ 1 / ||JVP||_F
+                curvature = jvp.norm().clamp(min=1e-8)
+
+        # step_size = 1 / curvature
+        out_grads.append(d_G / curvature)
+
+    return out_grads
 
 
 @decorator

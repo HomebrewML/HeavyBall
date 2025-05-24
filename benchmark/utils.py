@@ -36,7 +36,7 @@ base_args = {
     "momentum_into_precond_update": True,
     "eps": 1e-8,
     "weight_decay": 0,
-    "precond_update_power_iterations": 4,
+    "precond_update_power_iterations": 1,
     "dampening": 2**-24,
     "preconditioner_update_probability": 1.0,
     "store_triu_as_line": False,
