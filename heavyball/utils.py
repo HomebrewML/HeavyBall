@@ -2056,7 +2056,7 @@ def _psgd_precond_update_(
     step: Tensor,
 ):
     step.add_(1)
-    beta = heavyball.utils.beta_debias(lower_bount_beta, step)
+    alpha = 1 - heavyball.utils.beta_debias(lower_bount_beta, step)
     additive = step % 2
 
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
@@ -2067,16 +2067,17 @@ def _psgd_precond_update_(
 
         q = promote(oq)
 
-        norm = update.square().mean()
-        update = promote(update)
-        state = torch.index_select(lb_state, 0, additive)
-        lb = _lerp([state], [norm], beta)[0]
-        torch.scatter(lb_state, 0, additive, lb)
-
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
         update = torch.where(additive > 0, update, update * q)
+        norm = update.square().mean()
+        update = promote(update)
+
+        state = torch.index_select(lb_state, 0, additive)
+        lb = state + (norm - state) * alpha
+        lb_state.scatter_(0, additive, lb)
+
+        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
         copy_stochastic_(oq, q - update)
 
 
