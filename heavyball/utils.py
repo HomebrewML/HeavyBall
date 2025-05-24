@@ -2112,7 +2112,6 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = T
 
     for gg in GG:
         gg = promote(gg)
-        jvp = None
 
         if gg.ndim < 2:  # Scalar/Vector
             S = gg * gg
@@ -2126,11 +2125,9 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = T
             jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
 
         if compute_step_size:
-            jvp = jvp.norm().clamp(min=1e-8)
-        else:
-            jvp = 1
-        # step_size = 1 / curvature
-        out_grads.append(d_G / jvp)
+            curvature = jvp.norabsm().clamp(min=1e-8)
+            d_G = d_G / curvature
+        out_grads.append(d_G)
 
     return out_grads
 
