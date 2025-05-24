@@ -2125,7 +2125,7 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = T
             jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
 
         if compute_step_size:
-            curvature = jvp.norabsm().clamp(min=1e-8)
+            curvature = jvp.norm().clamp(min=1e-8)
             d_G = d_G / curvature
         out_grads.append(d_G)
 
