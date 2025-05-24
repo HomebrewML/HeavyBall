@@ -2077,14 +2077,30 @@ def _psgd_precond_update_(
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor]):
+    """
+    Idea:
+        Preconditioned gradient (`G`) should be orthogonal
+        Target:
+                  G == U@V.T (with U, _s, V := svd(G))
+            <==>  S == I (with S := G@G.T)
+        So, we minimize `MSE(S, I)`
+        Gradient:
+            d_S = S - I
+            d_G = G @ d_S + d_S @ G.T
+    """
     out = []
-    for gg, q in zip(GG, Q):
+    for gg in GG:
+        gg = promote(gg)
         if gg.ndim < 2:
-            target = 1
+            S = gg * gg
+            d_S = S - 1
+            d_G = 2 * gg * d_S
         else:
-            target = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
-        out.append(promote(gg) - target)
+            S = gg @ gg.T
+            d_S = S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
+            d_G = gg @ d_S + d_S @ gg.T
+        out.append(d_G)
     return out
 
 
