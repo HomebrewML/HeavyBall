@@ -41,7 +41,7 @@ def main(
     scale = configs.get(config, {}).get("scale", 1e3)
 
     dtype = [getattr(torch, d) for d in dtype]
- 
+
     model = Model(size=1024, scale=scale).cuda().double()
 
     def data():
