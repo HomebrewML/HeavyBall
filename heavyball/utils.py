@@ -2071,8 +2071,7 @@ def _psgd_precond_update_(
         update = promote(update)
         state = torch.index_select(lb_state, 0, additive)
         lb = _lerp([state], [norm], beta)[0]
-        new = torch.where(torch.arange(lb_state.numel(), device=additive.device) == additive, lb, lb_state)
-        copy_stochastic_(lb_state, new)
+        torch.scatter(lb_state, 0, additive, lb)
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
