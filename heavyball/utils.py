@@ -2131,7 +2131,7 @@ def inverse_free_psgd_update_precond(
 
     G = psgd_precond_grad(G, Q)
     terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-    matmuled = _psgd_quad_preconditioner_grad(terms, Q)
+    matmuled = _psgd_quad_preconditioner_grad(terms)
     _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     return G
 
