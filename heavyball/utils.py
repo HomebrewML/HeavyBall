@@ -2054,6 +2054,8 @@ def _psgd_precond_update_(
     step: Tensor,
 ):
     step.add_(1)
+    alpha = 1 - beta_debias(lower_bount_beta, step)
+    additive = step % 2
 
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
@@ -2065,70 +2067,61 @@ def _psgd_precond_update_(
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
+        update = torch.where(additive > 0, update, update * q)
+        norm = update.square().mean()
         update = promote(update)
-        copy_stochastic_(oq, q - update * precond_lr)
+
+        state = torch.index_select(lb_state, 0, additive)
+        lb = state + (norm - state) * alpha
+        lb_state.scatter_(0, additive, lb)
+
+        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
+        copy_stochastic_(oq, q - update)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], compute_step_size: bool = True):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], compute_step_size: bool = True):
     """
-    Computes the preconditioned gradient and optionally the optimal step size using fwdAD.
+    Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
 
     Idea:
-        Preconditioned gradient (`G`) should be orthogonal
-        Target:
-                  G == U@V.T (with U, _s, V := svd(G))
-            <==>  S == I (with S := G@G.T)
-        So, we minimize `MSE(S, I)`
-        Gradient:
-            d_S = S - I
-            d_G = G @ d_S + (d_S.T @ G.T).T
-        JVP (for step size):
-            Compute JVP of d_G w.r.t. G, with G as the tangent vector.
-            Use JVP to estimate curvature and compute step size.
-        JVP Math:
-            # JVP computation: d_G = d_S @ gg, where d_S = S - I, S = gg @ gg.T
-            # Tangent vector is gg
-            # Differentiate d_G w.r.t. gg:
-            # d_G = (gg @ gg.T - I) @ gg
-            # Let G = gg, S = G @ G.T, d_S = S - I, d_G = d_S @ G
-            # Compute d(d_G)/d(G) * G
-            # d_S/d(G) * G = (G @ G.T + G @ G.T) = 2 * G @ G.T
-            # d_G/d(G) * G = (d_S/d(G) * G) @ G + d_S @ G
-            #              = (2 * G @ G.T) @ G + d_S @ G
-            #              = 2 * (G @ G.T) @ G + (G @ G.T - I) @ G
-            #              = 2 * G @ (G.T @ G) + (G @ G.T) @ G - G
-            # jvp = 2 * (gg @ (gg.T @ gg)) + (gg @ gg.T) @ gg - gg
+        The preconditioner Q is updated to make the preconditioned gradient G orthogonal.
+        For matrices: G = Q @ GG @ Q.T, target S = G @ G.T ≈ I, minimize MSE(S, I).
+        For scalars/vectors: G = Q * GG * Q (element-wise), target G^2 ≈ 1, minimize MSE(G^2, 1).
+
+    Gradient:
+        - Matrices: d_S = S - I, d_G = G.T @ d_S + d_S @ G, d_Q = d_G @ Q @ GG.T + GG.T @ Q.T @ d_G
+        - Scalars/Vectors: d_S = S - 1, d_G = d_S * G, d_Q = 2 * Q * GG * d_G (element-wise)
+
+    JVP (for step size):
+        Approximates curvature by computing the JVP of d_G w.r.t. G with tangent vector G,
+        adjusted proportionally for d_Q computation.
+
     Args:
-        GG: List of gradient tensors.
+        GG: List of gradient tensors (gradients of the loss w.r.t. parameters).
+        Q: List of preconditioner tensors.
         compute_step_size: If True, computes the optimal step size using JVP.
 
     Returns:
-        Tuple[List[Tensor], List[Tensor] or None]:
-            - List of preconditioned gradients (d_G).
-            - List of step sizes (if compute_step_size is True), else None.
+        - List of gradients with respect to Q (d_Q).
     """
     out_grads = []
 
-    for gg in GG:
-        gg = promote(gg)
-
-        if gg.ndim < 2:  # Scalar/Vector
-            S = gg * gg
+    for gg, q in zip(GG, Q):
+        if gg.ndim < 2:  # Scalar/Vector case
+            pp = q * gg * q
+            S = pp * pp
             d_S = S - 1
-            d_G = d_S * gg
-            jvp = (3 * S - 1) * gg
+            d_G = d_S * pp
+            d_Q = 2 * q * gg * d_G
         else:
-            S = gg @ gg.T
-            d_S = S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
-            d_G = d_S @ gg
-            jvp = (3 * S - torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)) @ gg
-
-        if compute_step_size:
-            curvature = jvp.norm().clamp(min=1e-8)
-            d_G = d_G / curvature
-        out_grads.append(d_G)
-
+            pp = q @ gg @ q.T
+            S = pp @ pp.T
+            I = torch.eye(pp.size(0), device=pp.device, dtype=pp.dtype)
+            d_S = S - I
+            d_G = pp.T @ d_S + d_S @ pp
+            d_Q = d_G @ q @ gg.T + gg.T @ q.T @ d_G
+        out_grads.append(d_Q)
     return out_grads
 
 
@@ -2157,11 +2150,11 @@ def inverse_free_psgd_update_precond(
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
-    for i in range(power_iter):
-        G = psgd_precond_grad(G, Q)
-        terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-        matmuled = _psgd_quad_preconditioner_grad(terms)
-        _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
+    terms0 = [compiled_einsum(exprG, G, G) for exprG in exprGs]
+
+    matmuled = _psgd_quad_preconditioner_grad(terms0, Q)
+    _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
+    G = psgd_precond_grad(G, Q)
     return G
 
 
@@ -2456,10 +2449,9 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
 
 @functools.lru_cache(maxsize=None)
 def precond_grad_expr(Q_dim, grad_dim):
-    # expr = [
-    #    f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
-    # ]
-    expr = [f"{c.upper()}{c}" if q_ == 2 else f"{c}" for c, q_ in zip(einsum_base, Q_dim)]
+    expr = [
+        f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
+    ]
     expr = ",".join(expr)
     grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
@@ -2482,7 +2474,7 @@ def psgd_precond_grad(
     md = min_dtype(list(preconds) + [ea])
     args = [q.to(md) for q in preconds]
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
-    new = compiled_einsum(expr, *[a for a in args], ea.to(md))
+    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea.to(md))
     return new.to(ea.dtype)
 
 
