@@ -2067,7 +2067,7 @@ def _psgd_precond_update_(
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        update = torch.where(additive > 0, update, update * q)
+        # update = torch.where(additive > 0, update, update * q)
         norm = update.square().mean()
         update = promote(update)
 
@@ -2075,12 +2075,12 @@ def _psgd_precond_update_(
         lb = state + (norm - state) * alpha
         lb_state.scatter_(0, additive, lb)
 
-        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype) * precond_lr
-        copy_stochastic_(oq, q - update)
+        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype)
+        copy_stochastic_(oq, q - update * precond_lr)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], compute_step_size: bool = True):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
     """
     Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
 
@@ -2088,14 +2088,6 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], compute_st
         The preconditioner Q is updated to make the preconditioned gradient G orthogonal.
         For matrices: G = Q @ GG @ Q.T, target S = G @ G.T ≈ I, minimize MSE(S, I).
         For scalars/vectors: G = Q * GG * Q (element-wise), target G^2 ≈ 1, minimize MSE(G^2, 1).
-
-    Gradient:
-        - Matrices: d_S = S - I, d_G = G.T @ d_S + d_S @ G, d_Q = d_G @ Q @ GG.T + GG.T @ Q.T @ d_G
-        - Scalars/Vectors: d_S = S - 1, d_G = d_S * G, d_Q = 2 * Q * GG * d_G (element-wise)
-
-    JVP (for step size):
-        Approximates curvature by computing the JVP of d_G w.r.t. G with tangent vector G,
-        adjusted proportionally for d_Q computation.
 
     Args:
         GG: List of gradient tensors (gradients of the loss w.r.t. parameters).
@@ -2109,18 +2101,15 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], compute_st
 
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:  # Scalar/Vector case
-            pp = q * gg * q
-            S = pp * pp
-            d_S = S - 1
-            d_G = d_S * pp
-            d_Q = 2 * q * gg * d_G
+            d_Q = q - 1 / gg.sqrt().clamp(min=1e-8)  # difference between analytical solution and current
+            # actual gradient: d_Q = 8 * q ** 3 * gg ** 2 * (q ** 4 * gg ** 2 - 1)
         else:
-            pp = q @ gg @ q.T
-            S = pp @ pp.T
-            I = torch.eye(pp.size(0), device=pp.device, dtype=pp.dtype)
-            d_S = S - I
-            d_G = pp.T @ d_S + d_S @ pp
-            d_Q = d_G @ q @ gg.T + gg.T @ q.T @ d_G
+            G = q @ gg @ q.T  # G = Q GG Q^T
+            S = G @ G.T  # S = G G^T
+            I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)  # Identity matrix
+            d_S = S - I  # d_S = S - I
+            d_G = d_S @ G
+            d_Q = d_G @ gg @ q.T + q @ gg @ d_G.T  # Gradient: dL/dQ
         out_grads.append(d_Q)
     return out_grads
 
