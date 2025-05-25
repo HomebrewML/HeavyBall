@@ -1932,7 +1932,7 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
             eigval, _ = torch.compiler.disable(torch.lobpcg)(A, k=1, largest=True)
             return eigval[0].sqrt()
         else:
-            return torch.linalg.svd(A, driver="gesvdj")[1].max()  # == linalg.matrix_norm(A, ord=2)
+            return torch.linalg.svd(promote(A), driver="gesvdj")[1].max().to(A.dtype)  # == linalg.matrix_norm(A, ord=2)
     except torch.linalg.LinAlgError:
         return torch.zeros((), device=A.device, dtype=A.dtype)
 
@@ -1944,12 +1944,12 @@ def max_singular_value_power_iter(A: Tensor, max_abs: Optional[Tensor] = None, i
     """
     x_norm, max_idx = A.norm(dim=1).max(dim=0)
     x = A.index_select(0, max_idx).flatten().contiguous()
-    A = A / x_norm
-    x = x / x_norm
+    A = (A / x_norm).to(torch.bfloat16)
+    x = (x / x_norm).to(torch.bfloat16)
     for _ in range(iterations):
         x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
         x = x / x.norm()
-    return (x @ A.T.mv(A.mv(x))).sqrt() * x_norm
+    return (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
 
 
 @decorator_knowngood
@@ -2075,12 +2075,12 @@ def _psgd_precond_update_(
         lb = state + (norm - state) * alpha
         lb_state.scatter_(0, additive, lb)
 
-        update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype)
+        # update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype)
         copy_stochastic_(oq, q - update * precond_lr)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
+def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], power_iter: int = 6, update_iter: int = 5):
     """
     Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
 
@@ -2101,16 +2101,16 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor]):
 
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:  # Scalar/Vector case
-            d_Q = q - 1 / gg.sqrt().clamp(min=1e-8)  # difference between analytical solution and current
+            Y = 1 / gg.sqrt().clamp(min=1e-8)  # difference between analytical solution and current
             # actual gradient: d_Q = 8 * q ** 3 * gg ** 2 * (q ** 4 * gg ** 2 - 1)
         else:
-            G = q @ gg @ q.T  # G = Q GG Q^T
-            S = G @ G.T  # S = G G^T
-            I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)  # Identity matrix
-            d_S = S - I  # d_S = S - I
-            d_G = d_S @ G
-            d_Q = d_G @ gg @ q.T + q @ gg @ d_G.T  # Gradient: dL/dQ
-        out_grads.append(d_Q)
+            gg = gg.to(torch.bfloat16)
+            I = torch.eye(gg.shape[0], device=gg.device, dtype=torch.bfloat16)
+            Y = I / max_singular_value(gg, None, power_iter=power_iter)
+            for _ in range(update_iter):
+                Y = Y @ (3 * I - gg @ Y @ Y) / 2
+            Y = Y.to(q.dtype)
+        out_grads.append(q - Y)
     return out_grads
 
 
