@@ -2053,34 +2053,27 @@ def _psgd_precond_update_(
     store_triu_as_line: bool,
     step: Tensor,
 ):
-    step.add_(1)
-    alpha = 1 - beta_debias(lower_bount_beta, step)
-    additive = step % 2
-
-    for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
+    for update, oq in zip(matmuled, Q):
         if isinstance(oq, tuple):
             oq = oq[1]
-        if update.ndim == 2:
-            update = update + update.T  # enforce symmetric matrix
 
         q = promote(oq)
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        # update = torch.where(additive > 0, update, update * q)
-        norm = update.square().mean()
-        update = promote(update)
 
-        state = torch.index_select(lb_state, 0, additive)
-        lb = state + (norm - state) * alpha
-        lb_state.scatter_(0, additive, lb)
-
-        # update = update / lb.sqrt().clamp(min=1e-8).to(update.dtype)
         copy_stochastic_(oq, q - update * precond_lr)
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], power_iter: int = 6, update_iter: int = 5):
+def _psgd_quad_preconditioner_grad(
+    GG: List[Tensor],
+    Q: List[Tensor],
+    power_iter: int = 1,
+    update_iter: int = 12,
+    eps: float = 1e-8,
+    square_root: bool = False,
+):
     """
     Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
 
@@ -2101,16 +2094,23 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], power_iter
 
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:  # Scalar/Vector case
-            Y = 1 / gg.sqrt().clamp(min=1e-8)  # difference between analytical solution and current
+            if square_root:
+                gg = gg.sqrt()
+            n = 1 / gg.clamp(min=eps)  # difference between analytical solution and current
             # actual gradient: d_Q = 8 * q ** 3 * gg ** 2 * (q ** 4 * gg ** 2 - 1)
         else:
-            gg = gg.to(torch.bfloat16)
-            I = torch.eye(gg.shape[0], device=gg.device, dtype=torch.bfloat16)
-            Y = I / max_singular_value(gg, None, power_iter=power_iter)
-            for _ in range(update_iter):
-                Y = Y @ (3 * I - gg @ Y @ Y) / 2
-            Y = Y.to(q.dtype)
-        out_grads.append(q - Y)
+            n = promote(q)
+            gg = gg + torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) * eps
+            gg16 = gg.to(torch.bfloat16)
+            for _ in range(power_iter):
+                n16 = stochastic_round_(gg16, n)
+                if square_root:
+                    residual = gg16 @ n16 @ n16
+                    n = 1.5 * n + promote(n16 @ residual) / 2
+                else:
+                    residual = gg16 @ n16
+                    n = 2 * n + promote(n16 @ residual)
+        out_grads.append(q - n)
     return out_grads
 
 
@@ -2415,7 +2415,7 @@ def precond_grad_cached_(
     md = min_dtype(list(cached_q) + [ea])
     args = [q.to(md) for q in cached_q]
     args = args + [ea.to(md)]
-    expr = cached_precond_grad_expr(ndim_tuple(cached_q), grad.ndim)
+    expr = cached_precond_grad_expr(ndim_tuple(cached_q), ea.ndim)
     new = compiled_einsum(expr, *args)
     if cast:
         return new.to(ea.dtype)
@@ -2437,7 +2437,10 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
 
 
 @functools.lru_cache(maxsize=None)
-def precond_grad_expr(Q_dim, grad_dim):
+def precond_grad_expr(Q_dim, grad_dim, use_q: bool = False):
+    if not use_q:
+        return cached_precond_grad_expr(Q_dim, grad_dim)
+
     expr = [
         f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
     ]
@@ -2455,11 +2458,14 @@ def psgd_precond_grad(
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
+    use_q: bool = False,
 ):
-    if caution:
-        ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
         preconds = line_to_triu(preconds, symmetric_output)
+    if not use_q:
+        return precond_grad_cached_(ea, preconds, caution=caution, grad=grad)
+    if caution:
+        ea = _compilable_cautioning(grad, ea)
     md = min_dtype(list(preconds) + [ea])
     args = [q.to(md) for q in preconds]
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
