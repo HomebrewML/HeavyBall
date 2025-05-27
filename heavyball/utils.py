@@ -33,6 +33,7 @@ _fd_error = (
     "(via opt.finite_differences=True or by subclassing it)\n"
     "Original Error: "
 )
+USE_Q = False
 
 
 def decorator(func):
@@ -2053,15 +2054,31 @@ def _psgd_precond_update_(
     store_triu_as_line: bool,
     step: Tensor,
 ):
-    for update, oq in zip(matmuled, Q):
+    step.add_(1)
+    beta = beta_debias(lower_bount_beta, step)
+    additive = step % 1
+
+    for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
             oq = oq[1]
 
         q = promote(oq)
 
+        update = promote(update)
+        if update.ndim == 2:
+            norm = max_singular_value(update, None, power_iter=4)
+        else:
+            norm = update.abs().max()
+
+        norm = norm.to(lb_state.dtype)
+        state = torch.index_select(lb_state, 0, additive)
+        lb = _lerp([state], [norm], beta)[0]
+        lb = lb.maximum(norm)
+        torch.scatter(lb_state, 0, additive, lb)
+
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-
+        update = update / lb.to(update.dtype)
         copy_stochastic_(oq, q - update * precond_lr)
 
 
@@ -2430,7 +2447,7 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
 
 
 @functools.lru_cache(maxsize=None)
-def precond_grad_expr(Q_dim, grad_dim, use_q: bool = False):
+def precond_grad_expr(Q_dim, grad_dim, use_q: bool = USE_Q):
     if not use_q:
         return cached_precond_grad_expr(Q_dim, grad_dim)
 
@@ -2451,7 +2468,7 @@ def psgd_precond_grad(
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
-    use_q: bool = False,
+    use_q: bool = USE_Q,
 ):
     if store_triu_as_line:
         preconds = line_to_triu(preconds, symmetric_output)
