@@ -420,7 +420,7 @@ class FastINGO:
         population_size: Optional[int] = None,
         learning_rate: Optional[float] = None,
         last_n: int = 4096,
-        loco_step_size: float = 1,
+        loco_step_size: float = 0.1,
         device="cuda",
         batchnorm_decay: float = 0.99,
         score_decay: float = 0.99,
@@ -697,6 +697,10 @@ def init_nsgaii(study, seed, trials, search_space):
     return module.NSGAIIwITSampler(seed=seed)
 
 
+def init_random(study, seed, trials, search_space):
+    return optuna.samplers.RandomSampler(seed=seed)
+
+
 def init_ingo(study, seed, trials, search_space):
     return ImplicitNaturalGradientSampler(search_space=search_space, seed=seed)
 
@@ -712,7 +716,7 @@ class AutoSampler(BaseSampler):
     ) -> None:
         assert constraints_func is None
         if samplers is None:
-            samplers = ((0, init_hebo), (100, init_nsgaii))
+            samplers = ((0, init_botorch), (100, init_nsgaii))
         self.sampler_indices = np.sort(np.array([x[0] for x in samplers], dtype=np.int32))
         self.samplers = [x[1] for x in sorted(samplers, key=lambda x: x[0])]
         self.search_space = search_space

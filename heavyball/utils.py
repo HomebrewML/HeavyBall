@@ -2069,10 +2069,8 @@ def _psgd_precond_update_(
 def _psgd_quad_preconditioner_grad(
     GG: List[Tensor],
     Q: List[Tensor],
-    power_iter: int = 1,
-    update_iter: int = 12,
+    order: int = 1,
     eps: float = 1e-8,
-    square_root: bool = False,
 ):
     """
     Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
@@ -2094,23 +2092,17 @@ def _psgd_quad_preconditioner_grad(
 
     for gg, q in zip(GG, Q):
         if gg.ndim < 2:  # Scalar/Vector case
-            if square_root:
-                gg = gg.sqrt()
-            n = 1 / gg.clamp(min=eps)  # difference between analytical solution and current
+            new = 1 / promote(gg).clamp(min=eps)  # difference between analytical solution and current
             # actual gradient: d_Q = 8 * q ** 3 * gg ** 2 * (q ** 4 * gg ** 2 - 1)
         else:
-            n = promote(q)
-            gg = gg + torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) * eps
-            gg16 = gg.to(torch.bfloat16)
-            for _ in range(power_iter):
-                n16 = stochastic_round_(gg16, n)
-                if square_root:
-                    residual = gg16 @ n16 @ n16
-                    n = 1.5 * n + promote(n16 @ residual) / 2
-                else:
-                    residual = gg16 @ n16
-                    n = 2 * n + promote(n16 @ residual)
-        out_grads.append(q - n)
+            base = promote(q) - promote(gg)  # Q - QXQ
+            prev = b16 = base.to(torch.bfloat16)
+            new = promote(q) + base
+            for _ in range(1, order):
+                prev = prev @ b16
+                new = new + prev
+            new = (new + new.T) / 2
+        out_grads.append(q - new)
     return out_grads
 
 
@@ -2139,10 +2131,11 @@ def inverse_free_psgd_update_precond(
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
 
-    terms0 = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-
-    matmuled = _psgd_quad_preconditioner_grad(terms0, Q)
-    _psgd_precond_update_(matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
+    for i in range(power_iter):
+        G = psgd_precond_grad(G, Q)
+        terms0 = [compiled_einsum(exprG, G, G) for exprG in exprGs]
+        grads = _psgd_quad_preconditioner_grad(terms0, Q)
+        _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     G = psgd_precond_grad(G, Q)
     return G
 
