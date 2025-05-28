@@ -2115,7 +2115,7 @@ def _psgd_quad_preconditioner_grad(
             new = promote(q) + base
             for _ in range(1, order):
                 prev = prev @ b16
-                new = new + prev
+                new = new + promote(prev)
             new = (new + new.T) / 2
         out_grads.append(q - new)
     return out_grads
