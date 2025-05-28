@@ -367,7 +367,7 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
     )
 
 
-@decorator
+@decorator_knowngood
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -2065,6 +2065,12 @@ def _psgd_precond_update_(
 
         q = promote(oq)
 
+        update_shape = update.shape
+        is_mat = update.ndim == 2
+        if is_mat:
+            update = triu_to_line([update])[0][1]
+            if q.shape != update.shape:
+                q = triu_to_line([q])[0][1]
         update = promote(update)
         update = torch.where(additive > 0, update, update * q / update.abs().max().clamp(min=eps))
 
@@ -2074,10 +2080,13 @@ def _psgd_precond_update_(
         lb = _lerp([state], [norm], beta)[0]
         torch.scatter(lb_state, 0, additive, lb)
 
-        if store_triu_as_line and update.ndim == 2:
-            update = triu_to_line([update])[0][1]
         update = update / lb.clamp(min=eps).to(update.dtype)
-        copy_stochastic_(oq, q - update * precond_lr)
+        update = q - update * precond_lr
+
+        if not store_triu_as_line and is_mat:
+            update = line_to_triu([(update_shape, update)], symmetric_output=True)[0]
+
+        copy_stochastic_(oq, update)
 
 
 @decorator_knowngood
