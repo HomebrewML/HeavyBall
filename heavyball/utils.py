@@ -2053,10 +2053,11 @@ def _psgd_precond_update_(
     precond_lr: Tensor,
     store_triu_as_line: bool,
     step: Tensor,
+    eps: float = 1e-8,
 ):
-    step.add_(1)
-    beta = beta_debias(lower_bount_beta, step)
+    beta = beta_debias(lower_bount_beta, step // 2 + 1)
     additive = step % 2
+    step.add_(1)
 
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
@@ -2065,7 +2066,7 @@ def _psgd_precond_update_(
         q = promote(oq)
 
         update = promote(update)
-        update = torch.where(additive > 0, update, update * q / update.abs().max())
+        update = torch.where(additive > 0, update, update * q / update.abs().max().clamp(min=eps))
 
         norm = update.square().mean()
         norm = norm.to(lb_state.dtype)
@@ -2075,7 +2076,7 @@ def _psgd_precond_update_(
 
         if store_triu_as_line and update.ndim == 2:
             update = triu_to_line([update])[0][1]
-        update = update / lb.to(update.dtype)
+        update = update / lb.clamp(min=eps).to(update.dtype)
         copy_stochastic_(oq, q - update * precond_lr)
 
 
