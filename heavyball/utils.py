@@ -1381,11 +1381,14 @@ def stochastic_round_list_(ref: List[Tensor], source: List[Tensor]):
 
 
 @decorator_knowngood
-def stochastic_round_(ref: Tensor, source: Tensor):
-    if source.dtype == torch.bfloat16 or ref.dtype == source.dtype:
-        return source
-    if ref.dtype != torch.bfloat16:
-        return source.to(ref.dtype)
+def stochastic_round_(ref: Tensor, source: Tensor | None = None):
+    if source is not None:
+        if source.dtype == torch.bfloat16 or ref.dtype == source.dtype:
+            return source
+        if ref.dtype != torch.bfloat16:
+            return source.to(ref.dtype)
+    else:
+        source = ref
     result = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
     result.add_(source.view(dtype=torch.int32))
     result.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
@@ -2061,6 +2064,8 @@ def _psgd_precond_update_(
 
 
 def eye_like(x: Tensor):
+    if x.ndim < 2:
+        return torch.ones_like(x)
     assert x.ndim == 2
     assert x.size(0) == x.size(1)
     return torch.eye(x.size(0), device=x.device, dtype=x.dtype)
@@ -2091,14 +2096,14 @@ def _psgd_quad_preconditioner_grad(
     Returns:
         - List of gradients with respect to Q (d_Q).
     """
-    new_Q = [q / q.norm().clamp(min=1) for q in Q]  # maximal singular value has to be <1 for NS to find solution
+    new_Q = [eye_like(q) / q.numel() ** 0.5 for q in Q]  # maximal singular value has to be <1 for NS to find solution
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
     P0 = G
-    G16 = G.to(torch.bfloat16)
+    G16 = stochastic_round_(G)
     for i in range(order):
-        P = psgd_precond_grad(G16, [stochastic_round_(G16, q) for q in new_Q])  # Q₀GQ₁
+        P = psgd_precond_grad(G16, [stochastic_round_(q) for q in new_Q])  # Q₀GQ₁
         if i == 0:
             P0 = P.to(G.dtype)
         for q, exprG, size in zip(new_Q, exprGs, dim_size):
