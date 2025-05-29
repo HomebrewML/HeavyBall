@@ -33,7 +33,6 @@ _fd_error = (
     "(via opt.finite_differences=True or by subclassing it)\n"
     "Original Error: "
 )
-USE_Q = False
 
 
 def decorator(func):
@@ -2016,34 +2015,6 @@ def calcG_expr(q_dim, g_dim):
     return exprs
 
 
-@decorator
-def psgd_update_precond(
-    G: Tensor,
-    precond_lr: float,
-    oq: "TriuOrLine",
-    store_triu_as_line: bool,
-    velocity: Optional[List[Tensor]],
-    beta2: float,
-    ortho_method: Optional[str],
-    V: Tensor,
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: float,
-    power_iter: int,
-    step: Tensor,
-) -> None:
-    """Update Kronecker product preconditioner Q with pair (V, G)."""
-    Q = to_triu(oq)
-    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-    precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-
-    A, conjB = psgd_calc_A_and_conjB(G, Q, V)
-    terms = [(compiled_einsum(exprG, A, A), compiled_einsum(exprG, conjB, conjB)) for exprG in exprGs]
-    del A, conjB, V
-    updates = _psgd_default_preconditioner_grad(terms, Q)
-    _psgd_precond_update_(updates, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
-    return None
-
-
 @decorator_knowngood
 def _psgd_precond_update_(
     matmuled: List[Optional[Tensor]],
@@ -2089,45 +2060,50 @@ def _psgd_precond_update_(
         copy_stochastic_(oq, update)
 
 
+def eye_like(x: Tensor):
+    assert x.ndim == 2
+    assert x.size(0) == x.size(1)
+    return torch.eye(x.size(0), device=x.device, dtype=x.dtype)
+
+
 @decorator_knowngood
 def _psgd_quad_preconditioner_grad(
-    GG: List[Tensor],
+    G: Tensor,
     Q: List[Tensor],
-    order: int = 1,
-    eps: float = 1e-8,
+    order: int = 10,
 ):
     """
-    Computes the gradient with respect to the preconditioner Q and optionally the optimal step size using forward-mode AD.
-
     Idea:
-        The preconditioner Q is updated to make the preconditioned gradient G orthogonal.
-        For matrices: G = Q @ GG @ Q.T, target S = G @ G.T ≈ I, minimize MSE(S, I).
-        For scalars/vectors: G = Q * GG * Q (element-wise), target G^2 ≈ 1, minimize MSE(G^2, 1).
+        Q approximates G^-1
+        For matrices: G = Q @ (2 * I - GG.T @ Q) == NewtonSchulz*
+        For scalars/vectors: directly compute the corret inverse
+        ---
+        * Assuming GG.T should be inverted, NewtonSchulz wants Q(2I - GG.TQ)
+          However, computing Q@GG.T@Q with respect to the unused preconditioners is costly.
+          So, we precompute QG and run `(QG)@(QG).T == QGG.TQ.T`
+          With a symmetric Q, we get QGG.TQ.T = QGG.TQ - precisely the update we need for the NS iteration
+          Further, Q @ (2 * I - GG.T @ Q) == 2 * Q - Q @ GG.T @ Q. So, the update becomes 2Q-(QG)@(QG).T
 
     Args:
         GG: List of gradient tensors (gradients of the loss w.r.t. parameters).
         Q: List of preconditioner tensors.
-        compute_step_size: If True, computes the optimal step size using JVP.
 
     Returns:
         - List of gradients with respect to Q (d_Q).
     """
-    out_grads = []
+    new_Q = [q / q.norm().clamp(min=1e-8) for q in Q]  # maximal singular value has to be <1 for NS to find solution
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+    dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
-    for gg, q in zip(GG, Q):
-        if gg.ndim < 2:  # Scalar/Vector case
-            new = 1 / promote(gg).clamp(min=eps)  # difference between analytical solution and current
-            # actual gradient: d_Q = 8 * q ** 3 * gg ** 2 * (q ** 4 * gg ** 2 - 1)
-        else:
-            base = promote(q) - promote(gg)  # Q - QXQ
-            prev = b16 = base.to(torch.bfloat16)
-            new = promote(q) + base
-            for _ in range(1, order):
-                prev = prev @ b16
-                new = new + promote(prev)
-            new = (new + new.T) / 2
-        out_grads.append(q - new)
-    return out_grads
+    for _ in range(order):
+        P = psgd_precond_grad(G, new_Q)  # Q₀GQ₁
+        for q, exprG, size in zip(new_Q, exprGs, dim_size):
+            pp = compiled_einsum(exprG, P, P)  # (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
+            if pp.ndim == 2:
+                pp = (pp + pp.T) / 2  # ensure pp is symmetric
+            scale = size / P.numel()  # match expected magnitude
+            q.sub_(pp, alpha=scale / 2)  # quadratic NS update with inlined scaling
+    return [q - n for q, n in zip(Q, new_Q)]  # pseudo-gradient of current "optimum" via NS vs original
 
 
 @decorator
@@ -2153,15 +2129,10 @@ def inverse_free_psgd_update_precond(
 
     Q = to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-
-    for i in range(power_iter):
-        G = psgd_precond_grad(G, Q)
-        terms0 = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-        grads = _psgd_quad_preconditioner_grad(terms0, Q)
-        _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
-    G = psgd_precond_grad(G, Q)
-    return G
+    grads = _psgd_quad_preconditioner_grad(G, Q)
+    _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
+    P = psgd_precond_grad(G, Q)
+    return P
 
 
 @decorator_knowngood
@@ -2453,20 +2424,6 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
     _compilable_fused_precond_grad_cached_(ea, param, lr, grad, decay, caution, cached_q)
 
 
-@functools.lru_cache(maxsize=None)
-def precond_grad_expr(Q_dim, grad_dim, use_q: bool = USE_Q):
-    if not use_q:
-        return cached_precond_grad_expr(Q_dim, grad_dim)
-
-    expr = [
-        f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
-    ]
-    expr = ",".join(expr)
-    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
-    out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
-    return f"{expr},{grad_expr}->{out_expr}"
-
-
 @decorator_knowngood
 def psgd_precond_grad(
     ea: Tensor,
@@ -2475,19 +2432,10 @@ def psgd_precond_grad(
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
-    use_q: bool = USE_Q,
 ):
     if store_triu_as_line:
         preconds = line_to_triu(preconds, symmetric_output)
-    if not use_q:
-        return precond_grad_cached_(ea, preconds, caution=caution, grad=grad)
-    if caution:
-        ea = _compilable_cautioning(grad, ea)
-    md = min_dtype(list(preconds) + [ea])
-    args = [q.to(md) for q in preconds]
-    expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
-    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea.to(md))
-    return new.to(ea.dtype)
+    return precond_grad_cached_(ea, preconds, caution=caution, grad=grad)
 
 
 @decorator_knowngood
