@@ -2046,7 +2046,8 @@ def _psgd_precond_update_(
             if q.shape != update.shape:
                 q = triu_to_line([q])[0][1]
         update = promote(update)
-        update = torch.where(additive > 0, update, update * q / update.abs().max().clamp(min=eps))
+        # multiplicative learning is attractive, but makes little sense if our "gradient" is `optimum - current`
+        # it would go here
 
         norm = update.square().mean()
         norm = norm.to(lb_state.dtype)
@@ -2054,7 +2055,7 @@ def _psgd_precond_update_(
         lb = _lerp([state], [norm], beta)[0]
         torch.scatter(lb_state, 0, additive, lb)
 
-        update = update / lb.clamp(min=eps).to(update.dtype)
+        update = update / lb.sqrt().clamp(min=eps).to(update.dtype)
         update = q - update * precond_lr
 
         if not store_triu_as_line and is_mat:
@@ -2108,10 +2109,10 @@ def _psgd_quad_preconditioner_grad(
             P0 = P.to(G.dtype)
         for q, exprG, size in zip(new_Q, exprGs, dim_size):
             pp = compiled_einsum(exprG, P, P)  # (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
-            if pp.ndim == 2:
-                pp = (pp + pp.T) / 2  # ensure pp is symmetric
             scale = size / P.numel()  # match expected magnitude
             q -= promote(pp) * scale / 2  # quadratic NS update with inlined scaling
+            if q.ndim == 2:
+                q.copy_((q + q.T) / 2)  # ensure q is symmetric
     return [q - n for q, n in zip(Q, new_Q)], P0  # pseudo-gradient of current "optimum" via NS vs original
 
 
