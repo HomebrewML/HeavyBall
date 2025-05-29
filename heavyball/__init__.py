@@ -735,7 +735,7 @@ class NewtonHybrid2PSGDKron(ForeachCachedNewtonPSGD):
 
 class QUAD(ForeachPSGDKron):
     quad = True
-    cached = True
+    cached = False
 
 
 class ForeachPSGDLRA(C.BaseOpt):
