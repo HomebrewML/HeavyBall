@@ -2049,7 +2049,7 @@ def _psgd_precond_update_(
         # multiplicative learning is attractive, but makes little sense if our "gradient" is `optimum - current`
         # it would go here
 
-        norm = update.square().mean()
+        norm = update.square().sum(0).mean()
         norm = norm.to(lb_state.dtype)
         state = torch.index_select(lb_state, 0, additive)
         lb = _lerp([state], [norm], beta)[0]
