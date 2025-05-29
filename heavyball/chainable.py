@@ -637,7 +637,7 @@ def _update_psgd_precond(
     else:
         vector, hessian_vector = utils.dampen_grad(grad, group["dampening"])
 
-    precond = (utils.inverse_free_psgd_update_precond if vector is None else utils.psgd_update_precond)(
+    precond = utils.inverse_free_psgd_update_precond(
         hessian_vector,
         group["precond_lr"],
         Q,
