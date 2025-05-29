@@ -2070,7 +2070,7 @@ def eye_like(x: Tensor):
 def _psgd_quad_preconditioner_grad(
     G: Tensor,
     Q: List[Tensor],
-    order: int = 10,
+    order: int,
 ):
     """
     Idea:
@@ -2091,19 +2091,23 @@ def _psgd_quad_preconditioner_grad(
     Returns:
         - List of gradients with respect to Q (d_Q).
     """
-    new_Q = [q / q.norm().clamp(min=1e-8) for q in Q]  # maximal singular value has to be <1 for NS to find solution
+    new_Q = [q / q.norm().clamp(min=1) for q in Q]  # maximal singular value has to be <1 for NS to find solution
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
-    for _ in range(order):
-        P = psgd_precond_grad(G, new_Q)  # Q₀GQ₁
+    P0 = G
+    G16 = G.to(torch.bfloat16)
+    for i in range(order):
+        P = psgd_precond_grad(G16, [stochastic_round_(G16, q) for q in new_Q])  # Q₀GQ₁
+        if i == 0:
+            P0 = P.to(G.dtype)
         for q, exprG, size in zip(new_Q, exprGs, dim_size):
             pp = compiled_einsum(exprG, P, P)  # (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
             if pp.ndim == 2:
                 pp = (pp + pp.T) / 2  # ensure pp is symmetric
             scale = size / P.numel()  # match expected magnitude
-            q.sub_(pp, alpha=scale / 2)  # quadratic NS update with inlined scaling
-    return [q - n for q, n in zip(Q, new_Q)]  # pseudo-gradient of current "optimum" via NS vs original
+            q -= promote(pp) * scale / 2  # quadratic NS update with inlined scaling
+    return [q - n for q, n in zip(Q, new_Q)], P0  # pseudo-gradient of current "optimum" via NS vs original
 
 
 @decorator
@@ -2129,9 +2133,8 @@ def inverse_free_psgd_update_precond(
 
     Q = to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    grads = _psgd_quad_preconditioner_grad(G, Q)
+    grads, P = _psgd_quad_preconditioner_grad(G, Q, power_iter)
     _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
-    P = psgd_precond_grad(G, Q)
     return P
 
 
