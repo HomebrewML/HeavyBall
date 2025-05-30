@@ -2133,7 +2133,7 @@ def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
 
 
 @decorator_knowngood
-def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int):
+def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_iter: int = 4):
     """
     Idea:
         Q approximates G^-1
@@ -2147,13 +2147,21 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int):
           Further, Q @ (2 * I - GG.T @ Q) == 2 * Q - Q @ GG.T @ Q. So, the update becomes 2Q-(QG)@(QG).T
 
     Args:
-        GG: List of gradient tensors (gradients of the loss w.r.t. parameters).
-        Q: List of preconditioner tensors.
+        G: Gradient tensor to be preconditioned (gradient of the loss w.r.t. parameters)
+        Q: List of preconditioner tensors
+        order: Number of Newton-Schulz iterations
+        power_iter: Power iterations used in initial precond estimate
+
+    Hints:
+        * more `power_iter` -> better initial guess -> lower `order` required (recommended <20)
+        * higher `order` -> higher general accuracy -> lower `power_iter` required (recommended <80)
+        * `order` is more expensive but will yield rewards for longer. with large batches, both should be set high.
 
     Returns:
         - List of gradients with respect to Q (d_Q).
+
     """
-    new_Q = [eye_like(q) / q.numel() ** 0.5 for q in Q]  # maximal singular value has to be <1 for NS to find solution
+    new_Q = [q.clone() for q in Q]
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
@@ -2163,13 +2171,20 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int):
         P = psgd_precond_grad(G16, [stochastic_round_(q) for q in new_Q])  # Q₀GQ₁
         if i == 0:
             P0 = P.to(G.dtype)
-        for q, exprG, size in zip(new_Q, exprGs, dim_size):
-            pp = compiled_einsum(exprG, P, P)  # (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
-            scale = size / P.numel()  # match expected magnitude
-            q -= promote(pp) * scale / 2  # quadratic NS update with inlined scaling
-            if q.ndim == 2:
-                q.copy_((q + q.T) / 2)  # ensure q is symmetric
-    return [q - n for q, n in zip(Q, new_Q)], P0  # pseudo-gradient of current "optimum" via NS vs original
+            svds = [1 / promote(max_singular_value(q, power_iter=power_iter)).clamp(min=1e-8) for q in new_Q]
+            stochastic_multiply_(new_Q, svds)
+            stochastic_multiply_(P, functools.reduce(torch.multiply, svds))
+
+        # PPs = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
+        PPs = [compiled_einsum(exprG, P, P) * size / P.numel() for exprG, size in zip(exprGs, dim_size)]
+        stochastic_add_(new_Q, PPs, -0.5)
+
+    for q, n in zip(Q, new_Q):
+        if n.ndim == 2:
+            n = (n + n.T) / 2  # ensure new_Q is symmetric
+        copy_stochastic_(n, q - n)  # pseudo-gradient of current "optimum" via NS vs original
+
+    return new_Q, P0
 
 
 @decorator
