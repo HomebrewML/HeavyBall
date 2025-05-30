@@ -2223,7 +2223,7 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_i
     for i in range(order):
         P = psgd_precond_grad(G16, [stochastic_round_(q) for q in new_Q])  # Q₀GQ₁
         if i == 0:
-            P0 = P.to(G.dtype)
+            P0 = P.to(G.dtype).clone()
             svds = [1 / promote(max_singular_value(q, power_iter=power_iter)).clamp(min=1e-8) for q in new_Q]
             stochastic_multiply_(new_Q, svds)
             stochastic_multiply_(P, functools.reduce(torch.multiply, svds))
