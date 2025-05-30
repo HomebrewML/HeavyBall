@@ -2228,13 +2228,15 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_i
             stochastic_multiply_(new_Q, svds)
             stochastic_multiply_(P, functools.reduce(torch.multiply, svds))
 
-        # PPs = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
-        PPs = [compiled_einsum(exprG, P, P) * size / P.numel() for exprG, size in zip(exprGs, dim_size)]
-        stochastic_add_(new_Q, PPs, -0.5)
+        for q, exprG, size in zip(new_Q, exprGs, dim_size):
+            # PP = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
+            PP = compiled_einsum(exprG, P, P) * size / P.numel()  # rescale, as X@X.T sums over X.size(1) items
+            new = promote(q) - promote(PP) / 2
+            if q.ndim == 2:
+                new = (new + new.T) / 2  # ensure new_Q is symmetric
+            copy_stochastic_(q, new)
 
     for q, n in zip(Q, new_Q):
-        if n.ndim == 2:
-            n = (n + n.T) / 2  # ensure new_Q is symmetric
         copy_stochastic_(n, q - n)  # pseudo-gradient of current "optimum" via NS vs original
 
     return new_Q, P0
