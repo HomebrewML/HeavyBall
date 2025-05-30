@@ -370,8 +370,8 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.to(torch.bfloat16 if G.dtype != torch.float64 else G.dtype)  # Preserve float64 if present
-    X /= X.norm() + eps  # ensure top singular value <= 1
+    X = G if G.dtype == torch.float64 else stochastic_round_(G)
+    stochastic_multiply_(X, G.norm() + eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -1947,12 +1947,13 @@ def max_singular_value_power_iter(A: Tensor, max_abs: Optional[Tensor] = None, i
     Rayleigh quotient of row with the largest norm + optional power iterations
     """
     x_norm, max_idx = A.norm(dim=1).max(dim=0)
+    x_norm_inv = 1 / promote(x_norm)
     x = A.index_select(0, max_idx).flatten().contiguous()
-    A = (A / x_norm).to(torch.bfloat16)
-    x = (x / x_norm).to(torch.bfloat16)
+    A = stochastic_round_(A * x_norm_inv)
+    x = stochastic_round_(x * x_norm_inv)
     for _ in range(iterations):
         x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-        x = x / x.norm()
+        stochastic_multiply_(x, x_norm_inv)
     return (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
 
 
