@@ -1389,6 +1389,7 @@ def stochastic_round_(ref: Tensor, source: Tensor | None = None):
             return source.to(ref.dtype)
     else:
         source = ref
+    source = source.float()
     result = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
     result.add_(source.view(dtype=torch.int32))
     result.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
