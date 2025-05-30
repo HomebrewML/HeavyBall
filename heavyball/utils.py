@@ -2049,6 +2049,7 @@ def _psgd_precond_update_(
         update = promote(update)
         # multiplicative learning is attractive, but makes little sense if our "gradient" is `optimum - current`
         # it would go here
+        # update = torch.where(additive > 0, update, update * q / update.abs().max().clamp(min=eps))
 
         norm = update.square().sum(0).mean()
         norm = norm.to(lb_state.dtype)
@@ -2074,11 +2075,60 @@ def eye_like(x: Tensor):
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(
-    G: Tensor,
-    Q: List[Tensor],
-    order: int,
-):
+def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
+    """
+    Idea:
+        G should be zeroth power. So, all Qs together should approximate the G's inverse.
+        Assuming G is 2-dimensional, we'd have two preconditioning Q's: L, R
+        Optimize LGR being a zeroth power using `MSE( (LGR) (LGR).T , I ) + MSE( (LGR).T + (LGR) , I )`,
+        then backprop to L/R jointly.
+        This function computes the gradients for L/R, with an outer optimizer layer handling the rest.
+
+        `psgd_precond_grad` computes LGR for the general (n-dimensional) case
+        `exprG` contains the einsum expressions to compute (LGR)(LGR).T (and (LGR).T(LGR)) for the general n-dim case
+    Args:
+        G: Gradient that should be orthogonalized
+        Q: List of preconditioner tensors.
+
+    Returns:
+        - List of gradients with respect to Q (d_Q).
+    """
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+
+    G16 = stochastic_round_(G)
+    Q16 = [stochastic_round_(q) for q in Q]
+    P = psgd_precond_grad(G16, Q16)  # Q₀GQ₁
+
+    d_P = torch.zeros_like(G)
+    base = einsum_base[: G.ndim]
+    for i, exprG in enumerate(exprGs):
+        pp = compiled_einsum(exprG, P, P)
+        error = pp - eye_like(pp)
+        dim = einsum_base[i]
+        if pp.ndim == 2:
+            new = dim.upper()
+            prec = f"{new}{dim}"
+        else:
+            new = dim
+            prec = dim
+        d_P += torch.einsum(f"{base},{prec}->{base.replace(dim, new)}", P, error)
+
+    d_P = stochastic_round_(d_P)  # accumulate in fp32 and round at the end
+    grads = []
+    for i, exprG in enumerate(exprGs):
+        new_q = Q16[:]
+        new_q[i] = eye_like(new_q[i])
+        pq = psgd_precond_grad(G16, new_q)
+        grad = compiled_einsum(exprG, pq, d_P)
+        if grad.ndim == 2:
+            grad = (grad + grad.T) / 2
+        grads.append(grad)
+
+    return grads, P.to(G.dtype)
+
+
+@decorator_knowngood
+def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int):
     """
     Idea:
         Q approximates G^-1
@@ -2140,7 +2190,7 @@ def inverse_free_psgd_update_precond(
 
     Q = to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    grads, P = _psgd_quad_preconditioner_grad(G, Q, power_iter)
+    grads, P = _gg_inverse_via_newtonschulz(G, Q, power_iter)
     _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
     return P
 
