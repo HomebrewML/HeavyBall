@@ -658,7 +658,7 @@ def _compilable_stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[f
         copy_stochastic_(x_, x32 + y32 * alpha)
 
 
-def stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor] = 1):
+def stochastic_add_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1):
     x, y = broadcastable_list_guard(x, y)
     alpha = scalar_guard(alpha, x[0])
     _compilable_stochastic_add_(x, y, alpha)
@@ -672,7 +672,9 @@ def _compilable_stochastic_add_divide_(x: List[Tensor], y: List[Tensor], alpha: 
         copy_stochastic_(x_, (x32 + y32 * alpha) / divisor)
 
 
-def stochastic_add_divide_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor] = 1, divisor: float = 1):
+def stochastic_add_divide_(
+    x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1, divisor: float = 1
+):
     x, y = broadcastable_list_guard(x, y)
     alpha, divisor = scalar_guard(alpha, divisor, x[0])
     _compilable_stochastic_add_divide_(x, y, alpha, divisor)
@@ -686,7 +688,7 @@ def _compilable_stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
         copy_stochastic_(x_, x32 * y32)
 
 
-def stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
+def stochastic_multiply_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor):
     x, y = broadcastable_list_guard(x, y)
     _compilable_stochastic_multiply_(x, y)
 
@@ -1973,8 +1975,10 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
 
 @decorator_knowngood
 def max_singular_value(
-    A: Tensor, max_abs: Optional[Tensor], max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0
+    A: Tensor, max_abs: Optional[Tensor] = None, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0
 ) -> Tensor:
+    if A.ndim < 2:
+        return A.abs().max()
     if min(A.shape) <= max_svd:
         return max_singular_value_exact(A)  # SVD needs ~25% more runtime for size=32, but 0% error instead of 5%
     if use_cholesky or power_iter < 0:
