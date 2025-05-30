@@ -2062,7 +2062,7 @@ def _psgd_precond_update_(
         lb = _lerp([state], [norm], beta)[0]
         torch.scatter(lb_state, 0, additive, lb)
 
-        update = update / lb.sqrt().clamp(min=eps).to(update.dtype)
+        update = update  # / lb.sqrt().clamp(min=eps).to(update.dtype)
         update = q - update * precond_lr
 
         if not store_triu_as_line and is_mat:
@@ -2130,6 +2130,59 @@ def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
         grads.append(grad)
 
     return grads, P.to(G.dtype)
+
+
+def _inverse_initial_guess(gg):
+    n = gg.shape[0]
+
+    sigma_max = promote(gg.norm())
+
+    trace_gg = promote(torch.trace(gg))
+    sigma_min_approx = trace_gg / (n * sigma_max)
+
+    return sigma_max, sigma_min_approx
+
+
+@decorator_knowngood
+@torch.compiler.assume_constant_result
+def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
+    k = torch.arange(degree, dtype=torch.float64, device=device)
+    rotation = (2 * k + 1) * math.pi / (2 * degree)
+    f = (rotation.cos() + 1 + eps) ** -0.5
+    rotation = torch.where((rotation.view(-1, 1) * k[1:].view(1, -1)).cos())
+    coeff0 = f.sum() / degree
+    coeffs = f @ rotation * 2 / degree
+    return coeff0.float(), coeffs.float()
+
+
+@decorator_knowngood
+def bf16_matmul(x: Tensor, y: Tensor):
+    return (stochastic_round_(x) @ stochastic_round_(y)).to(x.dtype)
+
+
+@decorator_knowngood
+def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
+    """
+    This function is a helper for `_gg_inverse_via_newtonschulz` to compute a better initial guess.
+    It cannot be used by itself.
+    """
+    coeff0, coeffs = _chebychef_coeff(degree, gg.device)
+
+    sigma_max, sigma_min = _inverse_initial_guess(gg)
+    c = 2.0 / (sigma_max + sigma_min)
+    d = (sigma_max - sigma_min) / (sigma_max + sigma_min)
+
+    gg = promote(gg)
+    I = eye_like(gg)
+    B = c * gg - d * I
+    inverse = coeff0 * I
+
+    T_prev, T_curr = I, B
+    for c in coeffs:
+        stochastic_add_(inverse, T_curr, c)
+        T_prev, T_curr = T_curr, 2 * bf16_matmul(B, T_curr) - T_prev
+
+    return inverse * c.sqrt()
 
 
 @decorator_knowngood
