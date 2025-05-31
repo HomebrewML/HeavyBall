@@ -1450,7 +1450,7 @@ def _max_idx(x: List[int]):
 @decorator_knowngood
 def stable_exp(x: Tensor):
     # fp16:
-    #   exp(x) is stable in [-17, 11]
+    #   exp(x) is stable in [-17, 11]k
     #   `stable_exp` extends to [-17, 17]
     #   average error (in [-10, 10]) increased from 2.288e-3 to 2.299e-3
     # fp32:
@@ -1993,22 +1993,6 @@ def max_singular_value(
 
 
 @decorator_knowngood
-def _psgd_default_preconditioner_grad(
-    terms: List[Tuple[Tensor, Tensor]],
-    Q: List[Tensor],
-) -> List[Tensor]:
-    out = []
-    for q, (x, y) in zip(Q, terms):
-        x = promote(x)
-        y = promote(y)
-        update = x - y
-        if q.ndim == 2:
-            update = update.triu()
-        out.append(update)
-    return out
-
-
-@decorator_knowngood
 def to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
     if isinstance(Q[0], tuple):
         return line_to_triu(Q, symmetric_output)
@@ -2028,53 +2012,6 @@ def calcG_expr(q_dim, g_dim):
             out = base[i]
         exprs.append(f"{base},{''.join(new)}->{out}")
     return exprs
-
-
-@decorator_knowngood
-def _psgd_precond_update_(
-    matmuled: List[Optional[Tensor]],
-    Q: "TriuOrLine",
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: Tensor,
-    precond_lr: Tensor,
-    store_triu_as_line: bool,
-    step: Tensor,
-    eps: float = 1e-8,
-):
-    beta = beta_debias(lower_bount_beta, step // 2 + 1)
-    additive = step % 2
-    step.add_(1)
-
-    for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
-        if isinstance(oq, tuple):
-            oq = oq[1]
-
-        q = promote(oq)
-
-        update_shape = update.shape
-        is_mat = update.ndim == 2
-        if is_mat:
-            update = triu_to_line([update])[0][1]
-            if q.shape != update.shape:
-                q = triu_to_line([q])[0][1]
-        update = promote(update)
-        # multiplicative learning is attractive, but makes little sense if our "gradient" is `optimum - current`
-        # it would go here
-        # update = torch.where(additive > 0, update, update * q / update.abs().max().clamp(min=eps))
-
-        norm = update.square().sum(0).mean()
-        norm = norm.to(lb_state.dtype)
-        state = torch.index_select(lb_state, 0, additive)
-        lb = _lerp([state], [norm], beta)[0]
-        torch.scatter(lb_state, 0, additive, lb)
-
-        update = update  # / lb.sqrt().clamp(min=eps).to(update.dtype)
-        update = q - update * precond_lr
-
-        if not store_triu_as_line and is_mat:
-            update = line_to_triu([(update_shape, update)], symmetric_output=True)[0]
-
-        copy_stochastic_(oq, update)
 
 
 def eye_like(x: Tensor):
@@ -2192,7 +2129,9 @@ def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
 
 
 @decorator_knowngood
-def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, eps: float = 1e-6):
+def _gg_inverse_via_newtonschulz(
+    G: Tensor, oq: "TriuOrLine", order: int, precond_lr: Tensor, eps: float = 1e-6, multiplicative_update: bool = False
+):
     """
     Idea:
         Q approximates G^-1
@@ -2220,6 +2159,7 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, eps: fl
         - List of gradients with respect to Q (d_Q).
 
     """
+    Q = to_triu(oq, True)
     new_Q = [q.clone() for q in Q]
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
@@ -2243,10 +2183,30 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, eps: fl
                 new = (1 / X_estimate.clamp(min=eps)).to(q.dtype)
             copy_stochastic_(q, new)
 
-    for q, n in zip(Q, new_Q):
-        copy_stochastic_(n, q - n)  # pseudo-gradient of current "optimum" via NS vs original
+    for update, oq, lb_state in zip(new_Q, Q):
+        store_triu_as_line = isinstance(oq, tuple)
+        if store_triu_as_line:
+            store_triu_as_line = True
+            oq = oq[1]
+        q = promote(oq)
 
-    return new_Q, P0
+        update = promote(update)
+        if multiplicative_update:
+            if update.ndim == 2:
+                if q.shape != update.shape:
+                    q = line_to_triu([(update.shape, q)], symmetric_output=True)[0]
+                update = q @ update
+            else:
+                update = q * update
+
+        update = update / max_singular_value(update, power_iter=4).clamp(min=eps).to(update.dtype)
+        if store_triu_as_line and update.ndim == 2:
+            update = triu_to_line([update])[0][1]
+
+        update = q + (update - q) * precond_lr
+        copy_stochastic_(oq, update)
+
+    return P0
 
 
 @decorator
@@ -2270,11 +2230,8 @@ def inverse_free_psgd_update_precond(
     assert velocity is None
     del V, ortho_method, velocity
 
-    Q = to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    grads, P = _gg_inverse_via_newtonschulz(G, Q, power_iter)
-    _psgd_precond_update_(grads, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, step)
-    return P
+    return _gg_inverse_via_newtonschulz(G, oq, power_iter, precond_lr)
 
 
 @decorator_knowngood
