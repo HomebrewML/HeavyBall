@@ -2183,7 +2183,7 @@ def _gg_inverse_via_newtonschulz(
                 new = (1 / X_estimate.clamp(min=eps)).to(q.dtype)
             copy_stochastic_(q, new)
 
-    for update, oq, lb_state in zip(new_Q, Q):
+    for update, oq in zip(new_Q, Q):
         store_triu_as_line = isinstance(oq, tuple)
         if store_triu_as_line:
             store_triu_as_line = True
