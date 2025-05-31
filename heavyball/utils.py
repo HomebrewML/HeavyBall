@@ -2231,9 +2231,11 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_i
         for q, exprG, size in zip(new_Q, exprGs, dim_size):
             # PP = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
             PP = compiled_einsum(exprG, P, P) * size / P.numel()  # rescale, as X@X.T sums over X.size(1) items
-            new = promote(q) - promote(PP) / 2
             if q.ndim == 2:
+                new = promote(q) - promote(PP) / 2
                 new = (new + new.T) / 2  # ensure new_Q is symmetric
+            else:
+                new = promote(q) ** 2 / promote(PP)  # for scalar/vector L, PP is a vector -> LL/LXL == 1/X
             copy_stochastic_(q, new)
 
     for q, n in zip(Q, new_Q):
