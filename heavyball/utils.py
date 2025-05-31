@@ -1958,7 +1958,7 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
         x = stochastic_round_(x * x_norm_inv)
         for _ in range(iterations):
             x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-            stochastic_multiply_(x, x_norm_inv)
+            stochastic_multiply_(x, 1 / promote(x.norm()))
         out = (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
         return out.squeeze().clone()
 
