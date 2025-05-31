@@ -907,7 +907,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
     def state_(self, arg: Tensor, fail: bool = True):
         if not fail and arg not in self.mapping:
             return {}
-        state_param, index = self.mapping_inverse[arg]
+        state_param, index = self.mapping_inverse[arg.data_ptr()]
         if state_param not in self.state:
             self.state[state_param] = collections.defaultdict(dict)
         return self.state[state_param][index]
