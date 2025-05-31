@@ -930,7 +930,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
             if p not in self.mapping:
                 self.mapping[p] = p_views = merge_group(group, p)
                 for i, pv in enumerate(p_views):
-                    self.mapping_inverse[pv] = (p, i)
+                    self.mapping_inverse[pv.data_ptr()] = (p, i)
 
     def split_p_and_g_in_group(
         self,
@@ -956,7 +956,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
             else:
                 self.mapping[p] = p_views = merge_group(group, p)
                 for i, pv in enumerate(p_views):
-                    self.mapping_inverse[pv] = (p, i)
+                    self.mapping_inverse[pv.data_ptr()] = (p, i)
 
             vector = getattr(p, "vector", None)
             hessian_vector = getattr(p, "hessian_vector", None)
