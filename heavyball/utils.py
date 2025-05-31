@@ -2192,7 +2192,7 @@ def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
 
 
 @decorator_knowngood
-def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_iter: int = 4):
+def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, eps: float = 1e-6):
     """
     Idea:
         Q approximates G^-1
@@ -2230,18 +2230,17 @@ def _gg_inverse_via_newtonschulz(G: Tensor, Q: List[Tensor], order: int, power_i
         P = psgd_precond_grad(G16, [stochastic_round_(q) for q in new_Q])  # Q₀GQ₁
         if i == 0:
             P0 = P.to(G.dtype).clone()
-            svds = [1 / promote(max_singular_value(q, power_iter=power_iter)).clamp(min=1e-8) for q in new_Q]
-            stochastic_multiply_(new_Q, svds)
-            stochastic_multiply_(P, functools.reduce(torch.multiply, svds))
 
         for q, exprG, size in zip(new_Q, exprGs, dim_size):
             # PP = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
-            PP = compiled_einsum(exprG, P, P) * size / P.numel()  # rescale, as X@X.T sums over X.size(1) items
-            if q.ndim == 2:
-                new = promote(q) - promote(PP) / 2
+            PP = compiled_einsum(exprG, P, P)  # rescale, as X@X.T sums over X.size(1) items
+            PP = promote(PP) * size / P.numel()
+            if q.ndim == 2 and q.numel() > 1:
+                new = promote(q) - PP / 2
                 new = (new + new.T) / 2  # ensure new_Q is symmetric
-            else:
-                new = promote(q) ** 2 / promote(PP)  # for scalar/vector L, PP is a vector -> LL/LXL == 1/X
+            else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/X
+                X_estimate = PP.double() / q.double().square().clamp(min=eps)
+                new = (1 / X_estimate.clamp(min=eps)).to(q.dtype)
             copy_stochastic_(q, new)
 
     for q, n in zip(Q, new_Q):
