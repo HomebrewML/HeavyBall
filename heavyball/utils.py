@@ -1944,19 +1944,25 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
 
 
 @decorator_knowngood
-def max_singular_value_power_iter(A: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
+def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
     """
     Rayleigh quotient of row with the largest norm + optional power iterations
     """
-    x_norm, max_idx = A.norm(dim=1).max(dim=0)
-    x_norm_inv = 1 / promote(x_norm)
-    x = A.index_select(0, max_idx).flatten().contiguous()
-    A = stochastic_round_(A * x_norm_inv)
-    x = stochastic_round_(x * x_norm_inv)
-    for _ in range(iterations):
-        x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-        stochastic_multiply_(x, x_norm_inv)
-    return (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
+    x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+
+    def _inner():
+        A = A_outer
+        x_norm_inv = 1 / promote(x_norm)
+        x = A.index_select(0, max_idx).flatten().contiguous()
+        A = stochastic_round_(A * x_norm_inv)
+        x = stochastic_round_(x * x_norm_inv)
+        for _ in range(iterations):
+            x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
+            stochastic_multiply_(x, x_norm_inv)
+        out = (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
+        return out.squeeze().clone()
+
+    return torch.cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
 
 
 @decorator_knowngood
