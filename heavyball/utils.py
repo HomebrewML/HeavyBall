@@ -2211,6 +2211,7 @@ def _gg_inverse_via_newtonschulz(
     eps: float = 1e-6,
     multiplicative_update: bool = False,
     norm_eps: float = 1e-3,
+    min_update_step: float = 1e-5,
 ):
     """
     Idea:
@@ -2243,16 +2244,20 @@ def _gg_inverse_via_newtonschulz(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
-    P0 = G
     G16 = stochastic_round_(G)
     preconds = [q.T @ q if q.ndim == 2 else q**2 for q in Q]
     if len(preconds) == 1 and preconds[0].ndim < 2:
         inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
-    for i in range(inverse_order):
-        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
-        if i == 0:
-            P0 = P.to(G.dtype).clone()
 
+    def _step(old_preconds, new_preconds, _P0, step):
+        max_error = max((o - n).abs().max() for o, n in zip(old_preconds, new_preconds))
+        return (max_error > min_update_step) & (step < inverse_order)
+
+    def _body(_old_preconds, preconds, P0, step):
+        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
+        P0 = torch.cond(step == 0, lambda: P.to(G.dtype).contiguous().clone(), lambda: P0.contiguous().clone())
+
+        new_preconds = []
         for p, exprG, size in zip(preconds, exprGs, dim_size):
             # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
             PP = compiled_einsum(exprG, P, P)
@@ -2266,8 +2271,17 @@ def _gg_inverse_via_newtonschulz(
                     X_estimate = PP.double() / p.double().square().clamp(min=eps)
                     return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
 
-            new = _cond(PP.norm() > norm_eps, _step, lambda: p.clone())
-            copy_stochastic_(p, new)
+            new_preconds.append(_cond(PP.norm() > norm_eps, _step, lambda: p.clone()))
+
+        return [p.clone() for p in preconds], [n.clone() for n in new_preconds], P0.clone(), step + 1
+
+    init_state = (
+        [torch.zeros_like(p) for p in preconds],
+        preconds,
+        G,
+        torch.zeros((), dtype=torch.int64, device=G.device),
+    )
+    _, preconds, P0, _ = _while_loop(_step, _body, init_state)
 
     for new_precond, oq in zip(preconds, Q):
         new_q = matrix_square_root(new_precond)
