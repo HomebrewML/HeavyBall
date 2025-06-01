@@ -2128,9 +2128,89 @@ def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
     return inverse * c.sqrt()
 
 
+def _while_loop(cond, body, state):
+    """
+    dispatches to torch.while_loop if we're compiling. otherwise, falls back to a naive + slow baseline
+    useful for debugging
+    """
+    if torch.compiler.is_compiling():
+        return torch.while_loop(cond, body, state)
+
+    while cond(*state).item():
+        state = body(*state)
+    return state
+
+
+def _cond(cond, true_fn, false_fn):
+    """
+    dispatches to torch.cond if we're compiling. otherwise, falls back to a naive + slow baseline
+    useful for debugging
+    """
+    if torch.compiler.is_compiling():
+        return torch.cond(cond, true_fn, false_fn)
+
+    if cond.item():
+        return true_fn()
+    return false_fn()
+
+
+@decorator_knowngood
+def matrix_square_root(
+    A: Tensor,
+    order: int = 1,
+    max_steps: int = 10,
+    error_threshold: float = 1e-5,
+) -> Tensor:
+    """
+    Newton–Schulz principal square root of a symmetric positive-definite matrix
+    using `torch.while_loop` for Inductor-friendly control flow.
+
+        Returns S ≈ A½ after ≤ `max_steps` iterations, or earlier if
+        ‖I − S²‖∞ ≤ `error_threshold`.
+    """
+    if A.ndim < 2:
+        return A.sqrt()
+
+    assert A.size(0) == A.size(1)
+    # Horner coefficients of P_k(x) = Σ_{i=0}^k C(2i,i) x^{k−i} / 4^i
+    coeffs = [math.comb(2 * k, k) / 4**k for k in range(order + 1)]
+
+    dtype = A.dtype
+    A = promote(A)
+    I = eye_like(A)
+    scale = A.abs().max().clamp(min=1e-8)
+    A = A / scale
+
+    def _cond(_approx, error, step):
+        err = error.abs().max()
+        return (err > error_threshold) & (step < max_steps)
+
+    def _body(approx, error, step):
+        # Horner evaluation of P_k(E_k)
+        P = coeffs[-1] * I
+        for ck in reversed(coeffs[:-1]):
+            P = bf16_matmul(P, error) + ck * I
+
+        new_approx = bf16_matmul(approx, P)  # X_{k+1} = X_k P_k(E_k)
+        new_approx = (new_approx + new_approx.T) / 2  # enforce symmetric
+        error = I - bf16_matmul(approx, approx)  # E_k
+
+        return new_approx, error, step + 1
+
+    init_state = (A, I - A @ A, torch.zeros((), dtype=torch.int64, device=A.device))
+    final_approx, _, _ = _while_loop(_cond, _body, init_state)
+    return final_approx.to(dtype) * scale**0.5
+
+
 @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
-    G: Tensor, oq: "TriuOrLine", order: int, precond_lr: Tensor, eps: float = 1e-6, multiplicative_update: bool = False
+    G: Tensor,
+    oq: "TriuOrLine",
+    inverse_order: int,
+    precond_lr: Tensor,
+    eps: float = 1e-6,
+    multiplicative_update: bool = False,
+    norm_eps: float = 1e-3,
 ):
     """
     Idea:
@@ -2160,51 +2240,58 @@ def _gg_inverse_via_newtonschulz(
 
     """
     Q = to_triu(oq, True)
-    new_Q = [q.clone() for q in Q]
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
     P0 = G
     G16 = stochastic_round_(G)
-    for i in range(order):
-        P = psgd_precond_grad(G16, [stochastic_round_(q) for q in new_Q])  # Q₀GQ₁
+    preconds = [q.T @ q if q.ndim == 2 else q**2 for q in Q]
+    if len(preconds) == 1 and preconds[0].ndim < 2:
+        inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
+    for i in range(inverse_order):
+        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
         if i == 0:
             P0 = P.to(G.dtype).clone()
 
-        for q, exprG, size in zip(new_Q, exprGs, dim_size):
-            # PP = (LGR)(LGR)ᵀ == LGRRᵀGᵀLᵀ == LXL (with symmetric L)
-            PP = compiled_einsum(exprG, P, P)  # rescale, as X@X.T sums over X.size(1) items
-            PP = promote(PP) * size / P.numel()
-            if q.ndim == 2 and q.numel() > 1:
-                new = promote(q) - PP / 2
-                new = (new + new.T) / 2  # ensure new_Q is symmetric
-            else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/X
-                X_estimate = PP.double() / q.double().square().clamp(min=eps)
-                new = (1 / X_estimate.clamp(min=eps)).to(q.dtype)
-            copy_stochastic_(q, new)
+        for p, exprG, size in zip(preconds, exprGs, dim_size):
+            # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
+            PP = compiled_einsum(exprG, P, P)
 
-    for update, oq in zip(new_Q, Q):
+            def _step():
+                # scale = size / P.numel()  # rescale, as X@X.T sums over X.size(1) items - we want it to
+                if p.ndim == 2 and p.numel() > 1:
+                    new = promote(p) - promote(PP) / 2
+                    return (new + new.T) / 2  # ensure new_Q is symmetric
+                else:  # for scalar/vector L, PP is a vector -> LL/sqrt(LLXLL) == 1/sqrt(X)
+                    X_estimate = PP.double() / p.double().square().clamp(min=eps)
+                    return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+
+            new = _cond(PP.norm() > norm_eps, _step, lambda: p.clone())
+            copy_stochastic_(p, new)
+
+    for new_precond, oq in zip(preconds, Q):
+        new_q = matrix_square_root(new_precond)
         store_triu_as_line = isinstance(oq, tuple)
         if store_triu_as_line:
             store_triu_as_line = True
             oq = oq[1]
         q = promote(oq)
 
-        update = promote(update)
+        new_q = promote(new_q)
         if multiplicative_update:
-            if update.ndim == 2:
-                if q.shape != update.shape:
-                    q = line_to_triu([(update.shape, q)], symmetric_output=True)[0]
-                update = q @ update
+            if new_q.ndim == 2:
+                if q.shape != new_q.shape:
+                    q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
+                new_q = q @ new_q
             else:
-                update = q * update
+                new_q = q * new_q
 
-        update = update / max_singular_value(update, power_iter=4).clamp(min=eps).to(update.dtype)
-        if store_triu_as_line and update.ndim == 2:
-            update = triu_to_line([update])[0][1]
+        new_q = new_q / max_singular_value(new_q, power_iter=4).clamp(min=eps).to(new_q.dtype)
+        if store_triu_as_line and new_q.ndim == 2:
+            new_q = triu_to_line([new_q])[0][1]
 
-        update = q + (update - q) * precond_lr
-        copy_stochastic_(oq, update)
+        new_q = q + (new_q - q) * precond_lr
+        copy_stochastic_(oq, new_q)
 
     return P0
 
@@ -2523,6 +2610,17 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
     _compilable_fused_precond_grad_cached_(ea, param, lr, grad, decay, caution, cached_q)
 
 
+@functools.lru_cache(maxsize=None)
+def precond_grad_expr(Q_dim, grad_dim):
+    expr = [
+        f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
+    ]
+    expr = ",".join(expr)
+    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
+    out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
+    return f"{expr},{grad_expr}->{out_expr}"
+
+
 @decorator_knowngood
 def psgd_precond_grad(
     ea: Tensor,
@@ -2532,9 +2630,15 @@ def psgd_precond_grad(
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
 ):
+    if caution:
+        ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
         preconds = line_to_triu(preconds, symmetric_output)
-    return precond_grad_cached_(ea, preconds, caution=caution, grad=grad)
+    md = min_dtype(list(preconds) + [ea])
+    args = [q.to(md) for q in preconds]
+    expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
+    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea.to(md))
+    return new.to(ea.dtype)
 
 
 @decorator_knowngood
