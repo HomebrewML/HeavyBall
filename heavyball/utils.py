@@ -2100,7 +2100,7 @@ def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
 
 @decorator_knowngood
 def bf16_matmul(x: Tensor, y: Tensor):
-    return (stochastic_round_(x) @ stochastic_round_(y)).to(x.dtype)
+    return (promote(x) @ promote(y)).to(x.dtype)
 
 
 @decorator_knowngood
@@ -2244,8 +2244,9 @@ def _gg_inverse_via_newtonschulz(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
-    G16 = stochastic_round_(G)
-    preconds = [q.T @ q if q.ndim == 2 else q**2 for q in Q]
+    scale = G.norm().clamp(min=eps)
+    G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
+    preconds = [q.clone() for q in Q]
     if len(preconds) == 1 and preconds[0].ndim < 2:
         inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
 
@@ -2272,19 +2273,17 @@ def _gg_inverse_via_newtonschulz(
                     return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
 
             new_preconds.append(_cond(PP.norm() > norm_eps, _step, lambda: p.clone()))
-
-        return [p.clone() for p in preconds], [n.clone() for n in new_preconds], P0.clone(), step + 1
+        return [p.clone() for p in preconds], [n.clone() for n in new_preconds], P0.contiguous().clone(), step + 1
 
     init_state = (
         [torch.zeros_like(p) for p in preconds],
         preconds,
-        G,
+        G.contiguous(),
         torch.zeros((), dtype=torch.int64, device=G.device),
     )
     _, preconds, P0, _ = _while_loop(_step, _body, init_state)
 
-    for new_precond, oq in zip(preconds, Q):
-        new_q = matrix_square_root(new_precond)
+    for new_q, oq in zip(preconds, Q):
         store_triu_as_line = isinstance(oq, tuple)
         if store_triu_as_line:
             store_triu_as_line = True
@@ -2292,6 +2291,8 @@ def _gg_inverse_via_newtonschulz(
         q = promote(oq)
 
         new_q = promote(new_q)
+        # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
+        new_q = new_q / max_singular_value(new_q, power_iter=4).clamp(min=eps).to(new_q.dtype)
         if multiplicative_update:
             if new_q.ndim == 2:
                 if q.shape != new_q.shape:
@@ -2300,11 +2301,10 @@ def _gg_inverse_via_newtonschulz(
             else:
                 new_q = q * new_q
 
-        new_q = new_q / max_singular_value(new_q, power_iter=4).clamp(min=eps).to(new_q.dtype)
+        new_q = q + (new_q - q) * precond_lr
+
         if store_triu_as_line and new_q.ndim == 2:
             new_q = triu_to_line([new_q])[0][1]
-
-        new_q = q + (new_q - q) * precond_lr
         copy_stochastic_(oq, new_q)
 
     return P0
