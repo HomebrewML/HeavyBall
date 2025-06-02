@@ -2202,6 +2202,17 @@ def matrix_square_root(
     return final_approx.to(dtype) * scale**0.5
 
 
+def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 2):
+    X = X + eye_like(X) * eps
+    if X.ndim < 2 or X.numel() == 1:
+        return 1 / X
+
+    guess = _inverse_approx_via_chebychev(X)
+    for _ in range(iterations):
+        guess = 1.5 * guess - bf16_matmul(bf16_matmul(guess, X), X) * 0.5
+    return guess
+
+
 @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
@@ -2292,16 +2303,15 @@ def _gg_inverse_via_newtonschulz(
 
         new_q = promote(new_q)
         # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
-        new_q = new_q / max_singular_value(new_q, power_iter=4).clamp(min=eps).to(new_q.dtype)
-        if multiplicative_update:
-            if new_q.ndim == 2:
-                if q.shape != new_q.shape:
-                    q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
-                new_q = q @ new_q
-            else:
-                new_q = q * new_q
+        if new_q.ndim == 2:
+            if q.shape != new_q.shape:
+                q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
+        nqi = new_q @ newton_schulz_inverse(q, eps)  # has to be div not sub - we learn in log space
+        new_q = new_q / max_singular_value(nqi, power_iter=4).clamp(min=eps).to(new_q.dtype)
 
-        new_q = q + (new_q - q) * precond_lr
+        new_q = q + (new_q - q) * precond_lr  # LERPing to avoid max svd blowup
+        if new_q.ndim == 2:
+            new_q = (new_q + new_q.T) / 2
 
         if store_triu_as_line and new_q.ndim == 2:
             new_q = triu_to_line([new_q])[0][1]
