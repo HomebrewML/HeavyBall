@@ -2087,12 +2087,11 @@ def _inverse_initial_guess(gg):
 
 
 @decorator_knowngood
-@torch.compiler.assume_constant_result
 def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
     k = torch.arange(degree, dtype=torch.float64, device=device)
     rotation = (2 * k + 1) * math.pi / (2 * degree)
     f = (rotation.cos() + 1 + eps) ** -0.5
-    rotation = torch.where((rotation.view(-1, 1) * k[1:].view(1, -1)).cos())
+    rotation = (rotation.view(-1, 1) * k[1:].view(1, -1)).cos()
     coeff0 = f.sum() / degree
     coeffs = f @ rotation * 2 / degree
     return coeff0.float(), coeffs.float()
@@ -2202,12 +2201,13 @@ def matrix_square_root(
     return final_approx.to(dtype) * scale**0.5
 
 
-def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 2):
+def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 5):
     X = X + eye_like(X) * eps
     if X.ndim < 2 or X.numel() == 1:
         return 1 / X
 
-    guess = _inverse_approx_via_chebychev(X)
+    # guess = _inverse_approx_via_chebychev(X)
+    guess = eye_like(X)
     for _ in range(iterations):
         guess = 1.5 * guess - bf16_matmul(bf16_matmul(guess, X), X) * 0.5
     return guess
