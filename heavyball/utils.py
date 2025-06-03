@@ -1993,6 +1993,49 @@ def max_singular_value(
 
 
 @decorator_knowngood
+def min_singular_value(
+    A: Tensor,
+    power_iter: int = 5,
+    safety: float = 1.05,
+    max_svd: int = 32,
+):
+    if A.ndim < 2:
+        return A.abs().min()
+
+    n = A.size(0)
+    if n <= max_svd:
+        try:
+            eigs = torch.linalg.eigh(promote(A), driver="evd")[0]
+            return eigs.min().to(A.dtype)
+        except torch.linalg.LinAlgError:
+            pass
+
+    lambda_max_hat = max_singular_value(A, power_iter=power_iter)
+    lambda_upper = lambda_max_hat * safety
+
+    row_norms = A.norm(dim=1)
+    norm, idx = row_norms.min(dim=0)
+    v = _cond(norm > 0, lambda: A.index_select(0, idx).flatten(), lambda: torch.rand_like(A[0]))
+
+    v = v / promote(v.norm())
+    for _ in range(power_iter):
+        v = lambda_upper * v - promote(A.mv(stochastic_round_(v)))
+        v = v / promote(v.norm())
+    mu_hat = v @ (lambda_upper * v - promote(A.mv(stochastic_round_(v))))
+
+    lambda_min_hat = lambda_upper - mu_hat
+
+    def _approx():
+        mu = A.trace() / n
+        sigma_square = A.square().sum() / n - mu**2
+        return mu - (sigma_square / (n - 1)).sqrt()
+
+    return _cond(
+        (~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), _approx, lambda: lambda_min_hat.clone()
+    ).squeeze()
+
+
+@decorator_knowngood
 def to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
     if isinstance(Q[0], tuple):
         return line_to_triu(Q, symmetric_output)
@@ -2223,6 +2266,7 @@ def _gg_inverse_via_newtonschulz(
     multiplicative_update: bool = False,
     norm_eps: float = 1e-3,
     min_update_step: float = 1e-5,
+    svd_power_iter: int = 4,
 ):
     """
     Idea:
@@ -2306,8 +2350,11 @@ def _gg_inverse_via_newtonschulz(
         if new_q.ndim == 2:
             if q.shape != new_q.shape:
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
-        nqi = new_q @ newton_schulz_inverse(q, eps)  # has to be div not sub - we learn in log space
-        new_q = new_q / max_singular_value(nqi, power_iter=4).clamp(min=eps).to(new_q.dtype)
+        # scale == 1 / maxsvd(new_q@q^-1)
+        scale = min_singular_value(q, power_iter=svd_power_iter) / max_singular_value(
+            new_q, power_iter=svd_power_iter
+        ).clamp(min=eps)
+        new_q = new_q * scale.clamp(min=eps).to(new_q.dtype)
 
         new_q = q + (new_q - q) * precond_lr  # LERPing to avoid max svd blowup
         if new_q.ndim == 2:
