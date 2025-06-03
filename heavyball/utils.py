@@ -2256,6 +2256,12 @@ def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 5):
     return guess
 
 
+def multiply(A: Tensor, B: Tensor):
+    if A.ndim < 2 and B.ndim < 2:
+        return A * B
+    return A @ B
+
+
 @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
@@ -2263,9 +2269,8 @@ def _gg_inverse_via_newtonschulz(
     inverse_order: int,
     precond_lr: Tensor,
     eps: float = 1e-6,
-    multiplicative_update: bool = False,
-    norm_eps: float = 1e-3,
-    min_update_step: float = 1e-5,
+    norm_eps: float = 1e-6,
+    min_update_step: float = 1e-6,
     svd_power_iter: int = 4,
 ):
     """
@@ -2350,15 +2355,13 @@ def _gg_inverse_via_newtonschulz(
         if new_q.ndim == 2:
             if q.shape != new_q.shape:
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
-        # scale == 1 / maxsvd(new_q@q^-1)
-        scale = min_singular_value(q, power_iter=svd_power_iter) / max_singular_value(
-            new_q, power_iter=svd_power_iter
-        ).clamp(min=eps)
-        new_q = new_q * scale.clamp(min=eps).to(new_q.dtype)
 
-        new_q = q + (new_q - q) * precond_lr  # LERPing to avoid max svd blowup
+        new_q = eye_like(new_q) + precond_lr * (new_q - q)
+        new_q = multiply(multiply(new_q, q), new_q)
+
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
+        new_q = new_q / max_singular_value(new_q, power_iter=svd_power_iter).clamp(min=eps)
 
         if store_triu_as_line and new_q.ndim == 2:
             new_q = triu_to_line([new_q])[0][1]
