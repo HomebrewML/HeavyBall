@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import math
 import os
 import string
 from typing import Dict, List, Tuple
@@ -11,7 +12,7 @@ import torch
 import tqdm
 from torch._dynamo import config as dyn_cfg
 
-from heavyball.utils import _gg_inverse_via_newtonschulz, eye_like, set_torch
+from heavyball.utils import _gg_inverse_via_newtonschulz, set_torch
 
 set_torch()
 dyn_cfg.cache_size_limit = 10**6
@@ -56,13 +57,13 @@ def precondition_gradient(G_raw: torch.Tensor, hs: List[torch.Tensor]) -> torch.
     assert n == len(hs) <= 13, "Too many dims (einsum limited to 26 letters)."
     in_idx = LETTERS[n : 2 * n]  # d, e, f, …
     out_idx = LETTERS[:n]  # a, b, c, …
-    h_terms = [f"{in_idx[i]}{out_idx[i]}" for i in range(n)]
+    h_terms = [f"{out_idx[i]}{in_idx[i]}" for i in range(n)]
     expr = ",".join(h_terms + ["".join(in_idx)]) + f"->{''.join(out_idx)}"
     return torch.einsum(expr, *hs, G_raw)
 
 
 def relative_fro_error(est: List[torch.Tensor], true: List[torch.Tensor]) -> float:
-    return sum((t @ e - eye_like(t)).abs().max().item() / e.size(0) for t, e in zip(true, est)) / len(true)
+    return math.exp(sum(torch.linalg.cond(e @ t).log().item() for t, e in zip(true, est)))
 
 
 # --------------------------------------------------------------------------------------
@@ -93,7 +94,7 @@ class BenchmarkRunner:
             Q = [torch.eye(d, device=self.device) for d in shape]  # will be updated in‑place by algo
             oq = Q  # TriuOrLine alias
 
-            for step in range(self.n_steps):
+            for step in range(self.n_steps // 10):
                 torch.manual_seed(self.seed + step)  # deterministic re‑sampling per step
                 G_raw = torch.randn(*shape, device=self.device)
                 G = precondition_gradient(G_raw, hs).contiguous().clone()  # apply true Hessian
@@ -137,7 +138,7 @@ def plot_heatmap(df: pd.DataFrame, shape_str: str, out_dir: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="plots")
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -145,9 +146,9 @@ def main():
 
     cfg_grid = {
         "matrix_shape": [(128, 128)],
-        "inverse_order": [16, 64, 256],
-        "precond_lr": [0.1],
-        "multiplicative_update": [False],
+        "inverse_order": [256],
+        "precond_lr": [1, 0.5, 0.3, 0.1, 0.1 / 3],
+        "multiplicative_update": [True],
     }
 
     runner = BenchmarkRunner(cfg_grid, n_steps=args.steps, device=args.device)
@@ -176,9 +177,9 @@ def main():
             inverse_order=int(best.inverse_order),
             precond_lr=torch.tensor(float(best.precond_lr), device=args.device),
             multiplicative_update=bool(best.multiplicative_update),
-            norm_eps=1e-6,
-            min_update_step=1e-7,
-            eps=1e-8,
+            norm_eps=1e-10,
+            min_update_step=1e-10,
+            eps=1e-10,
         )
         errors.append(relative_fro_error(Q, hs))
 
