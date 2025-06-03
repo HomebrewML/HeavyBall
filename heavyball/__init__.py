@@ -672,7 +672,7 @@ class ForeachPSGDKron(C.BaseOpt):
         dampening: float = 2**-13,
         precond_update_power_iterations: int = 2,
         # expert parameters
-        precond_init_scale=None,
+        precond_init_scale=1.0,
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,
         precond_lr: float = 0.1,
