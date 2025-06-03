@@ -104,7 +104,6 @@ class BenchmarkRunner:
                     oq=oq,
                     inverse_order=cfg["inverse_order"],
                     precond_lr=torch.tensor(cfg["precond_lr"], device=self.device),
-                    multiplicative_update=cfg["multiplicative_update"],
                     norm_eps=1e-6,
                     min_update_step=1e-7,
                     eps=1e-8,
@@ -138,17 +137,16 @@ def plot_heatmap(df: pd.DataFrame, shape_str: str, out_dir: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="plots")
-    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     cfg_grid = {
-        "matrix_shape": [(128, 128)],
+        "matrix_shape": [(2048, 2048)],
         "inverse_order": [256],
         "precond_lr": [1, 0.5, 0.3, 0.1, 0.1 / 3],
-        "multiplicative_update": [True],
     }
 
     runner = BenchmarkRunner(cfg_grid, n_steps=args.steps, device=args.device)
@@ -176,7 +174,6 @@ def main():
             oq=oq,
             inverse_order=int(best.inverse_order),
             precond_lr=torch.tensor(float(best.precond_lr), device=args.device),
-            multiplicative_update=bool(best.multiplicative_update),
             norm_eps=1e-10,
             min_update_step=1e-10,
             eps=1e-10,
