@@ -10,6 +10,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import tqdm
+from matplotlib.colors import LogNorm
 from torch._dynamo import config as dyn_cfg
 
 from heavyball.utils import _gg_inverse_via_newtonschulz, set_torch
@@ -104,9 +105,7 @@ class BenchmarkRunner:
                     oq=oq,
                     inverse_order=cfg["inverse_order"],
                     precond_lr=torch.tensor(cfg["precond_lr"], device=self.device),
-                    norm_eps=1e-6,
-                    min_update_step=1e-7,
-                    eps=1e-8,
+                    anderson_interval=None,
                 )
 
             # After optimisation, reconstruct full estimated inverse
@@ -125,7 +124,7 @@ def plot_heatmap(df: pd.DataFrame, shape_str: str, out_dir: str):
     sub = df[df["shape_str"] == shape_str]
     pivot = sub.pivot_table(index="inverse_order", columns="precond_lr", values="rel_error", aggfunc="mean")
     plt.figure(figsize=(6, 4))
-    sns.heatmap(pivot, annot=True, fmt=".2e", linewidths=0.5)
+    sns.heatmap(pivot, annot=True, fmt=".2e", linewidths=0.5, norm=LogNorm())
     plt.title(f"Rel. error – shape {shape_str}")
     plt.ylabel("inverse_order")
     plt.xlabel("precond_lr")
@@ -144,9 +143,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     cfg_grid = {
-        "matrix_shape": [(2048, 2048)],
-        "inverse_order": [256],
-        "precond_lr": [1, 0.5, 0.3, 0.1, 0.1 / 3],
+        "matrix_shape": [(128, 128)],
+        "inverse_order": [16],
+        "precond_lr": [1],
     }
 
     runner = BenchmarkRunner(cfg_grid, n_steps=args.steps, device=args.device)
@@ -174,9 +173,7 @@ def main():
             oq=oq,
             inverse_order=int(best.inverse_order),
             precond_lr=torch.tensor(float(best.precond_lr), device=args.device),
-            norm_eps=1e-10,
-            min_update_step=1e-10,
-            eps=1e-10,
+            anderson_interval=None,
         )
         errors.append(relative_fro_error(Q, hs))
 
