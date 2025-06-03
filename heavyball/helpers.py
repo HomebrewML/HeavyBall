@@ -716,7 +716,7 @@ class AutoSampler(BaseSampler):
     ) -> None:
         assert constraints_func is None
         if samplers is None:
-            samplers = ((0, init_botorch), (100, init_nsgaii))
+            samplers = ((0, init_hebo), (100, init_nsgaii))
         self.sampler_indices = np.sort(np.array([x[0] for x in samplers], dtype=np.int32))
         self.samplers = [x[1] for x in sorted(samplers, key=lambda x: x[0])]
         self.search_space = search_space
