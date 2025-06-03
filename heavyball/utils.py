@@ -1949,16 +1949,18 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
     Rayleigh quotient of row with the largest norm + optional power iterations
     """
     x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+    x_norm = promote(x_norm)
 
     def _inner():
         A = A_outer
-        x_norm_inv = 1 / promote(x_norm)
         x = A.index_select(0, max_idx).flatten().contiguous()
-        A = stochastic_round_(A * x_norm_inv)
-        x = stochastic_round_(x * x_norm_inv)
+        A = stochastic_round_(A / x_norm)
+        x = x / x_norm
         for _ in range(iterations):
-            x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-            stochastic_multiply_(x, 1 / promote(x.norm()))
+            x = A.T.mv(
+                A.mv(stochastic_round_(x))
+            )  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
+            x = x / x.norm()
         out = (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
         return out.squeeze().clone()
 
@@ -1979,16 +1981,28 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     return sketch_norm * max_abs
 
 
+def _max_singular_value_ndim(A: Tensor, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0) -> Tensor:
+    if A.ndim <= 2:
+        return max_singular_value(A, max_svd, use_cholesky, power_iter)
+
+    base = einsum_base[: A.ndim]
+    A16 = stochastic_round_(A)
+    squares = [compiled_einsum(f"{base}{base.replace(b, b.upper())}->{b}{b.upper()}", A16, A16) for b in base]
+    svds = [max_singular_value(promote(s), max_svd, use_cholesky, power_iter) for s in squares]
+    svds = torch.stack(svds)
+    return svds.max().sqrt().to(A.dtype)  # sqrt because we took the SVD of a squared matrix
+
+
 @decorator_knowngood
-def max_singular_value(
-    A: Tensor, max_abs: Optional[Tensor] = None, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0
-) -> Tensor:
+def max_singular_value(A: Tensor, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0) -> Tensor:
     if A.ndim < 2:
         return A.abs().max()
+    if A.ndim > 2:
+        raise ValueError("max_singular_value: dimension of A must be less than or equal to 2")
     if min(A.shape) <= max_svd:
         return max_singular_value_exact(A)  # SVD needs ~25% more runtime for size=32, but 0% error instead of 5%
     if use_cholesky or power_iter < 0:
-        return max_singular_value_cholesky(A, max_abs)
+        return max_singular_value_cholesky(A)
     return max_singular_value_power_iter(A, None, iterations=power_iter)
 
 
@@ -2262,7 +2276,7 @@ def multiply(A: Tensor, B: Tensor):
     return A @ B
 
 
-@decorator_knowngood
+# @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
     oq: "TriuOrLine",
@@ -2304,7 +2318,7 @@ def _gg_inverse_via_newtonschulz(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
-    scale = G.norm().clamp(min=eps)
+    scale = _max_singular_value_ndim(G, power_iter=svd_power_iter)
     G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
     preconds = [q.clone() for q in Q]
     if len(preconds) == 1 and preconds[0].ndim < 2:
@@ -2357,7 +2371,7 @@ def _gg_inverse_via_newtonschulz(
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
 
         new_q = eye_like(new_q) + precond_lr * (new_q - q)
-        new_q = multiply(multiply(new_q, q), new_q)
+        new_q = multiply(multiply(new_q, q), new_q)  # multiplicative update rule in the lie group, from Xilin's QUAD
 
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
