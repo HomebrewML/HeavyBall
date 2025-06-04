@@ -2397,7 +2397,11 @@ def _gg_inverse_via_newtonschulz(
                     # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
                     X_estimate = PP.double() / p.double().square().clamp(min=eps)
                     out = (1 / X_estimate.clamp(min=eps)).to(p.dtype)
-                return out / max_singular_value(out, power_iter=0).clamp(min=1)
+                return _cond(
+                    out.norm() <= 1,
+                    lambda: out.clone(),
+                    lambda: out / max_singular_value(out, power_iter=0).clamp(min=1),
+                )
 
             norms.append(PP.norm())
             new_preconds.append(_cond(norms[-1] > norm_eps, _update, lambda: p.clone()))
