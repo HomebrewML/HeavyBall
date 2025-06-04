@@ -117,7 +117,7 @@ class PrecondGradAccumGuard(FunctionTransform):
         utils.stochastic_add_(state, new)
 
     def _reset(self, state):
-        if self.steps_taken == 0:
+        if self.steps_taken != 0:
             self.steps_taken = 0
             utils.zero_(state)
 
@@ -1084,7 +1084,7 @@ class BaseOpt(ChainOpt):
 
     update_clipping: str_or_fn = None
     The function to use for clipping the outgoing updates before applying them, after all other transformations.
-    This will turn off
+    This will turn off fused updates.
     This is syntactic sugar, equivalent to manually passing the function as the last element of the optimizer chain.
 
     """

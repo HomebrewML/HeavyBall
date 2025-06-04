@@ -317,8 +317,8 @@ def adaptive_gradient_clipping_(
 def is_compiling():
     try:
         return torch.compiler.is_compiling()
-    except TorchDynamoException:
-        return True
+    except (TorchDynamoException, AttributeError):
+        return False
 
 
 def set_(dst: Tensor, src: Tensor):

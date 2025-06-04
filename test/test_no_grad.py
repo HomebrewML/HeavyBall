@@ -26,7 +26,7 @@ class Param(nn.Module):
         (4, 4, 4, 4),
     ],
 )
-def test_closre(opt, size: List[int], depth: int = 2, iterations: int = 5, outer_iterations: int = 3):
+def test_closure(opt, size: List[int], depth: int = 2, iterations: int = 5, outer_iterations: int = 3):
     clean()
     set_torch()
 
