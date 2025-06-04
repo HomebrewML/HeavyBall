@@ -2307,7 +2307,7 @@ def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
 
     # Solve (G + εI) γ = 1
 
-    eye = eye_like(G) * eps * G.diag().abs().mean()
+    eye = eye_like(G) * eps
     L, info = torch.linalg.cholesky_ex(G + eye)
 
     def _cholesky_solve():
@@ -2331,7 +2331,7 @@ def _gg_inverse_via_newtonschulz(
     norm_eps: float = 1e-6,
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
-    anderson_interval: int | None = 4,
+    max_grad_norm: float = 0.01,
 ):
     """
     Idea:
@@ -2360,7 +2360,6 @@ def _gg_inverse_via_newtonschulz(
         - List of gradients with respect to Q (d_Q).
 
     """
-    anderson_interval = anderson_interval or inverse_order
     Q = to_triu(oq, True)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
@@ -2372,58 +2371,35 @@ def _gg_inverse_via_newtonschulz(
     if len(preconds) == 1 and preconds[0].ndim < 2:
         inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
 
-    anderson_buffer = [
-        [
-            [torch.empty((q.numel(),), device=G16.device, dtype=G16.dtype) for _ in range(anderson_interval)]
-            for _ in range(2)
-        ]
-        for q in Q
-    ]
-
-    def _step(old_preconds, new_preconds, _P0, step, anderson_buffer, update_norm):
+    def _step(old_preconds, new_preconds, _P0, step, update_norm):
         max_error = max((o - n).abs().max() for o, n in zip(old_preconds, new_preconds))
         return (max_error > min_update_step) & (step < inverse_order) & (update_norm > norm_eps)
 
-    def _body(_old_preconds, preconds, P0, step, anderson_buffer, norm):
+    def _body(_old_preconds, preconds, P0, step, norm):
         P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
         P0 = _cond(step == 0, lambda: P.to(G.dtype).contiguous().clone(), lambda: P0.contiguous().clone())
 
         new_preconds = []
         norms = []
-        for buf, p, exprG, size in zip(anderson_buffer, preconds, exprGs, dim_size):
+        for p, exprG, size in zip(preconds, exprGs, dim_size):
             # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
             PP = compiled_einsum(exprG, P, P)
-
-            buf[0].pop(0)
-            buf[1].pop(0)
-            buf[0].append(stochastic_round_(p).flatten().clone())
-            buf[1].append(stochastic_round_(PP).flatten().clone())
 
             def _update():
                 # scale = size / P.numel()  # rescale, as X@X.T sums over X.size(1) items - we want it to
                 if p.ndim == 2 and p.numel() > 1:
-                    new = promote(p) - promote(PP) / 2
+                    new = (
+                        promote(p) - promote(PP) / 2
+                    )  # / (1 + promote(PP.norm()) / promote(p.norm()))  # adaptive damping
                     return (new + new.T) / 2  # ensure new_Q is symmetric
-                else:  # for scalar/vector L, PP is a vector -> LL/sqrt(LLXLL) == 1/sqrt(X)
+                else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
                     X_estimate = PP.double() / p.double().square().clamp(min=eps)
                     return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
 
             norms.append(PP.norm())
             new_preconds.append(_cond(norms[-1] > norm_eps, _update, lambda: p.clone()))
 
-        step = step + 1
-
-        def _anderson(buf, p):
-            values = torch.stack(buf[0])
-            grads = torch.stack(buf[1])
-            out = anderson_step(values, grads, beta=0.5)  # as the step above would've been 0.5 too
-            return out.view_as(p).contiguous().clone()
-
-        new_preconds = [
-            _cond(step % anderson_interval == 0, lambda: _anderson(buf, p), lambda: p.clone())
-            for buf, p in zip(anderson_buffer, new_preconds)
-        ]
-        retval = preconds, new_preconds, P0.contiguous(), step, anderson_buffer, sum(norms)
+        retval = preconds, new_preconds, P0.contiguous(), step + 1, sum(norms)
         return tree_map(torch.clone, retval)
 
     init_state = (
@@ -2431,10 +2407,9 @@ def _gg_inverse_via_newtonschulz(
         preconds,
         G.contiguous(),
         torch.zeros((), dtype=torch.int64, device=G.device),
-        anderson_buffer,
         torch.ones((), dtype=G16.dtype, device=G16.device),
     )
-    _, preconds, P0, _, _, _ = _while_loop(_step, _body, init_state)
+    _, preconds, P0, _, _ = _while_loop(_step, _body, init_state)
 
     for new_q, oq in zip(preconds, Q):
         store_triu_as_line = isinstance(oq, tuple)
@@ -2449,9 +2424,10 @@ def _gg_inverse_via_newtonschulz(
             if q.shape != new_q.shape:
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
 
-        new_q = eye_like(new_q) + precond_lr * (new_q - q)
-        new_q = new_q / max_singular_value(new_q, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
-        new_q = multiply(multiply(new_q, q), new_q)  # multiplicative update rule in the lie group, from Xilin's QUAD
+        delta = eye_like(new_q) + precond_lr * (new_q - q)
+        delta = delta / max_singular_value(delta, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
+        delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
+        new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
 
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
