@@ -8,6 +8,12 @@ config.cache_size_limit = 2**20
 config.accumulated_cache_size_limit = 2**20
 
 
+def hilbert_matrix(n):
+    i = torch.arange(1, n + 1, dtype=torch.float64).unsqueeze(1)
+    j = torch.arange(1, n + 1, dtype=torch.float64).unsqueeze(0)
+    return 1.0 / (i + j - 1).cuda()
+
+
 def _make_matrix(shape, cond=10, dtype=torch.float32, symmetric=False, seed=0):
     torch.manual_seed(seed)
     m, n = shape
@@ -69,6 +75,14 @@ def test_max_singular_value_ndim(shape, bound: float = 2):
 def test_max_singular_value_rank_deficient(shape):
     A = torch.randn(shape).cuda()
     A[:, -1] = 0.0
+    approx = max_singular_value(A, power_iter=10)
+    exact = torch.linalg.svdvals(A.double()).max()
+    assert_close(approx, exact, atol=1e-6, rtol=0.1)
+
+
+@pytest.mark.parametrize("shape", ((4, 4), (32, 32), (128, 128), (512, 512)))
+def test_max_singular_value_ill_conditioned(shape):
+    A = hilbert_matrix(shape[0])
     approx = max_singular_value(A, power_iter=10)
     exact = torch.linalg.svdvals(A.double()).max()
     assert_close(approx, exact, atol=1e-6, rtol=0.1)
