@@ -2334,7 +2334,7 @@ def _gg_inverse_via_newtonschulz(
     norm_eps: float = 1e-6,
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
-    max_grad_norm: float = 1,
+    max_grad_norm: float | None = None,
 ):
     """
     Idea:
@@ -2433,7 +2433,8 @@ def _gg_inverse_via_newtonschulz(
 
         delta = eye_like(new_q) + precond_lr * (new_q - q)
         delta = delta / max_singular_value(delta, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
-        # delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
+        if max_grad_norm is not None:
+            delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(max=1)
         new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
 
         if new_q.ndim == 2:
