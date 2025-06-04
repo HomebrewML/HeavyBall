@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 from torch._dynamo.exc import TorchDynamoException
 from torch.backends import cudnn, opt_einsum
+from torch.nn import functional as F
 from torch.utils._pytree import tree_map
 
 compile_mode = "max-autotune-no-cudagraphs"
@@ -1956,15 +1957,17 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
         x = A.index_select(0, max_idx).flatten().contiguous()
         A = stochastic_round_(A / x_norm)
         x = x / x_norm
+
+        def _mv(x):
+            return promote(A.T.mv(A.mv(stochastic_round_(x))))
+
         for _ in range(iterations):
-            x = A.T.mv(
-                A.mv(stochastic_round_(x))
-            )  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-            x = x / x.norm()
-        out = (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
+            # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
+            x = F.normalize(_mv(x), dim=0)
+        out = (x @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
         return out.squeeze().clone()
 
-    return torch.cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
+    return _cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
 
 
 @decorator_knowngood
@@ -2331,7 +2334,7 @@ def _gg_inverse_via_newtonschulz(
     norm_eps: float = 1e-6,
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
-    max_grad_norm: float = 0.01,
+    max_grad_norm: float = 1,
 ):
     """
     Idea:
@@ -2388,13 +2391,13 @@ def _gg_inverse_via_newtonschulz(
             def _update():
                 # scale = size / P.numel()  # rescale, as X@X.T sums over X.size(1) items - we want it to
                 if p.ndim == 2 and p.numel() > 1:
-                    new = (
-                        promote(p) - promote(PP) / 2
-                    )  # / (1 + promote(PP.norm()) / promote(p.norm()))  # adaptive damping
-                    return (new + new.T) / 2  # ensure new_Q is symmetric
-                else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
+                    new = promote(p) - promote(PP) / 2  # adaptive damping
+                    out = (new + new.T) / 2  # ensure new_Q is symmetric
+                else:
+                    # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
                     X_estimate = PP.double() / p.double().square().clamp(min=eps)
-                    return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+                    out = (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+                return out / max_singular_value(out, power_iter=0).clamp(min=1)
 
             norms.append(PP.norm())
             new_preconds.append(_cond(norms[-1] > norm_eps, _update, lambda: p.clone()))
@@ -2426,7 +2429,7 @@ def _gg_inverse_via_newtonschulz(
 
         delta = eye_like(new_q) + precond_lr * (new_q - q)
         delta = delta / max_singular_value(delta, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
-        delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
+        # delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
         new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
 
         if new_q.ndim == 2:
