@@ -1939,7 +1939,7 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
             return eigval[0].sqrt()
         else:
             return torch.linalg.svd(promote(A), driver="gesvdj")[1].max().to(A.dtype)  # == linalg.matrix_norm(A, ord=2)
-    except torch.linalg.LinAlgError:
+    except (torch.linalg.LinAlgError, RuntimeError):
         return max_singular_value_power_iter(promote(A), iterations=2)
 
 
