@@ -1940,7 +1940,7 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
         else:
             return torch.linalg.svd(promote(A), driver="gesvdj")[1].max().to(A.dtype)  # == linalg.matrix_norm(A, ord=2)
     except torch.linalg.LinAlgError:
-        return torch.zeros((), device=A.device, dtype=A.dtype)
+        return max_singular_value_power_iter(promote(A), iterations=2)
 
 
 @decorator_knowngood
@@ -1981,20 +1981,20 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     return sketch_norm * max_abs
 
 
-def _max_singular_value_ndim(A: Tensor, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0) -> Tensor:
+def _max_singular_value_ndim(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
     if A.ndim <= 2:
         return max_singular_value(A, max_svd, use_cholesky, power_iter)
 
     base = einsum_base[: A.ndim]
     A16 = stochastic_round_(A)
-    squares = [compiled_einsum(f"{base}{base.replace(b, b.upper())}->{b}{b.upper()}", A16, A16) for b in base]
+    squares = [compiled_einsum(f"{base},{base.replace(b, b.upper())}->{b}{b.upper()}", A16, A16) for b in base]
     svds = [max_singular_value(promote(s), max_svd, use_cholesky, power_iter) for s in squares]
     svds = torch.stack(svds)
     return svds.max().sqrt().to(A.dtype)  # sqrt because we took the SVD of a squared matrix
 
 
 @decorator_knowngood
-def max_singular_value(A: Tensor, max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0) -> Tensor:
+def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
     if A.ndim < 2:
         return A.abs().max()
     if A.ndim > 2:
@@ -2019,7 +2019,7 @@ def min_singular_value(
     n = A.size(0)
     if n <= max_svd:
         try:
-            eigs = torch.linalg.eigh(promote(A), driver="evd")[0]
+            eigs = torch.linalg.eigvalsh(promote(A))
             return eigs.min().to(A.dtype)
         except torch.linalg.LinAlgError:
             pass
