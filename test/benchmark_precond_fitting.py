@@ -105,7 +105,6 @@ class BenchmarkRunner:
                     oq=oq,
                     inverse_order=cfg["inverse_order"],
                     precond_lr=torch.tensor(cfg["precond_lr"], device=self.device),
-                    anderson_interval=None,
                 )
 
             # After optimisation, reconstruct full estimated inverse
@@ -173,12 +172,11 @@ def main():
             oq=oq,
             inverse_order=int(best.inverse_order),
             precond_lr=torch.tensor(float(best.precond_lr), device=args.device),
-            anderson_interval=None,
         )
         errors.append(relative_fro_error(Q, hs))
 
     plt.figure(figsize=(6, 4))
-    plt.semilogy(range(1, args.steps + 1), errors, marker="o")
+    plt.semilogy(range(1, args.steps + 1), errors, linewidth=0.8)
     plt.grid(True, which="both", ls="--", linewidth=0.4)
     plt.xlabel("Update step")
     plt.ylabel("Relative Frobenius error")
