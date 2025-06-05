@@ -2319,7 +2319,7 @@ def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
     return (promote(Q) - beta * promote(R)).T @ gamma_proj.to(torch.float32)
 
 
-# @decorator_knowngood
+@decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
     oq: "TriuOrLine",
