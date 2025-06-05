@@ -892,4 +892,5 @@ __all__ = [
     "NewtonHybrid2PSGDLRA",
     "NewtonHybrid2PSGDKron",
     "MSAMLaProp",
+    "QUAD",
 ]
