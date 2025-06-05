@@ -2273,9 +2273,9 @@ def newton_schulz_inverse(X: Tensor, guess: None | Tensor = None, eps: float = 1
     if guess is None:
         guess = eye_like(X)  # _inverse_approx_via_chebychev(X)
     for _ in range(iterations):
-        guess = guess - bf16_matmul(bf16_matmul(guess, X), X) / 2
+        guess = guess * 2 - bf16_matmul(bf16_matmul(guess, X), X)
         guess = (guess + guess.T) / 2
-        guess = guess / max_singular_value(guess, power_iter=0)
+        guess = guess / max_singular_value(guess, power_iter=0).clamp(min=1)
     return guess
 
 
@@ -2294,7 +2294,7 @@ def newton_schulz_inverse_square_root(X: Tensor, guess: None | Tensor = None, ep
         term = 3 * I - promote(XY2)
         guess = promote(bf16_matmul(guess, term)) / 2
         guess = (guess + guess.T) / 2
-        guess = guess / max_singular_value(guess, power_iter=0)
+        guess = guess / max_singular_value(guess, power_iter=0).clamp(min=1)
         guess = stochastic_round_(X, guess)
     return guess
 
@@ -2351,7 +2351,7 @@ def _gg_inverse_via_newtonschulz(
     norm_eps: float = 1e-6,
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
-    max_grad_norm: float | None = 0.02,
+    max_grad_norm: float | None = None,
 ):
     """
     Idea:
