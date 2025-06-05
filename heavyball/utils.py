@@ -877,7 +877,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
         self.register_state_dict_post_hook(StatefulOptimizer._store_stats)
         self.register_load_state_dict_pre_hook(StatefulOptimizer._load_stats)
-        self._init_mapping()
 
     def _store_stats(self, state_dict: dict[str, any]):
         state_dict["heavyball"] = {
@@ -952,12 +951,9 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 yield p, grad
                 continue
 
-            if p in self.mapping:
-                p_views = self.mapping[p]
-            else:
-                self.mapping[p] = p_views = merge_group(group, p)
-                for i, pv in enumerate(p_views):
-                    self.mapping_inverse[pv.data_ptr()] = (p, i)
+            self.mapping[p] = p_views = merge_group(group, p)
+            for i, pv in enumerate(p_views):
+                self.mapping_inverse[pv.data_ptr()] = (p, i)
 
             vector = getattr(p, "vector", None)
             hessian_vector = getattr(p, "hessian_vector", None)
@@ -2309,7 +2305,6 @@ def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
     rhs = torch.ones_like(G[0])
 
     # Solve (G + εI) γ = 1
-
     eye = eye_like(G) * eps
     L, info = torch.linalg.cholesky_ex(G + eye)
 
@@ -2324,7 +2319,7 @@ def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
     return (promote(Q) - beta * promote(R)).T @ gamma_proj.to(torch.float32)
 
 
-@decorator_knowngood
+# @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
     oq: "TriuOrLine",
