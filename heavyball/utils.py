@@ -2403,7 +2403,10 @@ def _gg_inverse_via_newtonschulz(
 
             PP = promote(PP)
             denom = _compilable_exp_avg_sq_([state], [PP], beta_debias(rmsprop_beta, step + 1), rmsprop_eps, None)[0]
-            new = promote(p) - PP / denom * newton_schulz_lr  # adaptive damping
+            norm = PP.norm()
+            PP = PP / denom
+            PP = PP * (norm / PP.norm().clamp(min=norm_eps))
+            new = promote(p) - PP * newton_schulz_lr  # adaptive damping
             new = (new + new.T) / 2  # ensure new_Q is symmetric
             new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
 
