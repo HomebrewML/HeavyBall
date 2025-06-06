@@ -241,14 +241,14 @@ def eps_sqrt(item, eps):
 
 @decorator_knowngood
 def _compilable_exp_avg_sq_(
-    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: List[Optional[Tensor]]
+    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor]
 ):
     g32 = promote(grad)
     s32 = _lerp(state, torch._foreach_mul(g32, g32), beta2)
 
     denom = [eps_sqrt(d, eps) for d in s32]
 
-    if out[0] is None:
+    if out is None or out[0] is None:
         return denom
 
     copy_stochastic_list_(out, denom)
@@ -2006,6 +2006,15 @@ def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, 
 
 
 @decorator_knowngood
+def clamped_max_singular_value(
+    A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
+) -> Tensor:
+    norm = A.norm()  # L2 norm is an upper bound for the spectral norm. If the upper bound is below the minimum, the real value will be too.
+    out = _cond(norm > min, lambda: max_singular_value(A, max_svd, use_cholesky, power_iter), lambda: norm.clone())
+    return out.clamp(min=min)
+
+
+@decorator_knowngood
 def min_singular_value(
     A: Tensor,
     power_iter: int = 5,
@@ -2133,11 +2142,12 @@ def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
 
 def _inverse_initial_guess(gg):
     n = gg.shape[0]
-    sigma_max = gg.norm()
-    sigma_avg = torch.trace(gg) / n
-    eps = torch.finfo(sigma_max.dtype).eps
-    sigma_min_approx = (sigma_avg**2) / sigma_max.clamp(min=eps)
-    sigma_min_approx = torch.minimum(sigma_min_approx, sigma_max)
+
+    sigma_max = promote(gg.norm())
+
+    trace_gg = promote(torch.trace(gg))
+    sigma_min_approx = trace_gg / (n * sigma_max)
+
     return sigma_max, sigma_min_approx
 
 
@@ -2158,7 +2168,7 @@ def bf16_matmul(x: Tensor, y: Tensor):
 
 
 @decorator_knowngood
-def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 2):
+def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
     """
     This function is a helper for `_gg_inverse_via_newtonschulz` to compute a better initial guess.
     It cannot be used by itself.
@@ -2264,38 +2274,15 @@ def matrix_square_root(
     return final_approx.to(dtype) * scale**0.5
 
 
-@decorator_knowngood
-def newton_schulz_inverse(X: Tensor, guess: None | Tensor = None, eps: float = 1e-6, iterations: int = 5):
+def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 5):
     X = X + eye_like(X) * eps
     if X.ndim < 2 or X.numel() == 1:
         return 1 / X
 
-    if guess is None:
-        guess = eye_like(X)  # _inverse_approx_via_chebychev(X)
+    # guess = _inverse_approx_via_chebychev(X)
+    guess = eye_like(X)
     for _ in range(iterations):
-        guess = guess * 2 - bf16_matmul(bf16_matmul(guess, X), X)
-        guess = (guess + guess.T) / 2
-        guess = guess / max_singular_value(guess, power_iter=0).clamp(min=1)
-    return guess
-
-
-@decorator_knowngood
-def newton_schulz_inverse_square_root(X: Tensor, guess: None | Tensor = None, eps: float = 1e-6, iterations: int = 5):
-    X = X + eye_like(X) * eps
-    if X.ndim < 2 or X.numel() == 1:
-        return X ** (-0.5)
-
-    if guess is None:
-        guess = eye_like(X)
-    I = eye_like(promote(X))
-    for _ in range(iterations):
-        Y2 = bf16_matmul(guess, guess)
-        XY2 = bf16_matmul(X, Y2)
-        term = 3 * I - promote(XY2)
-        guess = promote(bf16_matmul(guess, term)) / 2
-        guess = (guess + guess.T) / 2
-        guess = guess / max_singular_value(guess, power_iter=0).clamp(min=1)
-        guess = stochastic_round_(X, guess)
+        guess = 1.5 * guess - bf16_matmul(bf16_matmul(guess, X), X) * 0.5
     return guess
 
 
@@ -2352,6 +2339,9 @@ def _gg_inverse_via_newtonschulz(
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
     max_grad_norm: float | None = None,
+    rmsprop_beta: float = 0.9,
+    rmsprop_eps: float = 1e-8,
+    newton_schulz_lr: float = 0.1,
 ):
     """
     Idea:
@@ -2380,25 +2370,51 @@ def _gg_inverse_via_newtonschulz(
         - List of gradients with respect to Q (d_Q).
 
     """
-    exprGs = calcG_expr(ndim_tuple(to_triu(oq)), G.ndim)
+
+    Q = to_triu(oq, True)
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+    dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
     scale = _max_singular_value_ndim(G, power_iter=svd_power_iter)
-    P = stochastic_round_(G / scale)  # max singular value of GG should be <1
-    base = einsum_base[: G.ndim]
-    for oq, dim, exprG in zip(oq, base, exprGs):
+    G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
+    preconds = [q.clone() for q in Q]
+
+    if len(preconds) == 1 and preconds[0].ndim < 2:
+        inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
+
+    rmsprop_state = [torch.zeros_like(q) if q.ndim == 2 else None for q in preconds]
+
+    for step in range(inverse_order):
+        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
+        if step == 0:
+            P0 = P.contiguous()
+
+        new_preconds = []
+        for p, exprG, size, state in zip(preconds, exprGs, dim_size, rmsprop_state):
+            # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
+            PP = compiled_einsum(exprG, P, P)
+
+            if p.ndim < 2 or p.numel() == 1:
+                # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
+                X_estimate = PP.double() / p.double().square().clamp(min=eps)
+                new = (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+                new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
+                continue
+
+            PP = promote(PP)
+            denom = _compilable_exp_avg_sq_([state], [PP], beta_debias(rmsprop_beta, step + 1), rmsprop_eps, None)[0]
+            new = promote(p) - PP / denom * newton_schulz_lr  # adaptive damping
+            new = (new + new.T) / 2  # ensure new_Q is symmetric
+            new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
+
+        preconds = new_preconds
+
+    for new_q, oq in zip(preconds, Q):
         store_triu_as_line = isinstance(oq, tuple)
         if store_triu_as_line:
             store_triu_as_line = True
             oq = oq[1]
         q = promote(oq)
-        PP = promote(compiled_einsum(exprG, P, P))
-        new_q = newton_schulz_inverse(PP, to_triu([q], symmetric_output=True)[0], iterations=inverse_order)
-
-        P = torch.einsum(
-            f"{base},{dim.upper()}{dim}->{base.replace(dim, dim.upper())}",  #
-            P,
-            stochastic_round_(new_q),
-        )
 
         new_q = promote(new_q)
         # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
@@ -2406,20 +2422,21 @@ def _gg_inverse_via_newtonschulz(
             if q.shape != new_q.shape:
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
 
-        delta = new_q - q
+        delta = eye_like(new_q) + precond_lr * (new_q - q)
+        delta = delta / clamped_max_singular_value(delta, min=eps, power_iter=svd_power_iter)  # align update magnitudes
         if max_grad_norm is not None:
             delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(max=1)
-        delta = eye_like(new_q) + precond_lr * delta
         new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
+
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
-        new_q = new_q / max_singular_value(new_q, power_iter=svd_power_iter).clamp(min=1)  # ensure update is stable
+        new_q = new_q / clamped_max_singular_value(new_q, min=eps, power_iter=svd_power_iter)  # ensure update is stable
 
         if store_triu_as_line and new_q.ndim == 2:
             new_q = triu_to_line([new_q])[0][1]
         copy_stochastic_(oq, new_q)
 
-    return P
+    return P0
 
 
 @decorator
