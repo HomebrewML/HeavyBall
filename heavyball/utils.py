@@ -2370,7 +2370,6 @@ def _gg_inverse_via_newtonschulz(
         - List of gradients with respect to Q (d_Q).
 
     """
-
     Q = to_triu(oq, True)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
@@ -2382,7 +2381,7 @@ def _gg_inverse_via_newtonschulz(
     if len(preconds) == 1 and preconds[0].ndim < 2:
         inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
 
-    rmsprop_state = [torch.zeros_like(q) if q.ndim == 2 else None for q in preconds]
+    rmsprop_state = [torch.zeros((), device=q.device, dtype=torch.float32) if q.ndim == 2 else None for q in preconds]
 
     for step in range(inverse_order):
         P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
@@ -2401,11 +2400,8 @@ def _gg_inverse_via_newtonschulz(
                 new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
                 continue
 
-            PP = promote(PP)
-            denom = _compilable_exp_avg_sq_([state], [PP], beta_debias(rmsprop_beta, step + 1), rmsprop_eps, None)[0]
-            norm = PP.norm()
-            PP = PP / denom
-            PP = PP * (norm / PP.norm().clamp(min=norm_eps))
+            state = _lerp([state], [PP.norm()], beta_debias(rmsprop_beta, step + 1))[0]
+            PP = promote(PP) / promote(state).clamp(min=rmsprop_eps)
             new = promote(p) - PP * newton_schulz_lr  # adaptive damping
             new = (new + new.T) / 2  # ensure new_Q is symmetric
             new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
@@ -2426,7 +2422,6 @@ def _gg_inverse_via_newtonschulz(
                 q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
 
         delta = eye_like(new_q) + precond_lr * (new_q - q)
-        delta = delta / clamped_max_singular_value(delta, min=eps, power_iter=svd_power_iter)  # align update magnitudes
         if max_grad_norm is not None:
             delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(max=1)
         new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
