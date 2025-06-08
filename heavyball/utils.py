@@ -2328,7 +2328,6 @@ def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
     return (promote(Q) - beta * promote(R)).T @ gamma_proj.to(torch.float32)
 
 
-# @decorator_knowngood
 def _gg_inverse_via_newtonschulz(
     G: Tensor,
     oq: "TriuOrLine",
@@ -2344,66 +2343,64 @@ def _gg_inverse_via_newtonschulz(
     newton_schulz_lr: float = 0.1,
 ):
     """
-    Idea:
-        Q approximates G^-1
-        For matrices: G = Q @ (2 * I - GG.T @ Q) == NewtonSchulz*
-        For scalars/vectors: directly compute the corret inverse
-        ---
-        * Assuming GG.T should be inverted, NewtonSchulz wants Q(2I - GG.TQ)
-          However, computing Q@GG.T@Q with respect to the unused preconditioners is costly.
-          So, we precompute QG and run `(QG)@(QG).T == QGG.TQ.T`
-          With a symmetric Q, we get QGG.TQ.T = QGG.TQ - precisely the update we need for the NS iteration
-          Further, Q @ (2 * I - GG.T @ Q) == 2 * Q - Q @ GG.T @ Q. So, the update becomes 2Q-(QG)@(QG).T
+    Adapted to fit Q with P = Q @ Q.T instead of directly using P.
+    The Newton-Schulz iteration now preconditions G as Q @ Q.T @ G (or similar),
+    updating Q such that P = Q @ Q.T approximates the inverse of a matrix like GG.T.
 
     Args:
         G: Gradient tensor to be preconditioned (gradient of the loss w.r.t. parameters)
-        Q: List of preconditioner tensors
-        order: Number of Newton-Schulz iterations
-        power_iter: Power iterations used in initial precond estimate
-
-    Hints:
-        * more `power_iter` -> better initial guess -> lower `order` required (recommended <20)
-        * higher `order` -> higher general accuracy -> lower `power_iter` required (recommended <80)
-        * `order` is more expensive but will yield rewards for longer. with large batches, both should be set high.
+        oq: List of preconditioner tensors (now Q where P = Q @ Q.T)
+        inverse_order: Number of Newton-Schulz iterations
+        precond_lr: Learning rate for preconditioner update
+        eps: Small value for numerical stability
+        norm_eps: Small value for norm clamping
+        min_update_step: Minimum update step size
+        svd_power_iter: Number of power iterations for singular value estimation
+        max_grad_norm: Maximum gradient norm for clipping
+        rmsprop_beta: Beta parameter for RMSprop
+        rmsprop_eps: Epsilon parameter for RMSprop
+        newton_schulz_lr: Learning rate for Newton-Schulz update
 
     Returns:
-        - List of gradients with respect to Q (d_Q).
-
+        - Preconditioned gradient P0 using the original Q.
     """
-    Q = to_triu(oq, True)
+    precond_lr, newton_schulz_lr = 1, precond_lr
+    Q = to_triu(oq, True)  # Q is stored in oq
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
     scale = _max_singular_value_ndim(G, power_iter=svd_power_iter)
-    G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
-    preconds = [q.clone() for q in Q]
+    G16 = stochastic_round_(G / scale)  # Normalize G
+    preconds = [q.clone() for q in Q]  # Q variables to update
 
     if len(preconds) == 1 and preconds[0].ndim < 2:
-        inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
+        inverse_order = 1  # Exact solution for scalars/vectors
 
     rmsprop_state = [torch.zeros((), device=q.device, dtype=torch.float32) if q.ndim == 2 else None for q in preconds]
 
     for step in range(inverse_order):
-        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
+        # Use P = Q @ Q.T for preconditioning
+        P = psgd_precond_grad(G16, [stochastic_round_(p) for p in preconds])
         if step == 0:
             P0 = P.contiguous()
 
         new_preconds = []
         for p, exprG, size, state in zip(preconds, exprGs, dim_size, rmsprop_state):
-            # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
             PP = compiled_einsum(exprG, P, P)
 
             if p.ndim < 2 or p.numel() == 1:
-                # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
+                # Scalar/vector case: P = Q^2
                 X_estimate = PP.double() / p.double().square().clamp(min=eps)
                 new = (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+                new = torch.sqrt(new.abs()) * new.sign()  # Q = sqrt(P)
                 new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
                 continue
 
+            # Matrix case: update Q
             state = _lerp([state], [PP.norm()], beta_debias(rmsprop_beta, step + 1))[0]
             PP = promote(PP) / promote(state).clamp(min=rmsprop_eps)
-            new = promote(p) - PP * newton_schulz_lr  # adaptive damping
-            new = (new + new.T) / 2  # ensure new_Q is symmetric
+            new = promote(p) - PP * newton_schulz_lr  # Target P update
+            new = (new + new.T) / 2  # Symmetry
             new_preconds.append(new / clamped_max_singular_value(new, min=1, power_iter=0))
 
         preconds = new_preconds
@@ -2411,24 +2408,18 @@ def _gg_inverse_via_newtonschulz(
     for new_q, oq in zip(preconds, Q):
         store_triu_as_line = isinstance(oq, tuple)
         if store_triu_as_line:
-            store_triu_as_line = True
             oq = oq[1]
         q = promote(oq)
 
         new_q = promote(new_q)
-        # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
-        if new_q.ndim == 2:
-            if q.shape != new_q.shape:
-                q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
-
-        delta = eye_like(new_q) + precond_lr * (new_q - q)
+        delta = eye_like(new_q) + precond_lr * (new_q - q)  # Multiplicative update factor
         if max_grad_norm is not None:
             delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(max=1)
-        new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
+        new_q = multiply(delta, q)  # Q_new = delta @ Q
 
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
-        new_q = new_q / clamped_max_singular_value(new_q, min=eps, power_iter=svd_power_iter)  # ensure update is stable
+        new_q = new_q / clamped_max_singular_value(new_q, min=eps, power_iter=svd_power_iter)
 
         if store_triu_as_line and new_q.ndim == 2:
             new_q = triu_to_line([new_q])[0][1]
