@@ -2364,7 +2364,6 @@ def _gg_inverse_via_newtonschulz(
     Returns:
         - Preconditioned gradient P0 using the original Q.
     """
-    precond_lr, newton_schulz_lr = 1, precond_lr
     Q = to_triu(oq, True)  # Q is stored in oq
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
@@ -2415,7 +2414,7 @@ def _gg_inverse_via_newtonschulz(
         delta = eye_like(new_q) + precond_lr * (new_q - q)  # Multiplicative update factor
         if max_grad_norm is not None:
             delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(max=1)
-        new_q = multiply(delta, q)  # Q_new = delta @ Q
+        new_q = multiply(delta, multiply(q, delta))  # QUAD update
 
         if new_q.ndim == 2:
             new_q = (new_q + new_q.T) / 2
