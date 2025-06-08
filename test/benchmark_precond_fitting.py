@@ -72,7 +72,7 @@ def precondition_gradient(G_raw: torch.Tensor, hs: List[torch.Tensor]) -> torch.
 def relative_fro_error(est: List[torch.Tensor], true: List[torch.Tensor]) -> float:
     """Compute relative Frobenius error; returns NaN if not applicable."""
     try:
-        return math.exp(sum(torch.linalg.cond(e @ e.T @ t).log().item() for t, e in zip(true, est)))
+        return math.exp(sum(torch.linalg.cond(e @ t).log().item() for t, e in zip(true, est)))
     except Exception:
         return float("nan")  # Return NaN if inverse is unstable (e.g., non-SPD)
 
