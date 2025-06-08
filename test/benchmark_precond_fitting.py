@@ -328,20 +328,20 @@ def create_comparison_plot(df: pd.DataFrame, out_dir: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="plots")
-    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     cfg_grid = {
-        "matrix_shape": [(32,), (128,), (32, 32), (16, 16, 16)],
+        "matrix_shape": [(4, 4)],
         "inverse_order": [1, 4],
         "precond_lr": [1, 1e-1],
         "matrix_type": ["spd", "non_spd"],
-        "cond_number": [1e2, 1e4, 1e6],  # Used when matrix_type is "spd"
-        "eig_min": [-1e-1, -1],  # Used when matrix_type is "non_spd"
-        "eig_max": [10],  # Used when matrix_type is "non_spd"
+        "cond_number": [1e2, 1e4, 1e8, 1e16],  # Used when matrix_type is "spd"
+        "eig_min": [-1e-1, -10],  # Used when matrix_type is "non_spd"
+        "eig_max": [1e1, 1e6],  # Used when matrix_type is "non_spd"
     }
 
     runner = BenchmarkRunner(cfg_grid, n_steps=args.steps, device=args.device)
