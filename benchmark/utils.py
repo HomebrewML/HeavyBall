@@ -36,9 +36,10 @@ base_args = {
     "momentum_into_precond_update": True,
     "eps": 1e-8,
     "weight_decay": 0,
-    "precond_update_power_iterations": 1,
+    "precond_update_power_iterations": 16,
     "dampening": 2**-24,
     "preconditioner_update_probability": 1.0,
+    "precond_init_scale": 1.0,
     "store_triu_as_line": False,
     "update_clipping": None,
     "delayed": True,
@@ -291,7 +292,7 @@ class Objective:
                 2: -0.75,  # 16x over 2 steps
                 1: -0.99,  # 100x over 1 step
             },
-            {1: 2, 16: 1},  # step_count^2 * 1 | step_count ^ 1.5 * 4 | step_count ^ 1 * 16
+            {100: 2, 1600: 1},  # step_count^2 * 1 | step_count ^ 1.5 * 4 | step_count ^ 1 * 16
             steps,
         )
         self.m = None
@@ -359,9 +360,12 @@ class Objective:
                 for loss in torch_hist:
                     loss_cpu = loss.item()
                     if not np.isfinite(loss_cpu) or self.win_condition(loss_cpu):
+                        print("infinite or won", loss_cpu)
                         return validator.ema_states.min().item(), self.m, loss_cpu
                     if validator(loss).item():
+                        print("invalid")
                         return validator.ema_states.min().item(), self.m, loss_cpu
+        print("step threshold")
         return validator.ema_states.min().item(), self.m, loss.item()
 
     def objective(self, params):
