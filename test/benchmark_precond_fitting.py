@@ -1,384 +1,231 @@
-import argparse
+# benchmark_fast.py
+# minimal, Typer‑based rewrite focused on runtime
+
+import functools
 import itertools
 import math
 import os
 import string
-from typing import Dict, List, Tuple
+import typing as tp
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import torch
 import tqdm
+import typer
 from matplotlib.colors import LogNorm
 from torch._dynamo import config as dyn_cfg
 
 from heavyball.utils import _gg_inverse_via_newtonschulz, set_torch
 
 set_torch()
-dyn_cfg.cache_size_limit = 10**6
-dyn_cfg.accumulated_cache_size_limit = 10**6
-
-# --------------------------------------------------------------------------------------
-# Utility helpers
-# --------------------------------------------------------------------------------------
-
+dyn_cfg.cache_size_limit = dyn_cfg.accumulated_cache_size_limit = 1_000_000
 LETTERS = string.ascii_lowercase
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------------------------------------------------------- matrices
 
 
-def generate_spd_matrix_with_cond(n: int, cond: float, device="cpu") -> torch.Tensor:
-    """Generate an SPD matrix with specified condition number."""
-    eigvals = torch.logspace(0, math.log10(cond), n, device=device)
-    Q, _ = torch.linalg.qr(torch.randn(n, n, device=device))
-    return Q @ torch.diag(eigvals) @ Q.T
+@functools.lru_cache(maxsize=None)
+def _spd(n: int, cond: float, device: str):
+    eig = torch.logspace(0, math.log10(cond), n, device=device)
+    q, _ = torch.linalg.qr(torch.randn(n, n, device=device))
+    return q @ torch.diag(eig) @ q.T
 
 
-def generate_symmetric_matrix_with_eig_range(n: int, eig_min: float, eig_max: float, device="cpu") -> torch.Tensor:
-    """Generate a symmetric matrix with specified eigenvalue range."""
-    eigvals = torch.linspace(eig_min, eig_max, n, device=device)
-    Q, _ = torch.linalg.qr(torch.randn(n, n, device=device))
-    return Q @ torch.diag(eigvals) @ Q.T
+@functools.lru_cache(maxsize=None)
+def _sym_range(n: int, lo: float, hi: float, device: str):
+    eig = torch.linspace(lo, hi, n, device=device)
+    q, _ = torch.linalg.qr(torch.randn(n, n, device=device))
+    return q @ torch.diag(eig) @ q.T
 
 
-def generate_matrix(n: int, cfg: Dict, device="cpu") -> torch.Tensor:
-    """Generate a matrix based on configuration."""
+def gen_mat(n: int, cfg: dict, device: str):
     if cfg["matrix_type"] == "spd":
-        return generate_spd_matrix_with_cond(n, cfg["cond_number"], device)
-    elif cfg["matrix_type"] == "non_spd":
-        return generate_symmetric_matrix_with_eig_range(n, cfg["eig_min"], cfg["eig_max"], device)
-    else:
-        raise ValueError("Invalid matrix_type")
+        return _spd(n, cfg["cond_number"], device)
+    return _sym_range(n, cfg["eig_min"], cfg["eig_max"], device)
 
 
-def kron_prod(mats: List[torch.Tensor]) -> torch.Tensor:
-    """Kronecker-product of a list of square matrices."""
-    out = mats[0]
-    for m in mats[1:]:
+# ----------------------------------------------------------------------------- gradients
+
+_DIST = {
+    "normal": lambda s, d: torch.randn(*s, device=d),
+    "laplace": lambda s, d: torch.distributions.Laplace(0.0, 1.0).sample(s).to(d),
+    "cauchy": lambda s, d: torch.distributions.Cauchy(0.0, 1.0).sample(s).to(d),
+    "uniform": lambda s, d: torch.rand(*s, device=d) * 2 - 1,
+    "rademacher": lambda s, d: (torch.randint(0, 2, s, device=d, dtype=torch.float32) * 2 - 1),
+    "poisson": lambda s, d: torch.poisson(torch.ones(*s, device=d)),
+}
+
+
+def _parse(spec: str):
+    if "_sparse" in spec:
+        base, p = spec.split("_sparse")
+        return base, ("static", float(p))
+    if "_anneal" in spec:
+        base, rng = spec.split("_anneal")
+        p0, p1 = map(float, rng.split("-"))
+        return base, ("anneal", (p0, p1))
+    return spec, None
+
+
+def gen_grad(shape: tp.Tuple[int, ...], cfg: dict, step: int, n_steps: int, device: str):
+    base, sparse = _parse(cfg["grad_dist"])
+    g = _DIST[base](shape, device)
+    if sparse is None:
+        return g
+    kind, param = sparse
+    p = param if kind == "static" else param[0] + (param[1] - param[0]) * step / (n_steps - 1)
+    return g * (torch.rand(*shape, device=device) > p)
+
+
+# ----------------------------------------------------------------------------- hessian dyn
+
+
+def blend(a, b, t):
+    return a * (1 - t) + b * t
+
+
+def hess_init(shape, cfg, device):
+    return [gen_mat(d, cfg, device) for d in shape]
+
+
+def hess_update(hs0, hstgt, cfg, step, n):
+    k = cfg["hess_dynamic"]
+    if k == "static":
+        return hs0
+    if k == "lerp":
+        t = step / (n - 1)
+        return [blend(a, b, t) for a, b in zip(hs0, hstgt)]
+    if k == "random_walk":
+        std = cfg.get("perturb_std", 1e-3)
+        return [h + std * torch.randn_like(h) for h in hs0]
+    raise ValueError(k)
+
+
+# ----------------------------------------------------------------------------- util
+
+
+def kron_list(ms):
+    out = ms[0]
+    for m in ms[1:]:
         out = torch.kron(out, m)
     return out
 
 
-def precondition_gradient(G_raw: torch.Tensor, hs: List[torch.Tensor]) -> torch.Tensor:
-    """Apply Kronecker-structured Hessian list *hs* to *G_raw*."""
-    n = G_raw.ndim
-    assert n == len(hs) <= 13, "Too many dims (einsum limited to 26 letters)."
-    in_idx = LETTERS[n : 2 * n]
-    out_idx = LETTERS[:n]
-    h_terms = [f"{out_idx[i]}{in_idx[i]}" for i in range(n)]
-    expr = ",".join(h_terms + ["".join(in_idx)]) + f"->{''.join(out_idx)}"
-    return torch.einsum(expr, *hs, G_raw)
+def precond(G, hs):
+    n = G.ndim
+    ins = LETTERS[n : 2 * n]
+    outs = LETTERS[:n]
+    expr = ",".join(f"{outs[i]}{ins[i]}" for i in range(n)) + "," + "".join(ins) + "->" + "".join(outs)
+    return torch.einsum(expr, *hs, G)
 
 
-def relative_fro_error(est: List[torch.Tensor], true: List[torch.Tensor]) -> float:
-    """Compute relative Frobenius error; returns NaN if not applicable."""
-    try:
-        return math.exp(sum(torch.linalg.cond(e @ t).log().item() for t, e in zip(true, est)))
-    except Exception:
-        return float("nan")  # Return NaN if inverse is unstable (e.g., non-SPD)
+@torch.no_grad()
+def rel_err(est, true):
+    vals = torch.stack([torch.linalg.cond(e @ t).log() for t, e in zip(true, est)])
+    return torch.exp(vals.sum()).item()
 
 
-# --------------------------------------------------------------------------------------
-# Benchmark runner
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- runner
 
 
-class BenchmarkRunner:
-    def __init__(self, cfg_grid: Dict[str, List], n_steps: int = 40, seed: int = 0, device="cpu"):
-        self.cfg_grid = cfg_grid
-        self.n_steps = n_steps
-        self.seed = seed
-        self.device = torch.device(device)
+class Runner:
+    def __init__(self, grid: dict, steps: int, seed: int, device: str):
+        self.grid, self.steps, self.seed, self.device = grid, steps, seed, device
         torch.manual_seed(seed)
 
-    def run(self) -> pd.DataFrame:
-        records = []
-        keys, values = zip(*self.cfg_grid.items())
-        for combo in tqdm.tqdm(list(itertools.product(*values))):
+    def run(self):
+        out = []
+        keys, vals = zip(*self.grid.items())
+        for combo in tqdm.tqdm(list(itertools.product(*vals))):
             cfg = dict(zip(keys, combo))
-            shape: Tuple[int, ...] = cfg["matrix_shape"]
-            shape_str = "x".join(map(str, shape))
-
-            # Build true Hessian list
-            hs = [generate_matrix(d, cfg, device=self.device) for d in shape]
-            Q = [torch.eye(d, device=self.device) for d in shape]  # Preconditioners
+            shape = cfg["matrix_shape"]
+            sstr = "x".join(map(str, shape))
+            hs0 = hess_init(shape, cfg, self.device)
+            hstgt = hess_init(shape, cfg, self.device) if cfg["hess_dynamic"] == "lerp" else hs0
+            Q = [torch.eye(d, device=self.device) for d in shape]
             oq = Q
-
-            for step in range(self.n_steps // 10):
+            for step in range(self.steps):
                 torch.manual_seed(self.seed + step)
-                G_raw = torch.randn(*shape, device=self.device)
-                G = precondition_gradient(G_raw, hs).contiguous().clone()
+                Graw = gen_grad(shape, cfg, step, self.steps, self.device)
+                hs = hess_update(hs0, hstgt, cfg, step, self.steps)
+                G = precond(Graw, hs).contiguous()
                 _gg_inverse_via_newtonschulz(
                     G=G,
                     oq=oq,
                     inverse_order=cfg["inverse_order"],
                     precond_lr=torch.tensor(cfg["precond_lr"], device=self.device),
                 )
-
-            error = relative_fro_error(Q, hs)
-            records.append({**cfg, "shape_str": shape_str, "rel_error": error})
-        return pd.DataFrame.from_records(records)
-
-
-# --------------------------------------------------------------------------------------
-# Plotting helpers
-# --------------------------------------------------------------------------------------
+            err = rel_err(Q, hs)
+            out.append({**cfg, "shape_str": sstr, "rel_error": err})
+        return pd.DataFrame(out)
 
 
-def plot_heatmap(df: pd.DataFrame, shape_str: str, matrix_type: str, out_dir: str):
-    sub = df[(df["shape_str"] == shape_str) & (df["matrix_type"] == matrix_type)]
-    pivot = sub.pivot_table(index="inverse_order", columns="precond_lr", values="rel_error", aggfunc="mean")
-    plt.figure(figsize=(6, 4))
-    sns.heatmap(pivot, annot=True, fmt=".2e", linewidths=0.5, norm=LogNorm())
-    plt.title(f"Rel. error – shape {shape_str}, type {matrix_type}")
-    plt.ylabel("inverse_order")
-    plt.xlabel("precond_lr")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"heat_{shape_str}_{matrix_type}.png"), dpi=150)
-    plt.close()
+# ----------------------------------------------------------------------------- plots
 
 
-def create_unified_visualization(
-    df: pd.DataFrame, best_config: pd.Series, convergence_errors: List[float], out_dir: str
+def heatmaps(df: pd.DataFrame, out_dir: str):
+    g = sns.FacetGrid(df, row="grad_dist", col="hess_dynamic", height=3.4, despine=False, margin_titles=True)
+
+    def _hm(data, **kw):
+        pivot = data.pivot_table(index="inverse_order", columns="precond_lr", values="rel_error", aggfunc="mean")
+        sns.heatmap(pivot, norm=LogNorm(), cmap="viridis", cbar=False, **kw)
+
+    g.map_dataframe(_hm)
+    b_ax = g.fig.add_axes([0.92, 0.2, 0.015, 0.6])
+    vmin, vmax = df.rel_error.min(), df.rel_error.max()
+    sm = plt.cm.ScalarMappable(cmap="viridis", norm=LogNorm(vmin, vmax))
+    sm.set_array([])
+    g.fig.colorbar(sm, cax=b_ax, label="rel error")
+    g.fig.savefig(os.path.join(out_dir, "faceted_heatmaps.png"), dpi=300, bbox_inches="tight")
+    plt.close(g.fig)
+
+
+# ----------------------------------------------------------------------------- CLI
+
+app = typer.Typer()
+
+
+@app.command()
+def main(
+    out_dir: str = "plots",
+    steps: int = 100,
+    device: str = DEVICE.type,
+    grad_dists: tp.List[str] = typer.Option(
+        [
+            "normal",
+            "laplace",
+            "cauchy",
+            "rademacher",
+            "uniform",
+            "poisson",
+            "normal_sparse0.8",
+            "laplace_anneal0.9-0.3",
+        ],
+        help="gradient specs",
+    ),
+    hess_dynamics: tp.List[str] = typer.Option(["static", "lerp", "random_walk"]),
 ):
-    """Create a unified visualization with all results in a single figure."""
-
-    # Set up the figure with a sophisticated layout
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(4, 5, height_ratios=[1.2, 1, 1, 1], width_ratios=[1, 1, 1, 1, 0.05], hspace=0.35, wspace=0.25)
-
-    # Use a professional color scheme
-    plt.style.use("seaborn-v0_8-darkgrid")
-    cmap = "viridis"
-
-    # Title
-    fig.suptitle("Newton-Schulz Preconditioner Convergence Analysis", fontsize=24, fontweight="bold", y=0.98)
-
-    # 1. Convergence curve (top row, spanning 4 columns)
-    ax_conv = fig.add_subplot(gs[0, :4])
-    ax_conv.semilogy(
-        range(1, len(convergence_errors) + 1), convergence_errors, linewidth=3, color="#2E86AB", label="Best SPD config"
-    )
-    ax_conv.fill_between(range(1, len(convergence_errors) + 1), convergence_errors, alpha=0.3, color="#2E86AB")
-    ax_conv.set_xlabel("Update Step", fontsize=14)
-    ax_conv.set_ylabel("Relative Frobenius Error", fontsize=14)
-    ax_conv.set_title(
-        f"Convergence of Best Configuration: shape={best_config.shape_str}, "
-        f"order={int(best_config.inverse_order)}, lr={best_config.precond_lr}",
-        fontsize=16,
-        pad=10,
-    )
-    ax_conv.grid(True, alpha=0.3, linestyle="--")
-    ax_conv.legend(fontsize=12)
-
-    # 2. Heatmaps grid
-    shapes = sorted(df.shape_str.unique(), key=lambda x: (len(x.split("x")), x))
-    matrix_types = ["spd", "non_spd"]
-
-    # Create a shared colorbar axis
-    cbar_ax = fig.add_subplot(gs[1:, -1])
-
-    # Determine global color scale for better comparison
-    valid_errors = df["rel_error"].replace([float("inf"), -float("inf")], float("nan")).dropna()
-    vmin, vmax = valid_errors.min(), valid_errors.max()
-
-    # Create heatmaps
-    heatmap_axes = []
-    for i, shape in enumerate(shapes):
-        for j, mtype in enumerate(matrix_types):
-            row = 1 + i // 2
-            col = (i % 2) * 2 + j
-
-            ax = fig.add_subplot(gs[row, col])
-            heatmap_axes.append(ax)
-
-            # Filter data
-            sub = df[(df["shape_str"] == shape) & (df["matrix_type"] == mtype)]
-
-            if not sub.empty:
-                # Create pivot table
-                pivot = sub.pivot_table(index="inverse_order", columns="precond_lr", values="rel_error", aggfunc="mean")
-
-                sns.heatmap(
-                    pivot,
-                    ax=ax,
-                    cmap=cmap,
-                    norm=LogNorm(vmin=vmin, vmax=vmax),
-                    annot=True,
-                    fmt=".1e",
-                    linewidths=1,
-                    linecolor="white",
-                    cbar=False,
-                    square=True,
-                    annot_kws={"size": 10},
-                )
-
-                # Styling
-                ax.set_title(f"{shape} - {mtype.upper()}", fontsize=14, fontweight="bold", pad=10)
-                ax.set_xlabel("Learning Rate" if row == 3 else "", fontsize=12)
-                ax.set_ylabel("Inverse Order" if col == 0 else "", fontsize=12)
-
-                # Rotate labels for better readability
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
-
-                # Highlight best configuration if it matches
-                if shape == best_config.shape_str and mtype == "spd":
-                    best_order_idx = list(pivot.index).index(int(best_config.inverse_order))
-                    best_lr_idx = list(pivot.columns).index(float(best_config.precond_lr))
-                    rect = plt.Rectangle((best_lr_idx, best_order_idx), 1, 1, fill=False, edgecolor="red", linewidth=3)
-                    ax.add_patch(rect)
-            else:
-                ax.text(
-                    0.5, 0.5, "No Data", transform=ax.transAxes, ha="center", va="center", fontsize=16, color="gray"
-                )
-                ax.set_xticks([])
-                ax.set_yticks([])
-
-    # Add colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax))
-    cbar = plt.colorbar(sm, cax=cbar_ax)
-    cbar.set_label("Relative Frobenius Error", fontsize=14, labelpad=10)
-    cbar.ax.tick_params(labelsize=12)
-
-    # Add summary statistics box
-    stats_text = f"""Summary Statistics:
-    Total configurations tested: {len(df)}
-    Best error (SPD): {df[df["matrix_type"] == "spd"]["rel_error"].min():.2e}
-    Worst error (SPD): {df[df["matrix_type"] == "spd"]["rel_error"].max():.2e}
-    Best configuration: {best_config.shape_str}, order={int(best_config.inverse_order)}, lr={best_config.precond_lr}
-    """
-
-    fig.text(
-        0.98,
-        0.02,
-        stats_text,
-        transform=fig.transFigure,
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8),
-        fontsize=11,
-        ha="right",
-        va="bottom",
-        family="monospace",
-    )
-
-    # Save the unified figure
-    plt.savefig(os.path.join(out_dir, "unified_analysis.png"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def create_comparison_plot(df: pd.DataFrame, out_dir: str):
-    """Create a comparison plot showing the effect of different parameters."""
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Parameter Effects on Convergence", fontsize=18, fontweight="bold")
-
-    # 1. Effect of inverse order
-    ax = axes[0, 0]
-    for shape in df.shape_str.unique():
-        spd_data = df[(df["shape_str"] == shape) & (df["matrix_type"] == "spd")]
-        if not spd_data.empty:
-            order_effect = spd_data.groupby("inverse_order")["rel_error"].mean()
-            ax.semilogy(order_effect.index, order_effect.values, marker="o", label=shape, linewidth=2, markersize=8)
-    ax.set_xlabel("Inverse Order")
-    ax.set_ylabel("Mean Relative Error")
-    ax.set_title("Effect of Inverse Order")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 2. Effect of learning rate
-    ax = axes[0, 1]
-    for shape in df.shape_str.unique():
-        spd_data = df[(df["shape_str"] == shape) & (df["matrix_type"] == "spd")]
-        if not spd_data.empty:
-            lr_effect = spd_data.groupby("precond_lr")["rel_error"].mean()
-            ax.loglog(lr_effect.index, lr_effect.values, marker="s", label=shape, linewidth=2, markersize=8)
-    ax.set_xlabel("Learning Rate")
-    ax.set_ylabel("Mean Relative Error")
-    ax.set_title("Effect of Learning Rate")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 3. SPD vs Non-SPD comparison
-    ax = axes[1, 0]
-    shape_groups = df.groupby(["shape_str", "matrix_type"])["rel_error"].mean().unstack()
-    shape_groups.plot(kind="bar", ax=ax, width=0.8)
-    ax.set_ylabel("Mean Relative Error")
-    ax.set_title("SPD vs Non-SPD Performance")
-    ax.set_yscale("log")
-    ax.legend(["Non-SPD", "SPD"])
-    ax.set_xlabel("Shape")
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
-
-    # 4. Condition number effect (for SPD matrices)
-    ax = axes[1, 1]
-    spd_data = df[df["matrix_type"] == "spd"]
-    for shape in spd_data.shape_str.unique():
-        shape_data = spd_data[spd_data["shape_str"] == shape]
-        cond_effect = shape_data.groupby("cond_number")["rel_error"].mean()
-        ax.loglog(cond_effect.index, cond_effect.values, marker="^", label=shape, linewidth=2, markersize=8)
-    ax.set_xlabel("Condition Number")
-    ax.set_ylabel("Mean Relative Error")
-    ax.set_title("Effect of Condition Number (SPD)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "parameter_comparison.png"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="plots")
-    parser.add_argument("--steps", type=int, default=20000)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
-
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    cfg_grid = {
-        "matrix_shape": [(4, 4)],
+    os.makedirs(out_dir, exist_ok=True)
+    grid = {
+        "matrix_shape": [(4, 4), (32, 32), (256, 256)],
         "inverse_order": [1, 4],
-        "precond_lr": [1, 1e-1],
+        "precond_lr": [1.0, 1e-1, 1e-2],
         "matrix_type": ["spd", "non_spd"],
-        "cond_number": [1e2, 1e4, 1e8, 1e16],  # Used when matrix_type is "spd"
-        "eig_min": [-1e-1, -10],  # Used when matrix_type is "non_spd"
-        "eig_max": [1e1, 1e6],  # Used when matrix_type is "non_spd"
+        "cond_number": [1e2, 1e4, 1e12, 1e30],
+        "eig_min": [1, -10],
+        "eig_max": [1e2, 1e6],
+        "grad_dist": grad_dists,
+        "hess_dynamic": hess_dynamics,
     }
-
-    runner = BenchmarkRunner(cfg_grid, n_steps=args.steps, device=args.device)
-    df = runner.run()
-    csv_path = os.path.join(args.out_dir, "benchmark_results.csv")
-    df.to_csv(csv_path, index=False)
-
-    # Get convergence data for best configuration
-    best = df[df["matrix_type"] == "spd"].nsmallest(1, "rel_error").iloc[0]
-    shape = best.matrix_shape
-    hs = [generate_matrix(d, best.to_dict(), device=args.device) for d in shape]
-    Q = [torch.eye(d, device=args.device) for d in shape]
-    oq = Q
-    errors = []
-
-    for step in range(min(args.steps, 1000)):  # Limit convergence plot to 1000 steps for clarity
-        torch.manual_seed(runner.seed + step)
-        G_raw = torch.randn(*shape, device=args.device)
-        G = precondition_gradient(G_raw, hs)
-        _gg_inverse_via_newtonschulz(
-            G=G.contiguous().clone(),
-            oq=oq,
-            inverse_order=int(best.inverse_order),
-            precond_lr=torch.tensor(float(best.precond_lr), device=args.device),
-        )
-        errors.append(relative_fro_error(Q, hs))
-
-    # Create unified visualization
-    create_unified_visualization(df, best, errors, args.out_dir)
-
-    # Create additional comparison plots
-    create_comparison_plot(df, args.out_dir)
-
-    print(f"Done. Unified visualizations saved to {args.out_dir}")
-    print("  - unified_analysis.png: Complete overview with heatmaps and convergence")
-    print("  - parameter_comparison.png: Parameter effect analysis")
+    df = Runner(grid, steps, seed=0, device=device).run()
+    csv = os.path.join(out_dir, "benchmark.csv")
+    df.to_csv(csv, index=False)
+    heatmaps(df, out_dir)
+    typer.echo(f"done -> {csv}")
 
 
 if __name__ == "__main__":
-    main()
+    app()
