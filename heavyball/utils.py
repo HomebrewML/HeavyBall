@@ -2634,9 +2634,9 @@ def psgd_unprecond_grad(
     for i, q in list(enumerate(preconds))[::-1]:
         q= q.float()
         if q.ndim < 2:
-            ea = ea / q
+            ea = ea / q.square()
         else:
-            ea = torch.linalg.solve_triangular(q, ea, upper=True, left=False)
+            ea = torch.cholesky_solve(ea, q, upper=True)  # cholesky to square Q before inverse
         ea = ea.permute(*range(1, q.ndim), 0)
     return ea.to(ea.dtype)
 
