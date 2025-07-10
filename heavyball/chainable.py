@@ -1163,6 +1163,7 @@ class BaseOpt(ChainOpt):
             raise ValueError("No functions provided. If that's on purpose (SGD-like), use `identity`")
 
         args, kwargs = None, None
+        fns = tuple(fns)
         fn = fns[-1]
         if isinstance(fn, functools.partial):
             fn, args, kwargs = fn.func, fn.args, fn.keywords
