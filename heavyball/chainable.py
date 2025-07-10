@@ -858,7 +858,7 @@ def scale_by_ape(
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
     precond_grad = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
     precond_grad = utils.adam_(exp_avg, exp_avg_sq, precond_grad,  utils.get_beta1(group), utils.get_beta2(group), group["step"],group["eps"])
-    return utils.psgd_unprecond_grad(precond_grad, Q, group["store_triu_as_line"])
+    return [utils.psgd_unprecond_grad(g, Q, group["store_triu_as_line"]) for g in precond_grad]
 
 
 @SqueezeGrad
