@@ -848,7 +848,7 @@ class ForeachAPE(C.BaseOpt):
             gradient_clipping,
             update_clipping,
             False,  #
-            functools.partial(C.scale_by_ape, cached=cached),
+            fns=[functools.partial(C.scale_by_ape, cached=cached)],
         )
 class ForeachPurePSGD(ForeachPSGDKron):
     exp_avg_input: bool = False
