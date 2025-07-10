@@ -2634,9 +2634,11 @@ def psgd_unprecond_grad(
     for i, q in list(enumerate(preconds))[::-1]:
         q= q.float()
         if q.ndim < 2:
-            ea = ea / q.square()
+            ea = ea / q.view(*(1,) * (ea.ndim - 1), -1).square()
         else:
+            ea = ea.transpose(-1, -2)
             ea = torch.cholesky_solve(ea, q, upper=True)  # cholesky to square Q before inverse
+            ea = ea.transpose(-1, -2)
         ea = ea.permute(*range(1, q.ndim), 0)
     return ea.to(ea.dtype)
 
