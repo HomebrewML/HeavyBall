@@ -2622,6 +2622,23 @@ def psgd_precond_grad(
     new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea.to(md))
     return new.to(ea.dtype)
 
+def psgd_unprecond_grad(
+    ea: Tensor,
+    preconds: TriuOrLine,
+    store_triu_as_line: bool = False,
+    symmetric_output: bool = False,
+):
+    if store_triu_as_line:
+        preconds = line_to_triu(preconds, symmetric_output)
+    ea = ea.float()
+    for i, q in list(enumerate(preconds))[::-1]:
+        q= q.float()
+        if q.ndim < 2:
+            ea = ea / q
+        else:
+            ea = torch.linalg.solve_triangular(q, ea, upper=True, left=False)
+        ea = ea.permute(*range(1, q.ndim), 0)
+    return ea.to(ea.dtype)
 
 @decorator_knowngood
 def _compilable_fused_psgd_precond_grad(
