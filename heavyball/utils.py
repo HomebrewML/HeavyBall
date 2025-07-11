@@ -2637,7 +2637,7 @@ def psgd_unprecond_grad(
             ea = ea / q.view(*(1,) * (ea.ndim - 1), -1).square()
         else:
             ea = ea.transpose(-1, -2)
-            ea = torch.cholesky_solve(ea, q, upper=True)  # cholesky to square Q before inverse
+            ea = torch.cholesky_solve(ea, q, upper=True)  # cholesky computes (Q.T@Q)^-1@X
             ea = ea.transpose(-1, -2)
         ea = ea.permute(*range(1, q.ndim), 0)
     return ea.to(ea.dtype)

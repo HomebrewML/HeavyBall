@@ -848,17 +848,19 @@ def scale_by_ape(
     update_to_precond,
     Q,
     Q_cache,
-    velocity: Optional[List[Tensor]],
-    running_lower_bound: List[Tensor],
-    exp_avg: Optional[List[Tensor]] = None,
-    exp_avg_sq: Optional[List[Tensor]] = None,
+    velocity: Optional[Tensor],
+    running_lower_bound: Tensor,
+    exp_avg: Tensor = None,
+    exp_avg_sq: Tensor = None,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
     precond_grad = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
     precond_grad, = utils.adam_([exp_avg], [exp_avg_sq], [precond_grad],  utils.get_beta1(group), utils.get_beta2(group), group["step"],group["eps"])
-    return utils.psgd_unprecond_grad(precond_grad, Q, group["store_triu_as_line"])
+    out = utils.psgd_unprecond_grad(precond_grad, Q, group["store_triu_as_line"])
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
+    return out
+
 
 
 @SqueezeGrad
