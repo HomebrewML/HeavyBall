@@ -2308,8 +2308,11 @@ def _compilable_l2_clip_(x, clip_at):
     ref = x
     x = list(map(promote, x))
     norm = torch._foreach_norm(x)
-    torch._foreach_maximum_(norm, clip_at)
-    out = torch._foreach_div(x, norm)
+    torch._foreach_add_(norm, 1e-6)
+    torch._foreach_reciprocal_(norm)
+    torch._foreach_mul_(norm, clip_at)
+    torch._foreach_maximum_(norm, 1.0)
+    out = torch._foreach_mul(x, norm)
     return stochastic_round_list_(ref, out)
 
 
@@ -2328,8 +2331,11 @@ def _compilable_rmsnorm_clip_(x, clip_at):
     x = list(map(promote, x))
     norm = torch._foreach_norm(x)
     norm = [n.div_(x_.numel() ** 0.5) for n, x_ in zip(norm, x)]
-    torch._foreach_maximum_(norm, clip_at)
-    return torch._foreach_div(x, norm)
+    torch._foreach_add_(norm, 1e-6)
+    torch._foreach_reciprocal_(norm)
+    torch._foreach_mul_(norm, clip_at)
+    torch._foreach_maximum_(norm, 1.0)
+    return torch._foreach_mul(x, norm)
 
 
 def rmsnorm_clip_(x, clip_at: float = 1.0):
@@ -2345,8 +2351,8 @@ def _compilable_global_rmsnorm_clip_(x, clip_at):
         norm += promote(i.square().sum())
         items += i.numel()
     norm = (norm / items) ** 0.5
-    norm = norm.clamp(min=clip_at)
-    stochastic_multiply_(x, 1 / norm)
+    scalar = (clip_at / (norm + 1e-6)).clamp(max=1.0)
+    stochastic_multiply_(x, scalar)
     return x
 
 
@@ -2362,8 +2368,8 @@ def _compilable_global_l2norm_clip_(x, clip_at):
     for i in x:
         norm += promote(i.square().sum())
     norm = norm**0.5
-    norm = norm.clamp(min=clip_at)
-    stochastic_multiply_(x, 1 / norm)
+    scalar = (clip_at / (norm + 1e-6)).clamp(max=1.0)
+    stochastic_multiply_(x, scalar)
     return x
 
 
