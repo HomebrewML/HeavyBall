@@ -122,7 +122,7 @@ class ForeachAdamC(C.BaseOpt):
         **kwargs,
     ):
         if max_lr is None:
-            utils.warn_one(
+            utils.warn_once(
                 "max_lr was not set. setting it to the current learning rate, under the assumption that it strictly decreases"
             )
             max_lr = lr
