@@ -7,7 +7,7 @@ import random
 import sys
 import time
 import warnings
-
+from typing import Callable, Optional
 import numpy as np
 import optuna
 import torch
@@ -259,6 +259,7 @@ class Objective:
         win_condition,
         weight_decay,
         warmup_trials,
+        eval_callback,
         ema_index: int = 0,
         **kwargs,
     ):
@@ -277,6 +278,7 @@ class Objective:
         self.warmup_trials = int(warmup_trials)
         self.kwargs = kwargs
         self.ema_index = ema_index
+        self.eval_callback = eval_callback
 
         # up to 32768 consecutive times can the new loss be (1 - 1e-7)x larger than the preceding loss
         self.validator = Validator(
@@ -333,6 +335,13 @@ class Objective:
             if hasattr(o, "train"):
                 o.train()
 
+            if not hasattr(self, "test_accuracies"):
+                self.callback_results = []
+
+            if self.eval_callback is not None:
+                test_accuracy = self.eval_callback(self.m)
+                self.callback_results.append(test_accuracy)
+
             for j in range(self.group):
                 inp, tgt = self.data()
 
@@ -362,15 +371,16 @@ class Objective:
                         return validator.ema_states.min().item(), self.m, loss_cpu
                     if validator(loss).item():
                         return validator.ema_states.min().item(), self.m, loss_cpu
-        return validator.ema_states.min().item(), self.m, loss.item()
+        return validator.ema_states.min().item(), self.m, loss.item(), self.callback_results
 
     def objective(self, params):
         self.attempt += 1
-        target, _, loss = self._inner(params)
+        target, _, loss, test_accuracies = self._inner(params)
         if self.best_loss is None or loss < self.best_loss or not np.isfinite(self.best_loss):
             self.best_loss = loss
             self.best_at = self.attempt
             self.avg = np.log(np.array(params))
+            self.callback_results = test_accuracies.copy()
         if self.best_at * 8 < self.attempt and self.attempt - self.best_at > self.warmup_trials:  # no improvements
             raise Stop
         if time.time() > self.end_time:  # timeout
@@ -445,6 +455,7 @@ def trial(
     return_best: bool = False,
     warmup_trial_pct: float = 1,
     random_trials: int = 10,
+    eval_callback: Optional[Callable] = None,  # evaluate_test_accuracy(dataloader)
 ):
     if data is None:
         data = _none_data
@@ -474,9 +485,6 @@ def trial(
     if opt.startswith("ortho-"):
         opt = opt[len("ortho-") :]
         kwargs["ortho_method"] = "newtonschulz-graft"
-    if opt == "adam":
-        opt = torch.optim.Adam
-    else:
         opt = getattr(heavyball, opt)
 
     heavyball.utils._ignore_warning("logei_candidates_func is experimental")
@@ -509,6 +517,7 @@ def trial(
         _win_condition,
         weight_decay,
         max(trials * warmup_trial_pct, 1 + random_trials),
+        eval_callback,
         **kwargs,
     )
 
@@ -561,10 +570,54 @@ def trial(
         print("Successfully found the minimum.")
     else:
         winning_params = {"lr": 1, "1mbeta1": 0.9, "1mbeta2": 0.999, "1mshampoo_beta": 0.999}
-    print(
-        f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
-        f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
-        f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss}"
-    )
+
+    if obj.callback_results == []:
+        print(
+            f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
+            f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
+            f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss}"
+        )
+    else:
+        print(
+            f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
+            f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
+            f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss} | Test Accuracies: {obj.callback_results}"
+        )
+
     if return_best:
         return obj.get_best()
+
+
+def evaluate_test_accuracy(test_loader):
+    def _fn(model):
+        # Save the current training state
+        was_training = model.training
+
+        model.eval()
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for data, target in test_loader:
+                if torch.cuda.is_available():
+                    data, target = data.cuda(), target.cuda()
+
+                output = model(data)
+
+                # Handle different output shapes
+                if output.dim() > 2:  # Sequence modeling: [batch, seq_len, vocab_size]
+                    pred = output.argmax(dim=-1)  # [batch, seq_len]
+                    pred_flat = pred.view(-1)
+                    target_flat = target.view(-1)
+                    correct += pred_flat.eq(target_flat).sum().item()
+                    total += target_flat.numel()
+                else:  # Regular classification: [batch, num_classes]
+                    pred = output.argmax(dim=1, keepdim=True)
+                    correct += pred.eq(target.view_as(pred)).sum().item()
+                    total += target.numel()
+
+        # Restore the original training state
+        model.train(was_training)
+        return correct / total
+
+    return _fn
