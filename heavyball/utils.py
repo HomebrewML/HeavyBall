@@ -1936,7 +1936,9 @@ def ndim_tuple(Q: list[Tensor]) -> tuple:
     return tuple(q.ndim for q in Q)
 
 
-def psgd_calc_A_and_conjB(G, Q, conjB):  # conjB ("V", "vector") == randn during hvp/whitening
+def psgd_calc_A_and_conjB(G: Tensor, Q, conjB: Tensor | None):  # conjB ("V", "vector") == randn during hvp/whitening
+    if conjB is None:
+        conjB = torch.randn_like(G)
     exprA = cached_precond_grad_expr(ndim_tuple(Q), G.ndim)  # calcA expr and cached precond expr are the same
     A = casted_einsum(exprA, *Q, G)
     solve = torch.compiler.disable(torch.linalg.solve_triangular)
@@ -2291,7 +2293,7 @@ def cond_n(cond_val: Tensor, *fns):
     return cond(cond_val == 0, fn, lambda: cond_n(cond_val - 1, *fns))
 
 
-@decorator_knowngood
+#@decorator_knowngood
 def _psgd_precond_update_(
     matmuled: List[Optional[Tensor]],
     Q: "TriuOrLine",

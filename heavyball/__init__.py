@@ -742,6 +742,8 @@ class ForeachPSGDKron(C.BaseOpt):
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
         update_clipping = C.default(update_clipping, utils.trust_region_clip_)
         inverse_free = C.default(inverse_free, self.quad)
+        if inverse_free:
+            raise ValueError("inverse_free (i.e., PSGD-QUAD) is not supported at the moment. Consider using https://github.com/evanatyourservice/quad_torch")
 
         defaults = locals()
         defaults.pop("self")
@@ -793,10 +795,6 @@ class ForeachCachedNewtonPSGD(ForeachCachedPSGDKron):
 class NewtonHybrid2PSGDKron(ForeachCachedNewtonPSGD):
     hvp_interval = 2
 
-
-class QUAD(ForeachPSGDKron):
-    quad = True
-    cached = True
 
 
 class ForeachPSGDLRA(C.BaseOpt):
