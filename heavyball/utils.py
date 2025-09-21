@@ -2293,7 +2293,7 @@ def cond_n(cond_val: Tensor, *fns):
     return cond(cond_val == 0, fn, lambda: cond_n(cond_val - 1, *fns))
 
 
-#@decorator_knowngood
+@decorator_knowngood
 def _psgd_precond_update_(
     matmuled: List[Optional[Tensor]],
     Q: "TriuOrLine",
