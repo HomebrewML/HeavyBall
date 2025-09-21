@@ -952,4 +952,6 @@ __all__ = [
     "NewtonHybrid2PSGDKron",
     "MSAMLaProp",
     "NewtonPSGDKron",
+    "ForeachAdamC",
+    "SGD"
 ]
