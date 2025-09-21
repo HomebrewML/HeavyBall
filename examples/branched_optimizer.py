@@ -21,9 +21,23 @@ def _graft(outputs: Iterable[list[torch.Tensor]], eps: float = 1e-8) -> list[tor
 
 
 class GraftedAdam(C.BaseOpt):
-    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
-            weight_decay: float = 1e-4, warmup_steps: int = 0, foreach: bool = True, ):
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, warmup_steps=warmup_steps, )
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 1e-4,
+        warmup_steps: int = 0,
+        foreach: bool = True,
+    ):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            warmup_steps=warmup_steps,
+        )
         branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=_graft)
         super().__init__(params, defaults, foreach, fns=(branch,))
 
@@ -34,7 +48,10 @@ def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,)), ])
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
 
     train_data = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
     test_data = datasets.FashionMNIST(root="./data", train=False, download=True, transform=transform)
@@ -47,7 +64,12 @@ def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_data, batch_size=512, shuffle=False)
 
-    model = nn.Sequential(nn.Flatten(), nn.Linear(28 * 28, 256), nn.ReLU(), nn.Linear(256, 10), ).to(device)
+    model = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(28 * 28, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
+    ).to(device)
 
     optimizer = GraftedAdam(model.parameters(), lr=3e-4, betas=(0.9, 0.995), weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -94,7 +116,8 @@ def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
 
         eval_acc = eval_correct / eval_total if eval_total else 0.0
         print(
-            f"Epoch {epoch}/{epochs} - train loss: {train_loss:.4f} - train acc: {train_acc:.3f} - eval acc: {eval_acc:.3f}")
+            f"Epoch {epoch}/{epochs} - train loss: {train_loss:.4f} - train acc: {train_acc:.3f} - eval acc: {eval_acc:.3f}"
+        )
 
 
 if __name__ == "__main__":
