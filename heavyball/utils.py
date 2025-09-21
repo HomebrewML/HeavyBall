@@ -1996,7 +1996,7 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
         out = (x @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
         return out.squeeze().clone()
 
-    return _cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
+    return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
 
 
 @decorator_knowngood
@@ -2043,7 +2043,7 @@ def clamped_max_singular_value(
     A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
 ) -> Tensor:
     norm = A.norm()  # L2 norm is an upper bound for the spectral norm. If the upper bound is below the minimum, the real value will be too.
-    out = _cond(norm > min, lambda: max_singular_value(A, max_svd, use_cholesky, power_iter), lambda: norm.clone())
+    out = cond(norm > min, lambda: max_singular_value(A, max_svd, use_cholesky, power_iter), lambda: norm.clone())
     return out.clamp(min=min)
 
 
@@ -2070,7 +2070,7 @@ def min_singular_value(
 
     row_norms = A.norm(dim=1)
     norm, idx = row_norms.min(dim=0)
-    v = _cond(norm > 0, lambda: A.index_select(0, idx).flatten(), lambda: torch.rand_like(A[0]))
+    v = cond(norm > 0, lambda: A.index_select(0, idx).flatten(), lambda: torch.rand_like(A[0]))
 
     v = v / promote(v.norm())
     for _ in range(power_iter):
@@ -2085,7 +2085,7 @@ def min_singular_value(
         sigma_square = A.square().sum() / n - mu**2
         return mu - (sigma_square / (n - 1)).sqrt()
 
-    return _cond(
+    return cond(
         (~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), _approx, lambda: lambda_min_hat.clone()
     ).squeeze()
 
@@ -2249,38 +2249,43 @@ def bf16_matmul(x: Tensor, y: Tensor):
     return (promote(x) @ promote(y)).to(x.dtype)
 
 
-def _while_loop(cond, body, state):
+def if_iscompiling(fn):
+    base = getattr(torch, fn.__name__, None)
+    def _fn(x):
+        if torch.compiler.is_compiling() and hasattr(torch, fn.__name__):
+            return base(x)
+        return fn(x)
+    return _fn
+
+
+@if_iscompiling
+def while_loop(cond, body, state):
     """
     dispatches to torch.while_loop if we're compiling. otherwise, falls back to a naive + slow baseline
     useful for debugging
     """
-    if torch.compiler.is_compiling():
-        return torch.while_loop(cond, body, state)
-
     while cond(*state).item():
         state = body(*state)
     return state
 
-
-def _cond(cond, true_fn, false_fn):
+@if_iscompiling
+def cond(cond, true_fn, false_fn):
     """
     dispatches to torch.cond if we're compiling. otherwise, falls back to a naive + slow baseline
     useful for debugging
     """
-    if torch.compiler.is_compiling():
-        return torch.cond(cond, true_fn, false_fn)
 
     if cond.item():
         return true_fn()
     return false_fn()
 
 
-def _cond_n(cond, *fns):
+def cond_n(cond_val: Tensor, *fns):
     fns = list(fns)
     fn = fns.pop(0)
     if not fns:
         return fn
-    return _cond(cond == 0, fn, lambda: _cond_n(cond - 1, *fns))
+    return cond(cond_val == 0, fn, lambda: cond_n(cond_val - 1, *fns))
 
 
 @decorator_knowngood
