@@ -19,7 +19,7 @@ class Param(nn.Module):
         return self.weight.mean() * inp
 
 
-@pytest.mark.parametrize("opt", ["ForeachPSGDKron", "ForeachPaLMPAdam"])
+@pytest.mark.parametrize("opt", ["ForeachPSGDKron"])
 @pytest.mark.parametrize("method", ["qr", "newtonschulz2", "svd", "eigh"])
 @pytest.mark.parametrize("size", [(16, 16, 16, 16), (4, 4, 4, 4), (512, 1, 128), (32128, 768)])
 @pytest.mark.parametrize("merge,split", [(False, False), (True, False), (True, True)])

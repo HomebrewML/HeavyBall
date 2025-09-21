@@ -241,14 +241,14 @@ def eps_sqrt(item, eps):
 
 @decorator_knowngood
 def _compilable_exp_avg_sq_(
-    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: List[Optional[Tensor]]
+    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor]
 ):
     g32 = promote(grad)
     s32 = _lerp(state, torch._foreach_mul(g32, g32), beta2)
 
     denom = [eps_sqrt(d, eps) for d in s32]
 
-    if out[0] is None:
+    if out is None or out[0] is None:
         return denom
 
     copy_stochastic_list_(out, denom)
@@ -317,8 +317,8 @@ def adaptive_gradient_clipping_(
 def is_compiling():
     try:
         return torch.compiler.is_compiling()
-    except TorchDynamoException:
-        return True
+    except (TorchDynamoException, AttributeError):
+        return False
 
 
 def set_(dst: Tensor, src: Tensor):
@@ -367,7 +367,7 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
     )
 
 
-@decorator
+@decorator_knowngood
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     assert (
         G.ndim >= 2
@@ -570,21 +570,15 @@ def get_orthogonal_matrix(mat, max_eps: float = 1e-3, min_eps: float = 1e-30):
             except torch.OutOfMemoryError:
                 if m.device.type == "cpu":
                     raise
-                else:
-                    # Synchronize and clean CUDA state before retry
-                    if m.is_cuda:
-                        torch.cuda.synchronize(m.device)
-                    clean()
-                    m = m.cpu()
-            except RuntimeError as e:  # failed to compute eigenvalues
-                # Check if this is a CUDA error that needs special handling
-                if m.is_cuda and ("CUDA" in str(e) or "illegal memory access" in str(e)):
-                    # CUDA context might be corrupted, move to CPU first
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(m.device)
+                clean()
+                m = m.cpu()
+            except RuntimeError as e:
+                if torch.cuda.is_available() and ("CUDA" in str(e) or "illegal memory access" in str(e)):
                     torch.cuda.synchronize(m.device)
                     clean()
                     m = m.cpu()
-                    if m.dtype != torch.double:
-                        m = m.double()
                 elif m.dtype != torch.double:
                     m = m.double()
                 elif eps < max_eps:
@@ -2097,24 +2091,6 @@ def min_singular_value(
 
 
 @decorator_knowngood
-def _psgd_default_preconditioner_grad(
-    terms: List[Tuple[Tensor, Tensor]],
-    Q: List[Tensor],
-) -> List[Tensor]:
-    out = []
-    for q, (x, y) in zip(Q, terms):
-        x = promote(x)
-        y = promote(y)
-        update = x - y
-        if q.ndim < 2:
-            update = q * update
-        else:
-            update = (q @ update).triu()
-        out.append(update)
-    return out
-
-
-@decorator_knowngood
 def _balance_to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
     if isinstance(Q[0], tuple):
         psgd_balance_Q([o[1] for o in Q])
@@ -2144,6 +2120,99 @@ def eye_like(x: Tensor):
     assert x.ndim == 2
     assert x.size(0) == x.size(1)
     return torch.eye(x.size(0), device=x.device, dtype=x.dtype)
+
+
+@decorator_knowngood
+def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
+    """
+    Idea:
+        G should be zeroth power. So, all Qs together should approximate the G's inverse.
+        Assuming G is 2-dimensional, we'd have two preconditioning Q's: L, R
+        Optimize LGR being a zeroth power using `MSE( (LGR) (LGR).T , I ) + MSE( (LGR).T + (LGR) , I )`,
+        then backprop to L/R jointly.
+        This function computes the gradients for L/R, with an outer optimizer layer handling the rest.
+
+        `psgd_precond_grad` computes LGR for the general (n-dimensional) case
+        `exprG` contains the einsum expressions to compute (LGR)(LGR).T (and (LGR).T(LGR)) for the general n-dim case
+    Args:
+        G: Gradient that should be orthogonalized
+        Q: List of preconditioner tensors.
+
+    Returns:
+        - List of gradients with respect to Q (d_Q).
+    """
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+
+    G16 = stochastic_round_(G)
+    Q16 = [stochastic_round_(q) for q in Q]
+    P = psgd_precond_grad(G16, Q16)  # Q₀GQ₁
+
+    d_P = torch.zeros_like(G)
+    base = einsum_base[: G.ndim]
+    for i, exprG in enumerate(exprGs):
+        pp = compiled_einsum(exprG, P, P)
+        error = pp - eye_like(pp)
+        dim = einsum_base[i]
+        if pp.ndim == 2:
+            new = dim.upper()
+            prec = f"{new}{dim}"
+        else:
+            new = dim
+            prec = dim
+        d_P += torch.einsum(f"{base},{prec}->{base.replace(dim, new)}", P, error)
+
+    d_P = stochastic_round_(d_P)  # accumulate in fp32 and round at the end
+    grads = []
+    for i, exprG in enumerate(exprGs):
+        new_q = Q16[:]
+        new_q[i] = eye_like(new_q[i])
+        pq = psgd_precond_grad(G16, new_q)
+        grad = compiled_einsum(exprG, pq, d_P)
+        if grad.ndim == 2:
+            grad = (grad + grad.T) / 2
+        grads.append(grad)
+
+    return grads, P.to(G.dtype)
+
+
+def _inverse_initial_guess(gg):
+    n = gg.shape[0]
+
+    sigma_max = promote(gg.norm())
+
+    trace_gg = promote(torch.trace(gg))
+    sigma_min_approx = trace_gg / (n * sigma_max)
+
+    return sigma_max, sigma_min_approx
+
+
+@decorator_knowngood
+def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
+    k = torch.arange(degree, dtype=torch.float64, device=device)
+    rotation = (2 * k + 1) * math.pi / (2 * degree)
+    f = (rotation.cos() + 1 + eps) ** -0.5
+    rotation = (rotation.view(-1, 1) * k[1:].view(1, -1)).cos()
+    coeff0 = f.sum() / degree
+    coeffs = f @ rotation * 2 / degree
+    return coeff0.float(), coeffs.float()
+
+
+@decorator_knowngood
+def _psgd_default_preconditioner_grad(
+    terms: List[Tuple[Tensor, Tensor]],
+    Q: List[Tensor],
+) -> List[Tensor]:
+    out = []
+    for q, (x, y) in zip(Q, terms):
+        x = promote(x)
+        y = promote(y)
+        update = x - y
+        if q.ndim < 2:
+            update = q * update
+        else:
+            update = (q @ update).triu()
+        out.append(update)
+    return out
 
 
 @decorator

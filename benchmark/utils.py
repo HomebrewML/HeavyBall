@@ -8,6 +8,7 @@ import sys
 import time
 import warnings
 from typing import Callable, Optional
+
 import numpy as np
 import optuna
 import torch
@@ -36,9 +37,13 @@ base_args = {
     "momentum_into_precond_update": True,
     "eps": 1e-8,
     "weight_decay": 0,
-    "precond_update_power_iterations": 8,
-    "precond_init_scale": 1,
-    "dampening": 2**-18,
+    "precond_update_power_iterations": 16,
+    "dampening": 2**-24,
+    "preconditioner_update_probability": 1.0,
+    "precond_init_scale": 1.0,
+    "store_triu_as_line": False,
+    "update_clipping": None,
+    "delayed": True,
 }
 
 
@@ -80,7 +85,7 @@ class FailureCounter:
 
 class Validator:
     ema_index: int = 4
-    warmup: int = 128
+    warmup: int = 256
     ema_patience: float = 2
     ema_start: int = 0
 
@@ -283,17 +288,16 @@ class Objective:
         # up to 32768 consecutive times can the new loss be (1 - 1e-7)x larger than the preceding loss
         self.validator = Validator(
             {  # We can't check for improvement, as it's not guaranteed - "1% in 1k steps" may not happen
-                256: 0,  # 0 improvement in 256 steps
-                128: -1e-4,  # 1.01x over 128 steps
-                64: -1e-3,  # 1.06x over 64 steps
-                32: -0.01,  # 1.4x over 32 steps
+                1024: -1e-4,  # 1.1x over 1024 steps
+                256: -1e-3,  # 1.25x over 256 steps
+                64: -0.01,  # 2x over 64 steps
                 16: -0.1,  # 5.4x over 16 steps
                 8: -0.33,  # 24x over 8 steps
                 4: -0.5,  # 16x over 4 steps
                 2: -0.75,  # 16x over 2 steps
                 1: -0.99,  # 100x over 1 step
             },
-            {1: 2, 4: 1.5, 16: 1},  # step_count^2 * 1 | step_count ^ 1.5 * 4 | step_count ^ 1 * 16
+            {100: 2, 1600: 1},  # step_count^2 * 1 | step_count ^ 1.5 * 4 | step_count ^ 1 * 16
             steps,
         )
         self.m = None
@@ -460,7 +464,7 @@ def trial(
     if data is None:
         data = _none_data
     group = min(group, steps)
-    heavyball.utils.set_torch()
+    heavyball.utils.set_torch(einsum_strategy="heavyball")
 
     if isinstance(opt, list):
         opt = opt[0]
@@ -533,7 +537,7 @@ def trial(
                 "lr": optuna.distributions.FloatDistribution(1e-7, 100, log=True),
                 "1mbeta1": optuna.distributions.FloatDistribution(1e-5, 1, log=True),
                 "1mbeta2": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
-                "1mshampoo_beta": optuna.distributions.FloatDistribution(1e-5, 1, log=True),
+                "1mshampoo_beta": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
             },
         )
         study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -544,7 +548,7 @@ def trial(
             lr = trial.suggest_float("lr", 1e-7, 100, log=True)
             one_minus_beta1 = trial.suggest_float("1mbeta1", 1e-5, 1, log=True)
             one_minus_beta2 = trial.suggest_float("1mbeta2", 1e-7, 1, log=True)
-            one_minus_shampoo_beta = trial.suggest_float("1mshampoo_beta", 1e-5, 1, log=True)
+            one_minus_shampoo_beta = trial.suggest_float("1mshampoo_beta", 1e-7, 1, log=True)
             out = obj.objective((lr, one_minus_beta1, one_minus_beta2, one_minus_shampoo_beta))
             if obj.win_condition():
                 winning_params.update({

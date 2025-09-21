@@ -420,7 +420,7 @@ class FastINGO:
         population_size: Optional[int] = None,
         learning_rate: Optional[float] = None,
         last_n: int = 4096,
-        loco_step_size: float = 1,
+        loco_step_size: float = 0.1,
         device="cuda",
         batchnorm_decay: float = 0.99,
         score_decay: float = 0.99,
@@ -695,6 +695,10 @@ def init_nsgaii(study, seed, trials, search_space):
         "samplers/nsgaii_with_initial_trials",
     )
     return module.NSGAIIwITSampler(seed=seed)
+
+
+def init_random(study, seed, trials, search_space):
+    return optuna.samplers.RandomSampler(seed=seed)
 
 
 def init_ingo(study, seed, trials, search_space):
