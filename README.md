@@ -15,7 +15,7 @@ _High-performance, extensible, chainable optimizers for PyTorch._
 
 ## Key Features
 
-- Foreach-based optimizers: `ForeachAdamW`, `ForeachRMSprop`, `ForeachSFAdamW`, `Muon`, `ADOPT`, `MSAM`, …
+- Foreach-based optimizers: `ForeachAdamW`, `ForeachRMSprop`, `ForeachSFAdamW`, `Muon`, `ADOPT`, `MSAM` (Momentum SAM), …
 - Schedule-Free optimizers with dynamic learning rate adaptation.
 - Advanced update rules: MARS correction, cautious updates, PaLM beta2 scheduling.
 - Chainable transforms for custom optimization recipes.
@@ -54,6 +54,15 @@ for data, target in dataloader:
 > ```bash
 > python3 -m benchmark.run_all_benchmarks --opt ForeachSOAP --opt LaProp --opt AdamW --opt Muon --opt ForeachCachedNewtonPSGD  --opt RMSprop --opt OrthoLaProp --opt ForeachSFAdamW --opt ForeachADOPT --opt LaPropOrtho --opt CachedPSGDKron --opt SignLaProp --opt ForeachSOLP --opt PSGDLRA --opt NewtonPSGDLRA --opt NewtonHybrid2PSGDKron --opt NewtonHybrid2PSGDLRA --opt mars-NewtonHybrid2PSGDLRA --opt MSAMLaProp --opt mars-adaptive-NewtonHybrid2PSGDKron  --opt mars-ortho-NewtonHybrid2PSGDKron --opt MuonLaProp --opt mars-unscaled-NewtonHybrid2PSGDKron --opt mars-NewtonHybrid2PSGDKron --opt cautious-AdamW --opt unscaled_cautious-AdamW --opt mars-AdamW  --dtype float32 --steps 1000000 --trials 1000 --parallelism 256 --seeds 1 --difficulties trivial --difficulties easy --difficulties medium --difficulties hard --difficulties extreme --difficulties nightmare --timeout 2880
 > ```
+
+## Migrating from HeavyBall 1.x
+
+- Read the detailed [2.0.0 migration notes](docs/heavyball-2.0.0-migration.md) for an end-to-end checklist, including guidance for restoring legacy behaviour when needed.
+- Use `scripts/migrate_optimizer_state.py` to rewrite pre-2.0 optimizer checkpoints:
+  ```bash
+  python scripts/migrate_optimizer_state.py path/to/checkpoint.pt heavyball.ForeachAdamW --state-key optimizer
+  ```
+  The utility renames legacy state entries, fans them out per parameter view, and injects the HeavyBall metadata block expected by 2.0.0.
 
 
 ## Contributing
