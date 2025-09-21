@@ -231,6 +231,23 @@ class NoStateNoForeach(FunctionTransform):
         return updates
 
 
+class SqueezeGrad(FunctionTransform):
+    def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        original_shapes = [u.shape for u in update]
+        update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
+        grad = [x.view_as(u) for x, u in zip(grad, update)]
+        param = [x.view_as(u) for x, u in zip(param, update)]
+        args = list(args)
+        for i, a in enumerate(args):
+            if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
+                args[i] = [x.view_as(u) for x, u in zip(a, update)]
+        for k, a in kwargs.items():
+            if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
+                kwargs[k] = [x.view_as(u) for x, u in zip(a, update)]
+        out = self.fn(state, group, update, grad, param, *args, **kwargs)
+        return [o.view(s) for o, s in zip(out, original_shapes)]
+
+
 def zero_guard(*names):
     return functools.partial(ZeroGuard, names=names)
 
@@ -760,6 +777,7 @@ def _update_lra(
     )
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -768,6 +786,7 @@ def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -777,6 +796,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     raise SkipUpdate from None
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -785,6 +805,7 @@ def scale_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, 
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -794,6 +815,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
     raise SkipUpdate from None
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
@@ -814,6 +836,7 @@ def scale_by_psgd(
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
@@ -838,6 +861,7 @@ def scale_by_delayed_psgd(
     return new if precond is None else precond
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
@@ -870,6 +894,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
     return clip_fn(update)
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
@@ -1113,6 +1138,7 @@ class BaseOpt(ChainOpt):
             raise ValueError("No functions provided. If that's on purpose (SGD-like), use `identity`")
 
         args, kwargs = None, None
+        fns = tuple(fns)
         fn = fns[-1]
         if isinstance(fn, functools.partial):
             fn, args, kwargs = fn.func, fn.args, fn.keywords
