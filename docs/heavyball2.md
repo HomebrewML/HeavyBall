@@ -23,7 +23,8 @@
 * `MSAMLaProp` built on top of [Momentum‑SAM](https://arxiv.org/abs/2401.12033)
 * Chainable pipeline:
     * Every transform carries a `transform_idx`; state keys include this index
-    * Branching supported
+    * [Optimizer branching](https://github.com/HomebrewML/HeavyBall/blob/2f7e095fb8217a58600d86ea6b19682c10e7eb33/examples/branched_optimizer.py#L15-L28),
+      for more freedom in optimizer design and native [grafting](https://openreview.net/forum?id=FpKgG31Z_i9) support
     * `PrecondGradAccumGuard` enables gradient accumulation for preconditioner fitting
     * `SqueezeGrad` removes size‑1 dims before functional transforms, improving PSGD's speed and preconditioner fitting
 * PSGD and SOAP speedups through new, more accurate SVD calculation and better compilation
