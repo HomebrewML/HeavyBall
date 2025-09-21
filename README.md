@@ -57,7 +57,7 @@ for data, target in dataloader:
 
 ## Migrating from HeavyBall 1.x
 
-- Read the detailed [2.0.0 migration notes](docs/heavyball-2.0.0-migration.md) for an end-to-end checklist, including guidance for restoring legacy behaviour when needed.
+- Read the detailed [2.0.0 migration notes](docs/heavyball2.md) for an end-to-end checklist, including guidance for restoring legacy behaviour when needed.
 - Use `scripts/migrate_optimizer_state.py` to rewrite pre-2.0 optimizer checkpoints:
   ```bash
   python scripts/migrate_optimizer_state.py path/to/checkpoint.pt heavyball.ForeachAdamW --state-key optimizer
