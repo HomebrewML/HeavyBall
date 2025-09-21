@@ -2251,10 +2251,12 @@ def bf16_matmul(x: Tensor, y: Tensor):
 
 def if_iscompiling(fn):
     base = getattr(torch, fn.__name__, None)
+
     def _fn(x):
         if torch.compiler.is_compiling() and hasattr(torch, fn.__name__):
             return base(x)
         return fn(x)
+
     return _fn
 
 
@@ -2267,6 +2269,7 @@ def while_loop(cond, body, state):
     while cond(*state).item():
         state = body(*state)
     return state
+
 
 @if_iscompiling
 def cond(cond, true_fn, false_fn):
