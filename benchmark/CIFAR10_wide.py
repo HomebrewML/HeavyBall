@@ -9,7 +9,7 @@ import typer
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from benchmark.utils import loss_win_condition, trial
+from benchmark.utils import evaluate_test_accuracy, loss_win_condition, trial
 from heavyball.utils import set_torch
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -149,7 +149,7 @@ def main(
         weight_decay,
         failure_threshold=10,
         trials=trials,
-        test_loader=test_loader,
+        eval_callback=evaluate_test_accuracy(test_loader),
     )
 
 
