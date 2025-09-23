@@ -1223,14 +1223,14 @@ def _compilable_adam_(
 
 
 def adam_(
-    exp_avg: List[Tensor],
-    exp_avg_sq: List[Tensor],
-    grad: List[Tensor],
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
     beta1: float,
     beta2: float,
     step: int,
     eps: float = 1e-8,
-):
+) -> List[Tensor]:
     exp_avg, exp_avg_sq, grad = map(list_guard, (exp_avg, exp_avg_sq, grad))
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
     _compilable_adam_(exp_avg, exp_avg_sq, grad, beta1, beta2, step, eps)
@@ -2283,6 +2283,54 @@ def cond(cond, true_fn, false_fn):
     if cond.item():
         return true_fn()
     return false_fn()
+
+
+@decorator_knowngood
+def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
+    """
+    Return w such that H = I - 2 w w^T is orthogonal and H e1 = v (v unit).
+    Applying from the right: G @ H = G - 2 (G @ w) w^T.
+    If v is (numerically) e1, returns w=0 and H=I.
+    """
+    v = v / v.norm().clamp(min=eps)
+    e1 = torch.zeros_like(v)
+    e1[0] = 1.0
+    w = e1 - v
+    return w / w.norm().clamp(min=eps)
+
+
+def eigvecs_product_rank1(
+    G: Tensor, v: Tensor, w_cache: Optional[Tensor] = None, eps: float = 1e-12
+) -> Tuple[Tensor, Tensor]:
+    """
+    Compute Y = G @ V where V is an eigenvector matrix for P = λ I + σ v v^T,
+    using the Householder reflector with first column v. Never materializes V.
+
+    Args:
+        G: shape (..., d) — gradient row(s) you want to rotate into eigenbasis.
+        v: shape (d,)      — current unit direction (top eigenvector of P).
+        w_cache: optional Householder vector w; pass to reuse across calls.
+
+    Returns:
+        (Y, w) where:
+          Y has shape (..., d) and equals G @ eigenvectors(P),
+          w is the Householder vector you can cache & reuse.
+    """
+    w = w_cache if w_cache is not None else _householder_vec_e1_to_v(v, eps)
+    Gw = torch.tensordot(G, w, dims=([-1], [0]))  # shape (...,)
+    Y = G - 2.0 * Gw.unsqueeze(-1) * w
+    return Y, w
+
+
+@decorator_knowngood
+def oja_update(v: Tensor, g: Tensor, lr: float = 1e-2, eps: float = 1e-12) -> Tensor:
+    """
+    One Oja step to track the top eigendirection of the gradient covariance.
+    v <- v + lr * ((g^T v) g - (g^T v)^2 v); then renormalize.
+    """
+    gv = g @ v
+    v = v + lr * (gv * g - (gv * gv) * v)
+    return v / v.norm().clamp(min=eps)
 
 
 def cond_n(cond_val: Tensor, *fns):
