@@ -375,16 +375,15 @@ class Objective:
                         return validator.ema_states.min().item(), self.m, loss_cpu
                     if validator(loss).item():
                         return validator.ema_states.min().item(), self.m, loss_cpu
-        return validator.ema_states.min().item(), self.m, loss.item(), self.callback_results
+        return validator.ema_states.min().item(), self.m, loss.item()
 
     def objective(self, params):
         self.attempt += 1
-        target, _, loss, test_accuracies = self._inner(params)
+        target, _, loss = self._inner(params)
         if self.best_loss is None or loss < self.best_loss or not np.isfinite(self.best_loss):
             self.best_loss = loss
             self.best_at = self.attempt
             self.avg = np.log(np.array(params))
-            self.callback_results = test_accuracies.copy()
         if self.best_at * 8 < self.attempt and self.attempt - self.best_at > self.warmup_trials:  # no improvements
             raise Stop
         if time.time() > self.end_time:  # timeout
@@ -489,7 +488,7 @@ def trial(
     if opt.startswith("ortho-"):
         opt = opt[len("ortho-") :]
         kwargs["ortho_method"] = "newtonschulz-graft"
-        opt = getattr(heavyball, opt)
+    opt = getattr(heavyball, opt)
 
     heavyball.utils._ignore_warning("logei_candidates_func is experimental")
     heavyball.utils._ignore_warning("BoTorchSampler is experimental")
@@ -526,10 +525,10 @@ def trial(
     )
 
     torch.cuda.synchronize()
-    start_time = time.time()
     stdout, sys.stdout = sys.stdout, sys.stderr
 
     set_seed()
+    start_time = time.time()
     try:
         sampler = AutoSampler(
             seed=0x123125,
@@ -542,6 +541,7 @@ def trial(
         )
         study = optuna.create_study(direction="minimize", sampler=sampler)
         winning_params = {}
+        prev_best = float("inf")
 
         def _optuna_objective(trial):
             set_seed(0x12312)
@@ -550,13 +550,14 @@ def trial(
             one_minus_beta2 = trial.suggest_float("1mbeta2", 1e-7, 1, log=True)
             one_minus_shampoo_beta = trial.suggest_float("1mshampoo_beta", 1e-7, 1, log=True)
             out = obj.objective((lr, one_minus_beta1, one_minus_beta2, one_minus_shampoo_beta))
-            if obj.win_condition():
+            if out < prev_best:
                 winning_params.update({
                     "lr": lr,
                     "1mbeta1": one_minus_beta1,
                     "1mbeta2": one_minus_beta2,
                     "1mshampoo_beta": one_minus_shampoo_beta,
                 })
+            if obj.win_condition(out):
                 raise WinConditionMet
             return out
 
@@ -570,23 +571,12 @@ def trial(
     torch.cuda.synchronize()
 
     end_time = time.time()
-    if winning_params:
-        print("Successfully found the minimum.")
-    else:
-        winning_params = {"lr": 1, "1mbeta1": 0.9, "1mbeta2": 0.999, "1mshampoo_beta": 0.999}
 
-    if obj.callback_results == []:
-        print(
-            f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
-            f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
-            f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss}"
-        )
-    else:
-        print(
-            f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
-            f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
-            f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss} | Test Accuracies: {obj.callback_results}"
-        )
+    print(
+        f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
+        f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
+        f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss} | Callback Results: {obj.callback_results}"
+    )
 
     if return_best:
         return obj.get_best()
