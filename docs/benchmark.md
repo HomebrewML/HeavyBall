@@ -69,7 +69,7 @@ reinforcing the need for diagnostic rather than purely comparative evaluation.
 <small>² `Mars`: Reduces variance in gradients</small>
 
 *This is a subset of the full results. For a complete breakdown, see
-the [full benchmark results](https://github.com/HomebrewML/HeavyBall/blob/main/benchmark/benchmark_results.md).*
+the [full benchmark results](https://github.com/HomebrewML/LightBench/blob/master/lightbench/benchmark_results.md).*
 
 ### Case Study: The `AdamW` Family
 
@@ -106,5 +106,5 @@ failure modes and developing novel visualization techniques.
 
 **Resources:**
 
-* **Full Results:** [benchmark/benchmark_results.md](https://github.com/HomebrewML/HeavyBall/blob/main/benchmark/benchmark_results.md)
-* **Benchmark Code:** [https://github.com/HomebrewML/HeavyBall/tree/main/benchmark](https://github.com/HomebrewML/HeavyBall/tree/main/benchmark)
+* **Full Results:** [LightBench/src/lightbench/benchmark_results.md](https://github.com/HomebrewML/HeavyBall/blob/main/LightBench/src/lightbench/benchmark_results.md)
+* **Benchmark Code:** [https://github.com/HomebrewML/HeavyBall/tree/main/LightBench](https://github.com/HomebrewML/HeavyBall/tree/main/LightBench)

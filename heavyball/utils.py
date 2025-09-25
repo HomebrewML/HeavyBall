@@ -2299,8 +2299,9 @@ def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
     return w / w.norm().clamp(min=eps)
 
 
+@decorator_knowngood
 def eigvecs_product_rank1(
-    G: Tensor, v: Tensor, w_cache: Optional[Tensor] = None, eps: float = 1e-12
+    G: Tensor, v: Tensor, w: Optional[Tensor] = None, eps: float = 1e-12
 ) -> Tuple[Tensor, Tensor]:
     """
     Compute Y = G @ V where V is an eigenvector matrix for P = λ I + σ v v^T,
@@ -2309,16 +2310,16 @@ def eigvecs_product_rank1(
     Args:
         G: shape (..., d) — gradient row(s) you want to rotate into eigenbasis.
         v: shape (d,)      — current unit direction (top eigenvector of P).
-        w_cache: optional Householder vector w; pass to reuse across calls.
+        w: optional Householder vector w; pass to reuse across calls.
 
     Returns:
         (Y, w) where:
           Y has shape (..., d) and equals G @ eigenvectors(P),
           w is the Householder vector you can cache & reuse.
     """
-    w = w_cache if w_cache is not None else _householder_vec_e1_to_v(v, eps)
-    Gw = torch.tensordot(G, w, dims=([-1], [0]))  # shape (...,)
-    Y = G - 2.0 * Gw.unsqueeze(-1) * w
+    if w is None:
+        w = _householder_vec_e1_to_v(v, eps)
+    Y = G - 2.0 * compiled_einsum("...i,i,j->...j", G, w, w)
     return Y, w
 
 

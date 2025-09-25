@@ -5,13 +5,13 @@ os.environ["TORCH_LOGS"] = "+recompiles"
 
 import pytest
 import torch
+from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
 from torch.utils._pytree import tree_map
 
 import heavyball
 import heavyball.utils
-from benchmark.utils import get_optim
 from heavyball.utils import set_torch
 
 config.cache_size_limit = 128

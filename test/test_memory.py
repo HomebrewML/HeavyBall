@@ -1,10 +1,10 @@
 import pytest
 import torch
+from lightbench.utils import get_optim
 from torch import nn
 
 import heavyball
 import heavyball.utils
-from benchmark.utils import get_optim
 from heavyball.utils import clean, set_torch
 
 

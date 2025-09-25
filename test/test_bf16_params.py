@@ -3,12 +3,12 @@ import os
 
 import pytest
 import torch
+from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
 
 import heavyball
 import heavyball.utils
-from benchmark.utils import get_optim
 from heavyball.utils import clean, set_torch
 
 os.environ["TORCH_LOGS"] = "+recompiles"

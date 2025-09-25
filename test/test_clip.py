@@ -6,11 +6,11 @@ import math
 
 import pytest
 import torch
+from lightbench.utils import get_optim
 from torch import linalg, nn
 from torch._dynamo import config
 
 import heavyball
-from benchmark.utils import get_optim
 from heavyball import utils
 from heavyball.utils import (
     _compilable_global_l2norm_clip_,

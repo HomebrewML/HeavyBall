@@ -487,7 +487,7 @@ def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx
         utils.copy_stochastic_(fisher_approx, update / update.norm().clamp(min=1e-8))
         raise SkipUpdate from None
 
-    precond_update, w_cache = utils.eigvecs_product_rank1(update.flatten(), fisher_approx.flatten().to(update.dtype))
+    precond_update, w = utils.eigvecs_product_rank1(update.flatten(), fisher_approx.flatten().to(update.dtype))
     precond_update = utils.adam_(
         exp_avg,
         exp_avg_sq,
@@ -496,7 +496,7 @@ def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx
         utils.get_beta2(group),
         group["step"] - 1,
     )[0]
-    precond_update, _ = utils.eigvecs_product_rank1(precond_update.flatten(), fisher_approx.flatten(), w_cache)
+    precond_update, _ = utils.eigvecs_product_rank1(precond_update.flatten(), fisher_approx.flatten(), w)
 
     new_approx = utils.oja_update(fisher_approx.flatten().to(update.dtype), update.flatten(), group["precond_lr"])
     utils.copy_stochastic_(fisher_approx, new_approx)
