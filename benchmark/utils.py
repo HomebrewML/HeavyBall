@@ -251,6 +251,75 @@ class Plotter(nn.Module):
         plt.close()
 
 
+class MultiPlotter:
+    def __init__(self, plotters):
+        if not plotters:
+            raise ValueError("MultiPlotter requires at least one Plotter instance.")
+        self.plotters = plotters
+        self._reference = plotters[0][1]
+
+    def plot(self, title=None, save_path=None):
+        import matplotlib.colors
+        import matplotlib.pyplot as plt
+
+        ref = self._reference
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        z = ref.Z
+        if ref.should_normalize:
+            z = z - z.min()
+            z = z / z.max()
+            z = z + 1e-8
+
+        contour = ax.contourf(ref.X.numpy(), ref.Y.numpy(), z.log().numpy(), levels=1000)
+
+        color_cycle = plt.rcParams.get("axes.prop_cycle")
+        if color_cycle is not None:
+            colors = list(color_cycle.by_key().get("color", []))
+        else:
+            colors = []
+        if not colors:
+            colors = list(matplotlib.colors.TABLEAU_COLORS.values())
+
+        for idx, (label, plotter) in enumerate(self.plotters):
+            color = colors[idx % len(colors)]
+            trajectory = np.array(plotter.trajectory)
+            ax.plot(trajectory[:, 0], trajectory[:, 1], ".-", color=color, label=label)
+            ax.scatter(
+                trajectory[0, 0],
+                trajectory[0, 1],
+                color=color,
+                edgecolors="black",
+                linewidths=0.8,
+                s=70,
+                marker="o",
+            )
+            ax.scatter(
+                trajectory[-1, 0],
+                trajectory[-1, 1],
+                color=color,
+                linewidths=1.6,
+                s=90,
+                marker="x",
+            )
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        if title:
+            ax.set_title(title)
+        ax.legend()
+        ax.grid(True)
+
+        label = "Log(ObjectiveValue)"
+        if ref.should_normalize:
+            label = "Log(NormalizedObjectiveValue)"
+        fig.colorbar(contour, ax=ax, label=label)
+
+        if save_path:
+            fig.savefig(save_path)
+        plt.close(fig)
+
+
 class Objective:
     def __init__(
         self,
@@ -284,6 +353,7 @@ class Objective:
         self.kwargs = kwargs
         self.ema_index = ema_index
         self.eval_callback = eval_callback
+        self.hyperparam_log_history: list[np.ndarray] = []
 
         # up to 32768 consecutive times can the new loss be (1 - 1e-7)x larger than the preceding loss
         self.validator = Validator(
@@ -315,23 +385,27 @@ class Objective:
             self._last_loss = loss
         return self._win_condition(self.m, self._last_loss)[0]
 
-    def _inner(self, params):
+    def _inner(
+        self,
+        params,
+        model_override=None,
+        *,
+        allow_validator_stop: bool = True,
+        allow_win_condition: bool = True,
+    ):
         input_kwargs = locals()
         input_kwargs.pop("self")
-        params = {
-            "lr": params[0],
-            "betas": (1 - params[1], 1 - params[2]),
-            "beta": 1 - params[1],
-            "shampoo_beta": 1 - params[3],
-            "sam_step_size": params[3],
-            "eps": 1e-8,
-            "precond_lr": params[3],
-            # we never have both precond_lr and shampoo_beta
-        }
-        if self.set_precond_init_scale:
-            params["precond_init_scale"] = 0.1
-        self.m = copy.deepcopy(self.model)
-        o = get_optim(self.opt, self.m.parameters(), **params, weight_decay=self.weight_decay, **self.kwargs)
+        params = tuple(float(p) for p in params)
+        params_dict = self._format_params(params)
+        model_template = self.model if model_override is None else model_override
+        self.m = self._clone_model(model_template)
+        o = get_optim(
+            self.opt,
+            self.m.parameters(),
+            **params_dict,
+            weight_decay=self.weight_decay,
+            **self.kwargs,
+        )
         torch_hist = torch.empty(self.group, dtype=torch.float64, device="cuda")
         validator = self.validator.new()
 
@@ -371,15 +445,19 @@ class Objective:
             with torch.no_grad():
                 for loss in torch_hist:
                     loss_cpu = loss.item()
-                    if not np.isfinite(loss_cpu) or self.win_condition(loss_cpu):
+                    win_condition_reached = allow_win_condition and self.win_condition(loss_cpu)
+                    if not np.isfinite(loss_cpu) or win_condition_reached:
                         return validator.ema_states.min().item(), self.m, loss_cpu
-                    if validator(loss).item():
+                    validator_triggered = validator(loss).item()
+                    if allow_validator_stop and validator_triggered:
                         return validator.ema_states.min().item(), self.m, loss_cpu
         return validator.ema_states.min().item(), self.m, loss.item()
 
     def objective(self, params):
         self.attempt += 1
         target, _, loss = self._inner(params)
+        params_log10 = np.log10(np.array(params, dtype=np.float64))
+        self.hyperparam_log_history.append(params_log10)
         if self.best_loss is None or loss < self.best_loss or not np.isfinite(self.best_loss):
             self.best_loss = loss
             self.best_at = self.attempt
@@ -390,9 +468,120 @@ class Objective:
             raise Stop
         return target
 
+    def _format_params(self, params: tuple[float, float, float, float]) -> dict[str, float]:
+        params_dict = {
+            "lr": params[0],
+            "betas": (1 - params[1], 1 - params[2]),
+            "beta": 1 - params[1],
+            "shampoo_beta": 1 - params[3],
+            "sam_step_size": params[3],
+            "eps": 1e-8,
+            "precond_lr": params[3],
+        }
+        if self.set_precond_init_scale:
+            params_dict["precond_init_scale"] = 0.1
+        return params_dict
+
+    def _clone_model(self, model_template):
+        cloned = copy.deepcopy(model_template)
+        if hasattr(cloned, "cuda"):
+            cloned = cloned.cuda()
+        if hasattr(cloned, "trajectory"):
+            initial = getattr(cloned, "initial", None)
+            param_tensor = getattr(cloned, "param", None)
+            if initial is not None:
+                cloned.trajectory = [initial.detach().cpu().numpy()]
+            elif param_tensor is not None:
+                cloned.trajectory = [param_tensor.detach().cpu().numpy()]
+            else:
+                cloned.trajectory = []
+        return cloned
+
+    def _replay_params(self, params, model_override=None, *, callback_period: int | None = None):
+        params = tuple(float(p) for p in params)
+        params_dict = self._format_params(params)
+        model_template = self.model if model_override is None else model_override
+        replay_model = self._clone_model(model_template)
+        optimizer = get_optim(
+            self.opt,
+            replay_model.parameters(),
+            **params_dict,
+            weight_decay=self.weight_decay,
+            **self.kwargs,
+        )
+
+        total_steps = self.steps
+        period = callback_period if callback_period is not None else max(1, self.group)
+
+        for step_idx in range(total_steps):
+            if hasattr(optimizer, "train"):
+                optimizer.train()
+
+            if not hasattr(self, "callback_results"):
+                self.callback_results = []
+            if self.eval_callback is not None and step_idx % period == 0:
+                test_accuracy = self.eval_callback(replay_model)
+                self.callback_results.append(test_accuracy)
+
+            inp, tgt = self.data()
+
+            def _closure():
+                loss = replay_model() if inp is None else replay_model(inp)
+                if self.loss_fn is not None:
+                    loss = self.loss_fn(loss, tgt)
+                loss.backward()
+                return loss
+
+            try:
+                optimizer.step(_closure)
+            except PrecondInitError:
+                self.set_precond_init_scale = True
+                params_dict = self._format_params(params)
+                optimizer = get_optim(
+                    self.opt,
+                    replay_model.parameters(),
+                    **params_dict,
+                    weight_decay=self.weight_decay,
+                    **self.kwargs,
+                )
+                optimizer.step(_closure)
+
+            optimizer.zero_grad()
+            if hasattr(optimizer, "eval"):
+                optimizer.eval()
+
+        return replay_model
+
+    def evaluate_params(self, params, model_override=None):
+        params = tuple(float(p) for p in params)
+        original_group = self.group
+        try:
+            self.group = 1
+            return self._replay_params(
+                params,
+                model_override=model_override,
+                callback_period=original_group,
+            )
+        finally:
+            self.group = original_group
+
+    def compute_hparam_log_ema(self, beta: float = 0.9):
+        if not 0 < beta < 1:
+            raise ValueError("EMA beta must be in (0, 1).")
+        if not self.hyperparam_log_history:
+            return None
+        ema = self.hyperparam_log_history[0].copy()
+        for log_vals in self.hyperparam_log_history[1:]:
+            ema = beta * ema + (1 - beta) * log_vals
+        return ema
+
     def get_best(self):
-        self.group = 1
-        return self._inner(np.exp(self.avg))[1]
+        original_group = self.group
+        try:
+            self.group = 1
+            return self._replay_params(tuple(np.exp(self.avg)), callback_period=original_group)
+        finally:
+            self.group = original_group
 
 
 def loss_win_condition(target):
@@ -459,36 +648,25 @@ def trial(
     warmup_trial_pct: float = 1,
     random_trials: int = 10,
     eval_callback: Optional[Callable] = None,  # evaluate_test_accuracy(dataloader)
+    ema_beta: float = 0.9,
 ):
     if data is None:
         data = _none_data
     group = min(group, steps)
     heavyball.utils.set_torch(einsum_strategy="heavyball")
 
-    if isinstance(opt, list):
-        opt = opt[0]
+    if not 0 < ema_beta < 1:
+        raise ValueError("ema_beta must be in (0, 1).")
 
-    kwargs = {"caution": False, "mars": False}
-    if opt.startswith("cautious-"):
-        opt = opt[len("cautious-") :]
-        kwargs["caution"] = True
-    if opt.startswith("unscaled_cautious-"):
-        opt = opt[len("unscaled_cautious-") :]
-        heavyball.utils.disable_caution_scaling()
-        kwargs["caution"] = True
-    if opt.startswith("mars-"):
-        opt = opt[len("mars-") :]
-        kwargs["mars"] = True
-    if opt.startswith("unscaled-"):
-        opt = opt[len("unscaled-") :]
-        kwargs["unscaled"] = True
-    if opt.startswith("adaptive-"):
-        opt = opt[len("adaptive-") :]
-        kwargs["adaptive"] = True
-    if opt.startswith("ortho-"):
-        opt = opt[len("ortho-") :]
-        kwargs["ortho_method"] = "newtonschulz-graft"
-    opt = getattr(heavyball, opt)
+    opt_list = opt if isinstance(opt, list) else [opt]
+    if not opt_list:
+        raise ValueError("At least one optimizer must be provided.")
+
+    plotter_template = model if isinstance(model, Plotter) else None
+    if plotter_template is not None:
+        base_model_template = copy.deepcopy(plotter_template.objective)
+    else:
+        base_model_template = copy.deepcopy(model)
 
     heavyball.utils._ignore_warning("logei_candidates_func is experimental")
     heavyball.utils._ignore_warning("BoTorchSampler is experimental")
@@ -498,88 +676,173 @@ def trial(
         "The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior."
     )
 
-    cleanup()
-    set_seed()
+    results = []
+    baseline_cautioning = getattr(heavyball.utils, "_compilable_cautioning", None)
 
-    did_win = False
+    for opt_entry in opt_list:
+        cleanup()
+        set_seed()
 
-    def _win_condition(*args):
-        nonlocal did_win
-        win_state, out = win_condition(*args)
-        did_win |= win_state
-        return did_win, out
+        kwargs = {"caution": False, "mars": False}
+        restore_caution = False
 
-    obj = Objective(
-        failure_threshold,
-        model,
-        opt,
-        steps,
-        group,
-        data,
-        loss_fn,
-        _win_condition,
-        weight_decay,
-        max(trials * warmup_trial_pct, 1 + random_trials),
-        eval_callback,
-        **kwargs,
-    )
+        if isinstance(opt_entry, str):
+            opt_label = opt_entry
+            opt_name = opt_entry
+            if opt_name.startswith("cautious-"):
+                opt_name = opt_name[len("cautious-") :]
+                kwargs["caution"] = True
+            if opt_name.startswith("unscaled_cautious-"):
+                opt_name = opt_name[len("unscaled_cautious-") :]
+                heavyball.utils.disable_caution_scaling()
+                kwargs["caution"] = True
+                restore_caution = True
+            if opt_name.startswith("mars-"):
+                opt_name = opt_name[len("mars-") :]
+                kwargs["mars"] = True
+            if opt_name.startswith("unscaled-"):
+                opt_name = opt_name[len("unscaled-") :]
+                kwargs["unscaled"] = True
+            if opt_name.startswith("adaptive-"):
+                opt_name = opt_name[len("adaptive-") :]
+                kwargs["adaptive"] = True
+            if opt_name.startswith("ortho-"):
+                opt_name = opt_name[len("ortho-") :]
+                kwargs["ortho_method"] = "newtonschulz-graft"
+            opt_callable = getattr(heavyball, opt_name)
+        else:
+            opt_callable = opt_entry
+            opt_label = getattr(opt_callable, "__name__", repr(opt_callable))
 
-    torch.cuda.synchronize()
-    stdout, sys.stdout = sys.stdout, sys.stderr
+        did_win = False
 
-    set_seed()
-    start_time = time.time()
-    try:
-        sampler = AutoSampler(
-            seed=0x123125,
-            search_space={
-                "lr": optuna.distributions.FloatDistribution(1e-7, 100, log=True),
-                "1mbeta1": optuna.distributions.FloatDistribution(1e-5, 1, log=True),
-                "1mbeta2": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
-                "1mshampoo_beta": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
-            },
+        def _win_condition(*args):
+            nonlocal did_win
+            win_state, out = win_condition(*args)
+            did_win |= win_state
+            return did_win, out
+
+        base_model = copy.deepcopy(base_model_template)
+        obj = Objective(
+            failure_threshold,
+            base_model,
+            opt_callable,
+            steps,
+            group,
+            data,
+            loss_fn,
+            _win_condition,
+            weight_decay,
+            max(trials * warmup_trial_pct, 1 + random_trials),
+            eval_callback,
+            **kwargs,
         )
-        study = optuna.create_study(direction="minimize", sampler=sampler)
-        winning_params = {}
-        prev_best = float("inf")
 
-        def _optuna_objective(trial):
-            set_seed(0x12312)
-            lr = trial.suggest_float("lr", 1e-7, 100, log=True)
-            one_minus_beta1 = trial.suggest_float("1mbeta1", 1e-5, 1, log=True)
-            one_minus_beta2 = trial.suggest_float("1mbeta2", 1e-7, 1, log=True)
-            one_minus_shampoo_beta = trial.suggest_float("1mshampoo_beta", 1e-7, 1, log=True)
-            out = obj.objective((lr, one_minus_beta1, one_minus_beta2, one_minus_shampoo_beta))
-            if out < prev_best:
-                winning_params.update({
-                    "lr": lr,
-                    "1mbeta1": one_minus_beta1,
-                    "1mbeta2": one_minus_beta2,
-                    "1mshampoo_beta": one_minus_shampoo_beta,
-                })
-            if obj.win_condition(out):
-                raise WinConditionMet
-            return out
+        torch.cuda.synchronize()
+        stdout, sys.stdout = sys.stdout, sys.stderr
 
         set_seed()
+        start_time = time.time()
+        winning_params = {
+            "lr": float("nan"),
+            "1mbeta1": float("nan"),
+            "1mbeta2": float("nan"),
+            "1mshampoo_beta": float("nan"),
+        }
+        prev_best = float("inf")
+        callback_results = None
         try:
-            study.optimize(_optuna_objective, n_trials=trials)
-        except WinConditionMet:
-            pass
-    finally:
-        sys.stdout = stdout
-    torch.cuda.synchronize()
+            sampler = AutoSampler(
+                seed=0x123125,
+                search_space={
+                    "lr": optuna.distributions.FloatDistribution(1e-7, 100, log=True),
+                    "1mbeta1": optuna.distributions.FloatDistribution(1e-5, 1, log=True),
+                    "1mbeta2": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
+                    "1mshampoo_beta": optuna.distributions.FloatDistribution(1e-7, 1, log=True),
+                },
+            )
+            study = optuna.create_study(direction="minimize", sampler=sampler)
 
-    end_time = time.time()
+            def _optuna_objective(trial):
+                set_seed(0x12312)
+                lr = trial.suggest_float("lr", 1e-7, 100, log=True)
+                one_minus_beta1 = trial.suggest_float("1mbeta1", 1e-5, 1, log=True)
+                one_minus_beta2 = trial.suggest_float("1mbeta2", 1e-7, 1, log=True)
+                one_minus_shampoo_beta = trial.suggest_float("1mshampoo_beta", 1e-7, 1, log=True)
+                out = obj.objective((lr, one_minus_beta1, one_minus_beta2, one_minus_shampoo_beta))
+                if out < prev_best:
+                    winning_params.update({
+                        "lr": lr,
+                        "1mbeta1": one_minus_beta1,
+                        "1mbeta2": one_minus_beta2,
+                        "1mshampoo_beta": one_minus_shampoo_beta,
+                    })
+                if obj.win_condition(out):
+                    raise WinConditionMet
+                return out
 
-    print(
-        f"Took: {end_time - start_time} | Attempt: {obj.attempt} | "  #
-        f"{opt.__name__}(lr={winning_params['lr']:.5f}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "  #
-        f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}) | Best Loss: {obj.best_loss} | Callback Results: {obj.callback_results}"
-    )
+            set_seed()
+            try:
+                study.optimize(_optuna_objective, n_trials=trials)
+            except WinConditionMet:
+                pass
+            callback_results = getattr(obj, "callback_results", None)
+        finally:
+            sys.stdout = stdout
+            if restore_caution and baseline_cautioning is not None:
+                heavyball.utils._compilable_cautioning = baseline_cautioning
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+
+        ema_logs = obj.compute_hparam_log_ema(beta=ema_beta)
+        ema_params = np.power(10.0, ema_logs) if ema_logs is not None else None
+
+        def _fmt(value, precision=5):
+            return f"{value:.{precision}f}" if np.isfinite(value) else "nan"
+
+        ema_msg = ""
+        if ema_params is not None:
+            ema_lr, ema_1mb1, ema_1mb2, ema_1msh = ema_params
+            ema_msg = (
+                f" | EMAβ={ema_beta:.2f}(lr={ema_lr:.5f}, betas=({1 - ema_1mb1:.3f}, {1 - ema_1mb2:.4f}), "
+                f"shampoo_beta={1 - ema_1msh:.3f})"
+            )
+
+        callback_msg = ""
+        if callback_results:
+            callback_msg = f" | Callback Results: {callback_results}"
+
+        print(
+            f"[{opt_label}] Took: {end_time - start_time} | Attempt: {obj.attempt} | "
+            f"{opt_label}(lr={_fmt(winning_params['lr'])}, betas=({1 - winning_params['1mbeta1']:.3f}, {1 - winning_params['1mbeta2']:.4f}), "
+            f"shampoo_beta={1 - winning_params['1mshampoo_beta']:.3f}){ema_msg} | Best Loss: {obj.best_loss}{callback_msg}"
+        )
+
+        if return_best:
+            if ema_params is None:
+                model_result = obj.get_best()
+            else:
+                model_override = plotter_template if plotter_template is not None else None
+                model_result = obj.evaluate_params(ema_params, model_override=model_override)
+            if isinstance(model_result, Plotter):
+                print(f"[{opt_label}] Replay trajectory length: {len(model_result.trajectory)}")
+            results.append({
+                "label": opt_label,
+                "model": model_result,
+                "best_loss": getattr(obj, "best_loss", None),
+                "callback_results": callback_results,
+            })
 
     if return_best:
-        return obj.get_best()
+        labelled_models = [(res["label"], res["model"]) for res in results if res["model"] is not None]
+        if not labelled_models:
+            return None
+        if len(labelled_models) == 1:
+            return labelled_models[0][1]
+        if all(isinstance(model, Plotter) for _, model in labelled_models):
+            return MultiPlotter(labelled_models)
+        return labelled_models[0][1]
 
 
 def evaluate_test_accuracy(test_loader):
