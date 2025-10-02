@@ -505,6 +505,20 @@ def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx
 
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
+def scale_by_unscaled_adam(group, update, grad, param, exp_avg, exp_avg_sq):
+    update = utils.unscaled_adam_(
+        exp_avg,
+        exp_avg_sq,
+        update,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"],
+    )
+    return update
+
+
+@zero_guard("exp_avg", "exp_avg_sq")
+@no_state
 def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 1:
         utils.scale_by_exp_avg_sq_(exp_avg_sq, update, 0, group["eps"])
