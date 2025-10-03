@@ -394,7 +394,8 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    stochastic_multiply_(X, G.norm(dim=(-2, -1)) + eps)  # ensure top singular value <= 1
+    # X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    stochastic_divide_with_eps_(X, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
     # Perform the NS iterations
     for a, b, c in [
         (4.0848, -6.8946, 2.9270),
@@ -418,7 +419,9 @@ def legacy_zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     a, b, c = (3.4445, -4.7750, 2.0315)
     G = G.clone()
     X = G if G.dtype == torch.float64 else stochastic_round_(G)
-    stochastic_multiply_(X, G.norm(dim=(-2, -1)) + eps)  # ensure top singular value <= 1
+
+    # X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    stochastic_divide_with_eps_(X, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -753,6 +756,18 @@ def _compilable_stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
 def stochastic_multiply_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor):
     x, y = broadcastable_list_guard(x, y)
     _compilable_stochastic_multiply_(x, y)
+
+@decorator_knowngood
+def _compilable_stochastic_divide_with_eps_(x: List[Tensor], y: List[Tensor], eps: Tensor):
+    for x_, y_ in zip(x, y):
+        x32 = promote(x_)
+        y32 = promote(y_)
+        copy_stochastic_(x_, x32 / (y32 + eps))
+
+def stochastic_divide_with_eps_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, eps: float):
+    x, y = broadcastable_list_guard(x, y)
+    eps = scalar_guard(eps, y[0])
+    _compilable_stochastic_divide_with_eps_(x, y, eps)
 
 
 @decorator
