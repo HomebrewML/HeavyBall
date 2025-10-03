@@ -385,6 +385,7 @@ class ForeachMuon(C.BaseOpt):
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
         nesterov: bool = True,
+        heavyball_momentum: bool = False,
         **kwargs,
     ):
         defaults = locals()
@@ -395,6 +396,16 @@ class ForeachMuon(C.BaseOpt):
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
 
+        if heavyball_momentum:
+            if nesterov:
+                ema = C.nesterov_momentum
+            else:
+                ema = C.heavyball_momentum
+        elif nesterov:
+            ema = C.nesterov_ema
+        else:
+            ema = C.exp_avg
+
         super().__init__(
             params,
             defaults,
@@ -402,7 +413,7 @@ class ForeachMuon(C.BaseOpt):
             gradient_clipping,
             update_clipping,
             palm,
-            fns=(C.nesterov_ema if nesterov else C.exp_avg, C.orthogonalize_update),
+            fns=(ema, C.orthogonalize_update),
         )
 
 
