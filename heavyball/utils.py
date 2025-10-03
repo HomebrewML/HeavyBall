@@ -757,12 +757,14 @@ def stochastic_multiply_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor):
     x, y = broadcastable_list_guard(x, y)
     _compilable_stochastic_multiply_(x, y)
 
+
 @decorator_knowngood
 def _compilable_stochastic_divide_with_eps_(x: List[Tensor], y: List[Tensor], eps: Tensor):
     for x_, y_ in zip(x, y):
         x32 = promote(x_)
         y32 = promote(y_)
         copy_stochastic_(x_, x32 / (y32 + eps))
+
 
 def stochastic_divide_with_eps_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, eps: float):
     x, y = broadcastable_list_guard(x, y)
