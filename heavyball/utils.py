@@ -1,5 +1,6 @@
 import collections
 import contextlib
+import enum
 import functools
 import gc
 import inspect
@@ -19,11 +20,26 @@ from torch.backends import cudnn, opt_einsum
 from torch.nn import functional as F
 from torch.utils._pytree import tree_map
 
+
+class ZerothPowerMode(enum.Enum):
+    newtonschulz = "newtonschulz"
+    legacy_newtonschulz = "legacy_newtonschulz"
+    qr = "qr"
+    svd = "svd"
+    legacy_svd = "legacy_svd"
+
+
+class OrthoScaleMode(enum.Enum):
+    none = "none"
+    scale = "scale"
+    graft = "graft"
+
+
 compile_mode = "max-autotune-no-cudagraphs"
 dynamic = False
 compile_mode_recommended_to_none = None
 zeroth_power_mode = "newtonschulz"
-precise_zeroth_power_mode = "qr"  # or svd
+precise_zeroth_power_mode = "qr"
 tiny_bf16 = torch.finfo(torch.bfloat16).tiny
 _cudnn_double_backward_pattern = re.compile(
     r"the derivative for .* is not implemented\. Double backwards .* To run double backwards"
@@ -373,6 +389,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
         G.ndim >= 2
     )  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     assert steps == 5
+    G = G.clone()
     X = G if G.dtype == torch.float64 else stochastic_round_(G)
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -387,13 +404,29 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
         (2.8366, -3.0525, 1.2012),
     ]:
         A = X @ X.mT
-        B = (
-            b * A + c * A @ A
-        )  # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
     if G.size(-2) > G.size(-1):
         X = X.mT
+    return X.to(G.dtype)
+
+
+@decorator_knowngood
+def legacy_zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    G = G.clone()
+    X = G if G.dtype == torch.float64 else stochastic_round_(G)
+    stochastic_multiply_(X, G.norm(dim=(-2, -1)) + eps)  # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
     return X.to(G.dtype)
 
 
@@ -449,21 +482,30 @@ def _compilable_grafting(magnitude, direction):
 
 
 @decorator_knowngood
-def _compilable_orthogonal_(x: Tensor, mode: str, out: Tensor | None, scale_mode: str):
-    if mode == "newtonschulz" or x.shape[0] != x.shape[1]:
+def _compilable_orthogonal_(x: Tensor, mode: str | ZerothPowerMode, out: Tensor | None, scale_mode: str):
+    if not isinstance(mode, ZerothPowerMode):
+        mode = ZerothPowerMode(mode)
+    if not isinstance(scale_mode, ZerothPowerMode):
+        scale_mode = OrthoScaleMode(scale_mode)
+    if mode == ZerothPowerMode.newtonschulz or x.shape[0] != x.shape[1]:
         y = zeropower_via_newtonschulz5(x, 5)
-    elif mode == "qr":
+    elif mode == ZerothPowerMode.legacy_newtonschulz:
+        y = legacy_zeropower_via_newtonschulz5(x, 5)
+    elif mode == ZerothPowerMode.qr:
         y = torch.linalg.qr(promote(x)).Q
-    elif mode == "svd":
-        u, _s, v = torch.linalg.svd(promote(x))
-        y = u @ v.T
+    elif mode == ZerothPowerMode.svd:
+        u, _s, vt = torch.linalg.svd(promote(x))
+        y = u @ vt
+    elif mode == ZerothPowerMode.legacy_svd:
+        u, _s, vt = torch.linalg.svd(promote(x))
+        y = u @ vt.T
     else:
         raise NotImplementedError(f"Unknown zeroth_power_mode: {mode}")
-    if scale_mode == "none":
+    if scale_mode == OrthoScaleMode.none:
         pass
-    elif scale_mode == "scale":
-        y *= max(1, x.size(0) / x.size(1)) ** 0.5
-    elif scale_mode == "graft":
+    elif scale_mode == OrthoScaleMode.scale:
+        y *= max(1, x.size(-2) / x.size(-1)) ** 0.5
+    elif scale_mode == OrthoScaleMode.graft:
         y = _compilable_grafting(x, y)
     else:
         raise NotImplementedError(f"Unknown scale_mode: {scale_mode}")
