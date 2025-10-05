@@ -29,8 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install 'numpy<2'
-          python -m pip install -e .[dev]
+          python -m pip install -e .[dev] --check-build-dependencies --use-pep517 'numpy<2' 'scikit_learn>1.6.0'  --upgrade
           python -m pip install pytest
       - name: Run toy model tests
         run: pytest test/test_toy_training.py -q
