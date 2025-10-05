@@ -27,6 +27,7 @@ class ZerothPowerMode(enum.Enum):
     qr = "qr"
     svd = "svd"
     legacy_svd = "legacy_svd"
+    thinky_polar_express = "thinky_polar_express"
 
 
 class OrthoScaleMode(enum.Enum):
@@ -390,12 +391,12 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     )  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     assert steps == 5
     G = G.clone()
-    X = G if G.dtype == torch.float64 else stochastic_round_(G)
+    x = G if G.dtype == torch.float64 else stochastic_round_(G)
     if G.size(-2) > G.size(-1):
-        X = X.mT
+        x = x.mT
 
     # X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    stochastic_divide_with_eps_(X, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
+    stochastic_divide_with_eps_(x, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
     # Perform the NS iterations
     for a, b, c in [
         (4.0848, -6.8946, 2.9270),
@@ -404,13 +405,70 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
         (2.8769, -3.1427, 1.2046),
         (2.8366, -3.0525, 1.2012),
     ]:
-        A = X @ X.mT
-        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        s = x @ x.mT
+        y = c * s
+        y.diagonal(dim1=-2, dim2=-1).add_(b)
+        y = y @ s
+        y.diagonal(dim1=-2, dim2=-1).add_(a)
+        x = y @ x
 
     if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X.to(G.dtype)
+        x = x.mT
+    return x.to(G.dtype)
+
+
+###### START
+# Taken from https://github.com/thinking-machines-lab/manifolds/blob/89dcae50f01af59f1e0570289474da3a2ecaa60b/src/msign.py#L47
+# under the MIT License
+
+ABC_LIST: list[tuple[float, float, float]] = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+]
+
+# safety factor for numerical stability (but exclude last polynomial)
+ABC_LIST_STABLE: list[tuple[float, float, float]] = [
+    (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in ABC_LIST[:-1]
+] + [ABC_LIST[-1]]
+
+
+def msign(G: torch.Tensor, steps: int = 10) -> torch.Tensor:
+    """
+    Polar Express algorithm for the matrix sign function:
+    https://arxiv.org/abs/2505.16932
+    """
+    assert G.ndim >= 2
+    should_transpose: bool = G.size(-2) > G.size(-1)
+
+    x = G if G.dtype == torch.float64 else stochastic_round_(G)
+    if should_transpose:
+        x = x.mT
+
+    x /= x.norm(dim=(-2, -1), keepdim=True) * 1.01
+    for step in range(steps):
+        a, b, c = ABC_LIST_STABLE[step] if step < len(ABC_LIST_STABLE) else ABC_LIST_STABLE[-1]
+        s = x @ x.mT
+        # goal is to compute x = a x + b S x + c S^2 x
+        # we can break this up into: x = (a I + (b I + c S) S) x
+        y = c * s
+        y.diagonal(dim1=-2, dim2=-1).add_(b)
+        y = y @ s
+        y.diagonal(dim1=-2, dim2=-1).add_(a)
+        x = y @ x
+
+    if should_transpose:
+        x = x.mT
+    x = torch.nan_to_num(x)
+    return x.float()
+
+
+###### END
 
 
 @decorator_knowngood
@@ -418,19 +476,22 @@ def legacy_zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
     G = G.clone()
-    X = G if G.dtype == torch.float64 else stochastic_round_(G)
+    x = G if G.dtype == torch.float64 else stochastic_round_(G)
 
     # X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    stochastic_divide_with_eps_(X, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
+    stochastic_divide_with_eps_(x, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
-        X = X.T
+        x = x.T
     for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        s = x @ x.mT
+        y = c * s
+        y.diagonal(dim1=-2, dim2=-1).add_(b)
+        y = y @ s
+        y.diagonal(dim1=-2, dim2=-1).add_(a)
+        x = y @ x
     if G.size(0) > G.size(1):
-        X = X.T
-    return X.to(G.dtype)
+        x = x.T
+    return x.to(G.dtype)
 
 
 @decorator_knowngood
@@ -492,6 +553,8 @@ def _compilable_orthogonal_(x: Tensor, mode: str | ZerothPowerMode, out: Tensor 
         scale_mode = OrthoScaleMode(scale_mode)
     if mode == ZerothPowerMode.newtonschulz or x.shape[0] != x.shape[1]:
         y = zeropower_via_newtonschulz5(x, 5)
+    elif mode == ZerothPowerMode.thinky_polar_express:
+        y = msign(x, 10)
     elif mode == ZerothPowerMode.legacy_newtonschulz:
         y = legacy_zeropower_via_newtonschulz5(x, 5)
     elif mode == ZerothPowerMode.qr:
