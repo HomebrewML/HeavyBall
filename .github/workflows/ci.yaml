@@ -29,7 +29,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -e .[dev] --check-build-dependencies --use-pep517 'numpy<2' 'scikit_learn>1.6.0'  --upgrade
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.7"
+          python -m pip install --only-binary=:all: "GPy>=1.13.1" "paramz>=0.9.6" "hebo>=0.3.6" "numpy<2" "scikit_learn>1.6.0" --upgrade
+          python -m pip install -e .[dev] --check-build-dependencies --use-pep517
           python -m pip install pytest
       - name: Run toy model tests
         run: pytest test/test_toy_training.py -q
