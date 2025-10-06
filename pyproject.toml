@@ -15,7 +15,7 @@ classifiers = ["Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
 ]
 dependencies = ["opt-einsum>=3.4.0",
-    "torch>=2.7.0",
+    "torch>=2.2,<3.0",
     "numpy<2.0.0",
 ]
 keywords = ["torch",
