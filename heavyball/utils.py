@@ -424,6 +424,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
 # 
 # under the MIT License
 
+# Coefficients are from https://arxiv.org/pdf/2505.16932v3
 ABC_LIST: list[tuple[float, float, float]] = [
     (8.28721201814563, -23.595886519098837, 17.300387312530933),
     (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
@@ -453,7 +454,9 @@ def msign(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
     if should_transpose:
         x = x.mT
 
-    x = x / (x.norm(dim=(-2, -1), keepdim=True) * 1.01 + eps)
+    # x = x / (x.norm(dim=(-2, -1), keepdim=True) * 1.01 + eps)
+    stochastic_divide_with_eps_(x, x.norm(dim=(-2, -1)) * 1.01, eps)
+
     for step in range(steps):
         a, b, c = ABC_LIST_STABLE[step] if step < len(ABC_LIST_STABLE) else ABC_LIST_STABLE[-1]
         s = x @ x.mT
