@@ -18,8 +18,23 @@ jobs:
         uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files --config pre-commit.yaml
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff
+      - name: Ruff lint
+        run: ruff check heavyball scripts test
+      - name: Ruff format check
+        run: ruff format --check heavyball scripts test
   tests:
-    needs: pre-commit
+    needs: [pre-commit, style]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,5 +47,5 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
           python -m pip install -e .[dev] --check-build-dependencies --use-pep517 --upgrade --upgrade-strategy eager --use-deprecated=legacy-resolver
           python -m pip install pytest
-      - name: Run toy model tests
-        run: pytest test/test_toy_training.py -q
+      - name: Run curated test targets
+        run: scripts/run_ci_tests.sh
