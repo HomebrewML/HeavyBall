@@ -47,7 +47,7 @@ _cudnn_double_backward_pattern = re.compile(
 )
 _torch_compile_double_backward_pattern = re.compile(r"compile.*does not currently support double backward")
 _fd_error = (
-    "You can accelerate startup by globally enabling finite_differences first "  #
+    "You can accelerate startup by globally enabling finite_differences first "
     "(via opt.finite_differences=True or by subclassing it)\n"
     "Original Error: "
 )
@@ -421,7 +421,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
 # Based on https://arxiv.org/pdf/2505.16932v3
 # and https://github.com/NoahAmsel/PolarExpress/blob/5454910920ca8c65afda28820cdf9e49b9436ed0/polar_express.py#L69-L82
 # and https://github.com/thinking-machines-lab/manifolds/blob/89dcae50f01af59f1e0570289474da3a2ecaa60b/src/msign.py#L47
-# 
+#
 # under the MIT License
 
 # Coefficients are from https://arxiv.org/pdf/2505.16932v3
