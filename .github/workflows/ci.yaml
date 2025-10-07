@@ -47,4 +47,8 @@ jobs:
           python -m pip install -e .[dev] --check-build-dependencies --use-pep517 --upgrade --upgrade-strategy eager --use-deprecated=legacy-resolver
           python -m pip install pytest
       - name: Run curated test targets
+        if: github.event_name != 'push'
         run: scripts/run_ci_tests.sh
+      - name: Run expanded test targets
+        if: github.event_name == 'push'
+        run: scripts/run_ci_tests.sh push

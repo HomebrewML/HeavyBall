@@ -14,12 +14,48 @@ run_pytest() {
   echo "::endgroup::"
 }
 
-run_pytest test/test_toy_training.py
-run_pytest test/test_migrate_cli.py
-run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype1
-run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype1
-run_pytest test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype1
-run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype1-4-16]"
-run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype2-10-512]"
-run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype1-3-5-16]"
-run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-9-4-64]"
+run_curated_suite() {
+  run_pytest test/test_toy_training.py
+  run_pytest test/test_migrate_cli.py
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype1
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype1
+  run_pytest test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype1
+  run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype1-4-16]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype2-10-512]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype1-3-5-16]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-9-4-64]"
+}
+
+run_push_expanded_suite() {
+  # Cover float16 (dtype0) variants and higher precision checks on push builds.
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype0
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype0
+  run_pytest test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype0
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype2
+  run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype2
+  run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype0-4-16]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype0-10-512]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype0-3-5-16]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype0-9-4-64]"
+  run_pytest test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype2
+  run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype2-4-16]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-9-4-128]"
+  run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-15-15-512]"
+}
+
+MODE="${1:-curated}"
+
+case "${MODE}" in
+  curated|baseline)
+    run_curated_suite
+    ;;
+  push|extended|full)
+    run_curated_suite
+    run_push_expanded_suite
+    ;;
+  *)
+    echo "Unknown test selection: ${MODE}" >&2
+    echo "Usage: $0 [curated|push]" >&2
+    exit 2
+    ;;
+esac
