@@ -17,3 +17,9 @@ run_pytest() {
 run_pytest test/test_toy_training.py
 run_pytest test/test_migrate_cli.py
 run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype1
+run_pytest test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype1
+run_pytest test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype1
+run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype1-4-16]"
+run_pytest "test/test_psgd_precond_init_stability.py::test_mean_root[dtype2-10-512]"
+run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype1-3-5-16]"
+run_pytest "test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-9-4-64]"
