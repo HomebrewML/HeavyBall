@@ -6,8 +6,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
+import heavyball
 import heavyball.chainable as C
-import heavyball.utils
 
 heavyball.utils.set_torch()
 
