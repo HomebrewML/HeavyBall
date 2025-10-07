@@ -5,6 +5,10 @@ on:
   workflow_dispatch:
   push:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -46,9 +50,5 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
           python -m pip install -e .[dev] --check-build-dependencies --use-pep517 --upgrade --upgrade-strategy eager --use-deprecated=legacy-resolver
           python -m pip install pytest
-      - name: Run curated test targets
-        if: github.event_name != 'push'
-        run: scripts/run_ci_tests.sh
-      - name: Run expanded test targets
-        if: github.event_name == 'push'
-        run: scripts/run_ci_tests.sh push
+      - name: Run targeted tests
+        run: scripts/run_ci_tests.sh ${{ github.event_name == 'push' && 'push' || '' }}
