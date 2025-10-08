@@ -1591,7 +1591,8 @@ def _compilable_copy_stochastic_(target: Tensor, source: Tensor):
 def copy_stochastic_(target: Tensor, source: Tensor):
     if target.dtype == torch.bfloat16 and source.dtype in (torch.float16, torch.float32, torch.float64):
         _compilable_copy_stochastic_(target, source.float())
-    set_(target, source)
+    else:
+        set_(target, source)
 
 
 @decorator_knowngood
