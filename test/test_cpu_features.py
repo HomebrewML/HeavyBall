@@ -34,7 +34,7 @@ def _parameter_drift(model: nn.Module, original: list[torch.Tensor]) -> float:
 def _make_batch(
     in_features: int = 8, out_features: int = 4, batch: int = 16
 ) -> tuple[nn.Module, torch.Tensor, torch.Tensor]:
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     model = nn.Sequential(nn.Linear(in_features, out_features), nn.ReLU(), nn.Linear(out_features, out_features))
     data = torch.randn(batch, in_features)
     target = torch.randn(batch, out_features)

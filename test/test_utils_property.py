@@ -149,7 +149,7 @@ def test_global_clipping_bounds_group_norms(tensors: List[torch.Tensor], clip_at
     ),
 )
 def test_stochastic_add_matches_expected(data, alpha):
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     dtype, tensors, partner = data
     x = [tensor.clone() for tensor in tensors]
     y = [tensor.clone() for tensor in partner]
@@ -172,7 +172,7 @@ def test_stochastic_add_matches_expected(data, alpha):
     ),
 )
 def test_stochastic_add_divide_matches_expected(data, alpha, divisor):
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     dtype, tensors, partner = data
     x = [tensor.clone() for tensor in tensors]
     y = [tensor.clone() for tensor in partner]
@@ -191,7 +191,7 @@ def test_stochastic_add_divide_matches_expected(data, alpha, divisor):
 @settings(deadline=None, max_examples=75)
 @given(data=_stochastic_inputs())
 def test_stochastic_multiply_matches_expected(data):
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     dtype, tensors, partner = data
     x = [tensor.clone() for tensor in tensors]
     y = [tensor.clone() for tensor in partner]
@@ -212,7 +212,7 @@ def test_stochastic_multiply_matches_expected(data):
     ),
 )
 def test_stochastic_divide_with_eps_matches_expected(data, eps):
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     dtype, tensors, partner = data
     # Avoid very small denominators to keep the numeric range reasonable.
     partner = [tensor.clamp(min=0.5) for tensor in partner]

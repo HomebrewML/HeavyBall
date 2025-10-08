@@ -2,10 +2,13 @@ import os
 import random
 import warnings
 from copy import deepcopy
+from typing import Callable, List
 
+import numpy as np
 import pytest
 import torch
-from torch import nn
+from torch import Tensor, nn
+from torch.utils import _pytree as tree_util
 
 import heavyball
 from heavyball.utils import (
@@ -48,7 +51,7 @@ def _clone_parameters(model: nn.Module):
     return [param.detach().clone() for param in model.parameters()]
 
 
-def _parameter_drift(model: nn.Module, reference: list[torch.Tensor]) -> float:
+def _parameter_drift(model: nn.Module, reference: list[Tensor]) -> float:
     diffs = [current.detach() - ref for current, ref in zip(model.parameters(), reference, strict=True)]
     flat = torch.cat([diff.reshape(-1) for diff in diffs])
     return float(flat.norm())
@@ -120,11 +123,23 @@ def test_sam_step_accumulates_and_zeros_gradients():
         assert torch.allclose(param.grad, torch.zeros_like(param.grad), atol=0, rtol=0)
 
 
+def scalar_like(x):
+    return torch.zeros((), dtype=x.dtype, device=x.device)
+
+
+def _local_l2_norm(x):
+    return x.double().square().sum().sqrt().item()
+
+
+def _local_rms_norm(x):
+    return x.double().square().mean().sqrt().item()
+
+
 @pytest.mark.parametrize(
     "clip_fn,metric",
     [
-        (_compilable_l2_clip_, lambda t: torch.linalg.vector_norm(t).item()),
-        (_compilable_rmsnorm_clip_, lambda t: torch.sqrt(t.square().mean()).item()),
+        (_compilable_l2_clip_, _local_l2_norm),
+        (_compilable_rmsnorm_clip_, _local_rms_norm),
     ],
 )
 def test_local_clip_functions_limit_each_tensor_norm(clip_fn, metric):
@@ -134,16 +149,44 @@ def test_local_clip_functions_limit_each_tensor_norm(clip_fn, metric):
         assert metric(tensor) <= 1.5 * (1 + 1e-3)
 
 
+def _upcast_value(x: Tensor):
+    if x.dtype.is_complex:
+        return x.to(torch.cdouble)
+    if x.dtype.is_floating_point:
+        return x.to(torch.double)
+    return x.to(torch.int64)
+
+
+def _upcast(fn: Callable[[...], Tensor]) -> Callable[[...], float]:
+    def _fn(*args, **kwargs):
+        args, kwargs = tree_util.tree_map(_upcast_value, (args, kwargs))
+        return fn(*args, **kwargs).item()
+
+    return _fn
+
+
+@_upcast
+def _global_l2_norm(xs: List[Tensor]) -> Tensor:
+    return sum((x.square().sum() for x in xs), start=scalar_like(xs[0])).sqrt()
+
+
+@_upcast
+def _global_rms_norm(xs: List[Tensor]) -> Tensor:
+    norm = sum((x.square().sum() for x in xs), start=scalar_like(xs[0]))
+    numel = sum(x.numel() for x in xs)
+    return (norm / numel) ** 0.5
+
+
 @pytest.mark.parametrize(
     "clip_fn,metric",
     [
         (
             _compilable_global_l2norm_clip_,
-            lambda xs: torch.sqrt(sum(x.square().sum() for x in xs)).item(),
+            _global_l2_norm,
         ),
         (
             _compilable_global_rmsnorm_clip_,
-            lambda xs: torch.sqrt(sum(x.square().sum() for x in xs) / sum(x.numel() for x in xs)).item(),
+            _global_rms_norm,
         ),
     ],
 )
@@ -196,7 +239,7 @@ def test_psgd_should_update_stochastic_schedule_uses_rng():
 
 
 def test_stochastic_math_helpers_match_expected_results():
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     a = torch.zeros(4)
     b = torch.ones(4)
 
@@ -215,17 +258,41 @@ def test_stochastic_math_helpers_match_expected_results():
     assert torch.allclose(a, torch.full_like(a, expected), atol=1e-6)
 
 
+def test_stochastic_math_accuracy(steps: int = 100, items: int = 1024):
+    torch.manual_seed(0x172893)
+    rng = np.random.default_rng(0x213112)
+
+    accum_baseline = torch.zeros(items, dtype=torch.bfloat16)
+    accum_stochastic = torch.zeros(items, dtype=torch.bfloat16)
+    accum_groundtruth = torch.zeros(items, dtype=torch.float64)
+
+    numbers = 1 + 2 * torch.arange(int(items**0.5), dtype=torch.float32)
+    add = (numbers.view(1, -1) / numbers.view(-1, 1)).flatten()
+
+    steps //= 2
+    alphas = rng.standard_normal((steps,))
+    for _ in range(2):
+        for alpha in alphas:
+            accum_baseline.add_(add, alpha=alpha)
+            accum_groundtruth.add_(add, alpha=alpha)
+            stochastic_add_(accum_stochastic, add, alpha=alpha)
+        assert (accum_baseline.double() - accum_groundtruth).norm().item() > (
+            accum_stochastic.double() - accum_groundtruth
+        ).norm().item()
+        alphas = -alphas
+
+
 def test_disable_caution_scaling_toggles_behavior():
-    grad = torch.tensor([1.0, -1.0])
-    update = torch.tensor([1.0, 1.0])
+    grad = Tensor([1.0, -1.0])
+    update = Tensor([1.0, 1.0])
     original = heavyball.utils._compilable_cautioning
     try:
         scaled = caution(grad, update.clone())
-        assert torch.allclose(scaled, torch.tensor([2.0, 0.0]))
+        assert torch.allclose(scaled, Tensor([2.0, 0.0]))
 
         disable_caution_scaling()
         unscaled = caution(grad, update.clone())
-        assert torch.allclose(unscaled, torch.tensor([1.0, 0.0]))
+        assert torch.allclose(unscaled, Tensor([1.0, 0.0]))
     finally:
         heavyball.utils._compilable_cautioning = original
 
@@ -250,14 +317,14 @@ def test_merge_group_merges_only_when_enabled():
 
 
 def test_orthogonalize_grad_to_param_outputs_orthogonal_grad():
-    weight = torch.tensor([3.0, 4.0])
-    grad = torch.tensor([1.0, 2.0])
+    weight = Tensor([3.0, 4.0])
+    grad = Tensor([1.0, 2.0])
     orthogonalize_grad_to_param([weight], [grad], eps=1e-6, graft=False)
-    assert torch.allclose((weight * grad).sum(), torch.tensor(0.0), atol=1e-6)
+    assert torch.allclose((weight * grad).sum(), Tensor(0.0), atol=1e-6)
 
 
 def test_mars_correction_updates_old_gradient_copy():
-    g = [torch.tensor([1.0, 2.0])]
+    g = [Tensor([1.0, 2.0])]
     old = [torch.zeros(2)]
     mars_correction(g, old, beta1=0.9, gamma=0.2)
-    assert torch.allclose(old[0], torch.tensor([1.0, 2.0]))
+    assert torch.allclose(old[0], Tensor([1.0, 2.0]))

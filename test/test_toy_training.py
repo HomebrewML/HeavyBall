@@ -46,7 +46,7 @@ def toy_training_results(request):
     optimizer_name: str = request.param
     optimizer_cls = getattr(heavyball, optimizer_name)
 
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     model = torch.nn.Linear(2, 1)
     param_list = list(model.parameters())
     data = torch.tensor([[0.5, -1.0], [1.5, 0.3], [-0.7, 0.9], [0.2, -0.4]], dtype=torch.float32)
