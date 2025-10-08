@@ -258,7 +258,7 @@ def test_stochastic_math_helpers_match_expected_results():
     assert torch.allclose(a, torch.full_like(a, expected), atol=1e-6)
 
 
-def test_stochastic_math_accuracy(steps: int = 100, items: int = 1024):
+def test_stochastic_math_accuracy(steps: int = 1000, items: int = 1024):
     torch.manual_seed(0x172893)
     rng = np.random.default_rng(0x213112)
 
