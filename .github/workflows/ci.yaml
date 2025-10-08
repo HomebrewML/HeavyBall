@@ -33,9 +33,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ruff
       - name: Ruff lint
-        run: ruff check heavyball scripts test
+        run: ruff check .
       - name: Ruff format check
-        run: ruff format --check heavyball scripts test
+        run: ruff format --check .
   tests:
     needs: [pre-commit, style]
     runs-on: ubuntu-latest

@@ -28,7 +28,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "pytest", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "hebo", "lightbench"]
+dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "hebo", "lightbench"]
 
 [project.urls]
 source = "https://github.com/HomebrewML/HeavyBall"

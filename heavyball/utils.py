@@ -2417,10 +2417,11 @@ def bf16_matmul(x: Tensor, y: Tensor):
 def if_iscompiling(fn):
     base = getattr(torch, fn.__name__, None)
 
-    def _fn(x):
-        if torch.compiler.is_compiling() and hasattr(torch, fn.__name__):
-            return base(x)
-        return fn(x)
+    @functools.wraps(fn)
+    def _fn(*args, **kwargs):
+        if torch.compiler.is_compiling() and base is not None:
+            return base(*args, **kwargs)
+        return fn(*args, **kwargs)
 
     return _fn
 
