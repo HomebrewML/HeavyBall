@@ -270,9 +270,7 @@ def test_stochastic_math_accuracy(steps: int = 100, items: int = 32, target_shif
     accum_stochastic = torch.zeros(items, dtype=torch.bfloat16) + target_shift
     accum_groundtruth = torch.zeros(items, dtype=torch.float64) + target_shift
 
-    numbers = 1 + 2 * torch.arange(items, dtype=torch.float32)
-    add = 1 / numbers
-
+    add = 1 / (1 + 2 * torch.arange(items, dtype=torch.float32))
     alphas = np.exp(-2 - 2 * rng.random((steps // 2,)))
     for _ in range(2):
         for alpha in alphas:
@@ -286,16 +284,16 @@ def test_stochastic_math_accuracy(steps: int = 100, items: int = 32, target_shif
 
 
 def test_disable_caution_scaling_toggles_behavior():
-    grad = Tensor([1.0, -1.0])
-    update = Tensor([1.0, 1.0])
+    grad = torch.tensor([1.0, -1.0])
+    update = torch.tensor([1.0, 1.0])
     original = heavyball.utils._compilable_cautioning
     try:
         scaled = caution(grad, update.clone())
-        assert torch.allclose(scaled, Tensor([2.0, 0.0]))
+        assert torch.allclose(scaled, torch.tensor([2.0, 0.0]))
 
         disable_caution_scaling()
         unscaled = caution(grad, update.clone())
-        assert torch.allclose(unscaled, Tensor([1.0, 0.0]))
+        assert torch.allclose(unscaled, torch.tensor([1.0, 0.0]))
     finally:
         heavyball.utils._compilable_cautioning = original
 
@@ -320,14 +318,14 @@ def test_merge_group_merges_only_when_enabled():
 
 
 def test_orthogonalize_grad_to_param_outputs_orthogonal_grad():
-    weight = Tensor([3.0, 4.0])
-    grad = Tensor([1.0, 2.0])
+    weight = torch.torch.tensor([3.0, 4.0])
+    grad = torch.torch.tensor([1.0, 2.0])
     orthogonalize_grad_to_param([weight], [grad], eps=1e-6, graft=False)
-    assert torch.allclose((weight * grad).sum(), Tensor(0.0), atol=1e-6)
+    assert torch.allclose((weight * grad).sum(), torch.tensor(0.0), atol=1e-6)
 
 
 def test_mars_correction_updates_old_gradient_copy():
-    g = [Tensor([1.0, 2.0])]
+    g = [torch.torch.tensor([1.0, 2.0])]
     old = [torch.zeros(2)]
     mars_correction(g, old, beta1=0.9, gamma=0.2)
-    assert torch.allclose(old[0], Tensor([1.0, 2.0]))
+    assert torch.allclose(old[0], torch.torch.tensor([1.0, 2.0]))
