@@ -3,7 +3,8 @@ from __future__ import annotations
 import functools
 import math
 import threading
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy
 import numpy as np
@@ -11,7 +12,6 @@ import optuna
 import optunahub
 import pandas as pd
 import torch
-from botorch.utils.sampling import manual_seed
 from hebo.design_space.design_space import DesignSpace
 from hebo.optimizers.hebo import HEBO
 from optuna._transform import _SearchSpaceTransform
@@ -21,13 +21,6 @@ from optuna.samplers._lazy_random_state import LazyRandomState
 from optuna.study import Study
 from optuna.study._study_direction import StudyDirection
 from optuna.trial import FrozenTrial, TrialState
-from optuna_integration.botorch import (
-    ehvi_candidates_func,
-    logei_candidates_func,
-    qehvi_candidates_func,
-    qei_candidates_func,
-    qparego_candidates_func,
-)
 from torch import Tensor
 from torch.nn import functional as F
 
@@ -35,6 +28,33 @@ from heavyball.utils import scalar_guard
 
 _MAXINT32 = (1 << 31) - 1
 _SAMPLER_KEY = "auto:sampler"
+
+
+@contextmanager
+def manual_seed(seed: int | None = None) -> Generator[None, None, None]:
+    r"""
+    Contextmanager for manual setting the torch.random seed.
+
+    Args:
+        seed: The seed to set the random number generator to.
+
+    Returns:
+        Generator
+
+    Example:
+        >>> with manual_seed(1234):
+        >>>     X = torch.rand(3)
+
+    copied as-is from https://github.com/meta-pytorch/botorch/blob/a42cd65f9b704cdb6f2ee64db99a022eb15295d5/botorch/utils/sampling.py#L53C1-L75C50 under the MIT License
+    """
+    old_state = torch.random.get_rng_state()
+    try:
+        if seed is not None:
+            torch.random.manual_seed(seed)
+        yield
+    finally:
+        if seed is not None:
+            torch.random.set_rng_state(old_state)
 
 
 class SimpleAPIBaseSampler(BaseSampler):
@@ -65,6 +85,16 @@ def _get_default_candidates_func(
     """
     The original is available at https://github.com/optuna/optuna-integration/blob/156a8bc081322791015d2beefff9373ed7b24047/optuna_integration/botorch/botorch.py under the MIT License
     """
+
+    # lazy import
+    from optuna_integration.botorch import (
+        ehvi_candidates_func,
+        logei_candidates_func,
+        qehvi_candidates_func,
+        qei_candidates_func,
+        qparego_candidates_func,
+    )
+
     if n_objectives > 3 and not has_constraint and not consider_running_trials:
         return ehvi_candidates_func
     elif n_objectives > 3:

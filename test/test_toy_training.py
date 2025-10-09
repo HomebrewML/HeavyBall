@@ -46,7 +46,7 @@ def toy_training_results(request):
     optimizer_name: str = request.param
     optimizer_cls = getattr(heavyball, optimizer_name)
 
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     model = torch.nn.Linear(2, 1)
     param_list = list(model.parameters())
     data = torch.tensor([[0.5, -1.0], [1.5, 0.3], [-0.7, 0.9], [0.2, -0.4]], dtype=torch.float32)
@@ -61,19 +61,19 @@ def toy_training_results(request):
     sig = inspect.signature(optimizer_cls.__init__)
     kwargs = dict(EXTRA_KWARGS.get(optimizer_name, {}))
     if "foreach" in sig.parameters:
-        kwargs["foreach"] = False
+        kwargs["foreach"] = True
 
     if optimizer_name == "SAMWrapper":
         inner_kwargs = {}
         inner_sig = inspect.signature(heavyball.ForeachAdamW.__init__)
         if "foreach" in inner_sig.parameters:
-            inner_kwargs["foreach"] = False
+            inner_kwargs["foreach"] = True
         inner_optimizer = heavyball.ForeachAdamW(param_list, **inner_kwargs)
         optimizer = optimizer_cls(param_list, wrapped_optimizer=inner_optimizer, **kwargs)
     else:
         optimizer = optimizer_cls(param_list, **kwargs)
 
-    for _ in range(4):
+    for _ in range(8):
         gradient_bucket: list[torch.Tensor] = []
 
         def closure():

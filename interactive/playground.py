@@ -10,8 +10,8 @@ import torch.nn as nn
 from plotly.subplots import make_subplots
 from sklearn.decomposition import PCA
 
+import heavyball
 import heavyball.chainable as C
-import heavyball.utils
 
 # TensorFlow Playground inspired colors
 COLORS = {

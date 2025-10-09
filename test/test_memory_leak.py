@@ -6,7 +6,6 @@ from torch import nn
 from torch.nn import functional as F
 
 import heavyball
-import heavyball.utils
 from heavyball.utils import clean, set_torch
 
 

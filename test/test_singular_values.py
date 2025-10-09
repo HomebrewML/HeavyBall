@@ -63,7 +63,7 @@ def test_min_singular_value(shape, cond, dtype, power_iter):
 
 @pytest.mark.parametrize("shape", ((3, 4, 5), (16, 32, 64), (16, 16, 512)))
 def test_max_singular_value_ndim(shape, bound: float = 2):
-    torch.manual_seed(0)
+    torch.manual_seed(0x172893)
     A = torch.randn(shape).cuda()
     approx = _max_singular_value_ndim(A, power_iter=2)
     exact = torch.linalg.svdvals(A.double()).max()
