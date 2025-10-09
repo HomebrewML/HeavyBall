@@ -1590,7 +1590,7 @@ def _compilable_copy_stochastic_(target: Tensor, source: Tensor):
 
 def copy_stochastic_(target: Tensor, source: Tensor):
     if target.dtype == torch.bfloat16 and source.dtype in (torch.float16, torch.float32, torch.float64):
-        _compilable_copy_stochastic_(target, source.float())
+        source = stochastic_round_(target, source)
     set_(target, source)
 
 
@@ -2417,10 +2417,11 @@ def bf16_matmul(x: Tensor, y: Tensor):
 def if_iscompiling(fn):
     base = getattr(torch, fn.__name__, None)
 
-    def _fn(x):
-        if torch.compiler.is_compiling() and hasattr(torch, fn.__name__):
-            return base(x)
-        return fn(x)
+    @functools.wraps(fn)
+    def _fn(*args, **kwargs):
+        if torch.compiler.is_compiling() and base is not None:
+            return base(*args, **kwargs)
+        return fn(*args, **kwargs)
 
     return _fn
 

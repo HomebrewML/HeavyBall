@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heavyball"
 description = "Efficient Optimizers"
-version = "2.1.3"
+version = "2.1.2"
 authors = [{ name = "HeavyBall Authors", email = "github.heavyball@nestler.sh" }]
 classifiers = ["Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
@@ -28,7 +28,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "pytest", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "hebo", "lightbench"]
+dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "hebo", "lightbench"]
 
 [project.urls]
 source = "https://github.com/HomebrewML/HeavyBall"

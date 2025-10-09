@@ -11,7 +11,6 @@ from torch._dynamo import config
 from torch.utils._pytree import tree_map
 
 import heavyball
-import heavyball.utils
 from heavyball.utils import set_torch
 
 config.cache_size_limit = 128

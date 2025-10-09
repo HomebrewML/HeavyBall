@@ -5,7 +5,6 @@ from torch import nn
 from torch._dynamo import config
 
 import heavyball
-import heavyball.utils
 from heavyball.utils import set_torch
 
 config.cache_size_limit = 2**20

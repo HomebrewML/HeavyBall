@@ -9,7 +9,6 @@ from torch import nn
 from torch._dynamo import config
 
 import heavyball
-import heavyball.utils
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.zeroth_power_mode = "newtonschulz"

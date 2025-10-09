@@ -6,7 +6,6 @@ from lightbench.utils import get_optim
 from torch import nn
 
 import heavyball
-import heavyball.utils
 from heavyball.utils import clean, set_torch
 
 
