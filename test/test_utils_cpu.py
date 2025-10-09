@@ -2,13 +2,17 @@ import os
 import random
 import warnings
 from copy import deepcopy
-from typing import Callable, List
 
 import numpy as np
 import pytest
 import torch
 from torch import Tensor, nn
-from torch.utils import _pytree as tree_util
+from utils import (
+    _global_l2_norm,
+    _global_rms_norm,
+    _local_l2_norm,
+    _local_rms_norm,
+)
 
 import heavyball
 from heavyball.utils import (
@@ -54,7 +58,7 @@ def _clone_parameters(model: nn.Module):
 def _parameter_drift(model: nn.Module, reference: list[Tensor]) -> float:
     diffs = [current.detach() - ref for current, ref in zip(model.parameters(), reference, strict=True)]
     flat = torch.cat([diff.reshape(-1) for diff in diffs])
-    return float(flat.norm())
+    return flat.norm().item()
 
 
 def test_hook_optimizer_into_model_matches_sgd():
@@ -63,7 +67,7 @@ def test_hook_optimizer_into_model_matches_sgd():
     hooked = deepcopy(baseline)
     data, target = _make_batch(seed=1)
 
-    manual_opt = heavyball.SGD(baseline.parameters(), lr=0.05, foreach=False)
+    manual_opt = heavyball.SGD(baseline.parameters(), lr=0.05)
     for _ in range(3):
         manual_opt.zero_grad(set_to_none=True)
         loss = torch.nn.functional.mse_loss(baseline(data), target)
@@ -72,7 +76,7 @@ def test_hook_optimizer_into_model_matches_sgd():
 
     reference = _clone_parameters(baseline)
 
-    optimizers = hook_optimizer_into_model(hooked, heavyball.SGD, lr=0.05, foreach=False)
+    optimizers = hook_optimizer_into_model(hooked, heavyball.SGD, lr=0.05)
     assert len(optimizers) == sum(param.requires_grad for param in hooked.parameters())
 
     for _ in range(3):
@@ -88,7 +92,7 @@ def test_fused_hook_updates_parameters_without_manual_step():
     initial = _clone_parameters(model)
     data, target = _make_batch(seed=2, batch=6)
 
-    fused_optimizer = fused_hook(model.parameters(), heavyball.SGD, lr=0.05, foreach=False)
+    fused_optimizer = fused_hook(model.parameters(), heavyball.SGD, lr=0.05)
 
     # Users should not call step manually.
     with pytest.warns(UserWarning):
@@ -123,18 +127,6 @@ def test_sam_step_accumulates_and_zeros_gradients():
         assert torch.allclose(param.grad, torch.zeros_like(param.grad), atol=0, rtol=0)
 
 
-def scalar_like(x):
-    return torch.zeros((), dtype=x.dtype, device=x.device)
-
-
-def _local_l2_norm(x):
-    return x.double().square().sum().sqrt().item()
-
-
-def _local_rms_norm(x):
-    return x.double().square().mean().sqrt().item()
-
-
 @pytest.mark.parametrize(
     "clip_fn,metric",
     [
@@ -147,34 +139,6 @@ def test_local_clip_functions_limit_each_tensor_norm(clip_fn, metric):
     clip_fn(tensors, clip_at=1.5)
     for tensor in tensors:
         assert metric(tensor) <= 1.5 * (1 + 1e-3)
-
-
-def _upcast_value(x: Tensor):
-    if x.dtype.is_complex:
-        return x.to(torch.cdouble)
-    if x.dtype.is_floating_point:
-        return x.to(torch.double)
-    return x.to(torch.int64)
-
-
-def _upcast(fn: Callable[[...], Tensor]) -> Callable[[...], float]:
-    def _fn(*args, **kwargs):
-        args, kwargs = tree_util.tree_map(_upcast_value, (args, kwargs))
-        return fn(*args, **kwargs).item()
-
-    return _fn
-
-
-@_upcast
-def _global_l2_norm(xs: List[Tensor]) -> Tensor:
-    return sum((x.square().sum() for x in xs), start=scalar_like(xs[0])).sqrt()
-
-
-@_upcast
-def _global_rms_norm(xs: List[Tensor]) -> Tensor:
-    norm = sum((x.square().sum() for x in xs), start=scalar_like(xs[0]))
-    numel = sum(x.numel() for x in xs)
-    return (norm / numel) ** 0.5
 
 
 @pytest.mark.parametrize(

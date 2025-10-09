@@ -61,19 +61,19 @@ def toy_training_results(request):
     sig = inspect.signature(optimizer_cls.__init__)
     kwargs = dict(EXTRA_KWARGS.get(optimizer_name, {}))
     if "foreach" in sig.parameters:
-        kwargs["foreach"] = False
+        kwargs["foreach"] = True
 
     if optimizer_name == "SAMWrapper":
         inner_kwargs = {}
         inner_sig = inspect.signature(heavyball.ForeachAdamW.__init__)
         if "foreach" in inner_sig.parameters:
-            inner_kwargs["foreach"] = False
+            inner_kwargs["foreach"] = True
         inner_optimizer = heavyball.ForeachAdamW(param_list, **inner_kwargs)
         optimizer = optimizer_cls(param_list, wrapped_optimizer=inner_optimizer, **kwargs)
     else:
         optimizer = optimizer_cls(param_list, **kwargs)
 
-    for _ in range(4):
+    for _ in range(8):
         gradient_bucket: list[torch.Tensor] = []
 
         def closure():

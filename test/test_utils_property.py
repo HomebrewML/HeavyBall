@@ -4,9 +4,7 @@ from typing import Iterable, List, Sequence
 import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
-
-# Ensure torch.compile stays disabled on CPU-only CI runners.
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+from utils import _global_l2_norm, _global_rms_norm, _local_l2_norm, _local_rms_norm
 
 import heavyball
 from heavyball.utils import (
@@ -21,6 +19,10 @@ from heavyball.utils import (
     stochastic_divide_with_eps_,
     stochastic_multiply_,
 )
+
+# Ensure torch.compile stays disabled on CPU-only CI runners.
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 
 heavyball.utils.compile_mode = None
 
@@ -108,8 +110,8 @@ def _expand_like(reference: Iterable[torch.Tensor], candidate: List[torch.Tensor
 )
 def test_local_clipping_respects_thresholds(tensors: List[torch.Tensor], clip_at: float):
     for clip_fn, metric in (
-        (l2_clip_, lambda x: x.float().norm().item()),
-        (rmsnorm_clip_, lambda x: torch.sqrt(x.float().square().mean()).item()),
+        (l2_clip_, _local_l2_norm),
+        (rmsnorm_clip_, _local_rms_norm),
     ):
         clipped = [tensor.clone() for tensor in tensors]
         clip_fn(clipped, clip_at)
@@ -127,11 +129,11 @@ def test_global_clipping_bounds_group_norms(tensors: List[torch.Tensor], clip_at
     for clip_fn, metric in (
         (
             global_l2norm_clip,
-            lambda xs: torch.sqrt(sum(x.float().square().sum() for x in xs)).item(),
+            _global_l2_norm,
         ),
         (
             global_rmsnorm_clip,
-            lambda xs: torch.sqrt(sum(x.float().square().sum() for x in xs) / sum(x.numel() for x in xs)).item(),
+            _global_rms_norm,
         ),
     ):
         clipped = [tensor.clone() for tensor in tensors]

@@ -21,14 +21,14 @@ def _train_once(optimizer, model: nn.Module, data: torch.Tensor, target: torch.T
         loss = torch.nn.functional.mse_loss(prediction, target)
         loss.backward()
         optimizer.step()
-    return float(loss)
+    return loss.item()
 
 
 def _parameter_drift(model: nn.Module, original: list[torch.Tensor]) -> float:
     current = [param.detach() for param in model.parameters()]
     diffs = [curr - init for curr, init in zip(current, original, strict=True)]
     stacked = torch.cat([diff.reshape(-1) for diff in diffs])
-    return float(stacked.norm())
+    return stacked.norm().item()
 
 
 def _make_batch(
@@ -54,7 +54,7 @@ def test_selected_optimizers_run_on_cpu(opt_name: str) -> None:
     init = [param.detach().clone() for param in model.parameters()]
 
     opt_cls = getattr(heavyball, opt_name)
-    optimizer = opt_cls(model.parameters(), foreach=False, warmup_steps=0)
+    optimizer = opt_cls(model.parameters(), warmup_steps=0)
     final_loss = _train_once(optimizer, model, data, target, steps=3)
 
     assert torch.isfinite(torch.tensor(final_loss))
@@ -68,8 +68,16 @@ def test_caution_reduces_update_magnitude() -> None:
     baseline_init = [param.detach().clone() for param in baseline_model.parameters()]
     cautious_init = [param.detach().clone() for param in cautious_model.parameters()]
 
-    baseline_opt = heavyball.SGD(baseline_model.parameters(), lr=1e-3, caution=False, foreach=False)
-    cautious_opt = heavyball.SGD(cautious_model.parameters(), lr=1e-3, caution=True, foreach=False)
+    baseline_opt = heavyball.SGD(
+        baseline_model.parameters(),
+        lr=1e-3,
+        caution=False,
+    )
+    cautious_opt = heavyball.SGD(
+        cautious_model.parameters(),
+        lr=1e-3,
+        caution=True,
+    )
 
     _train_once(baseline_opt, baseline_model, data, target)
     _train_once(cautious_opt, cautious_model, data, target)
@@ -84,17 +92,16 @@ def test_mars_flag_changes_behavior() -> None:
     model_a, data, target = _make_batch()
     model_b = deepcopy(model_a)
 
-    opt_a = heavyball.ForeachAdamW(model_a.parameters(), mars=False, foreach=False, warmup_steps=0)
-    opt_b = heavyball.ForeachAdamW(model_b.parameters(), mars=True, foreach=False, warmup_steps=0)
+    opt_a = heavyball.ForeachAdamW(model_a.parameters(), mars=False, warmup_steps=0)
+    opt_b = heavyball.ForeachAdamW(model_b.parameters(), mars=True, warmup_steps=0)
 
-    baseline_init = [param.detach().clone() for param in model_a.parameters()]
-    mars_init = [param.detach().clone() for param in model_b.parameters()]
+    init = [param.detach().clone() for param in model_a.parameters()]
 
     _train_once(opt_a, model_a, data, target)
     _train_once(opt_b, model_b, data, target)
 
-    baseline_drift = _parameter_drift(model_a, baseline_init)
-    mars_drift = _parameter_drift(model_b, mars_init)
+    baseline_drift = _parameter_drift(model_a, init)
+    mars_drift = _parameter_drift(model_b, init)
     assert baseline_drift > 0.0
     assert mars_drift > 0.0
 
@@ -105,7 +112,7 @@ def test_mars_flag_changes_behavior() -> None:
 
 def test_sam_wrapper_requires_closure() -> None:
     model = nn.Linear(4, 2)
-    base = heavyball.ForeachAdamW(model.parameters(), foreach=False)
+    base = heavyball.ForeachAdamW(model.parameters())
     wrapper = heavyball.SAMWrapper(model.parameters(), wrapped_optimizer=base)
 
     with pytest.raises(ValueError):
