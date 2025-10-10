@@ -30,6 +30,7 @@ test/test_cpu_features.py
 test/test_chainable_cpu.py
 test/test_helpers_cpu.py
 test/test_utils_cpu.py
+test/test_stochastic_utils_cpu.py
 test/test_optimizer_cpu_smoke.py
 test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype1
 test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype1

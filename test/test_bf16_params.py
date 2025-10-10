@@ -14,6 +14,11 @@ os.environ["TORCH_LOGS"] = "+recompiles"
 
 config.cache_size_limit = 128
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required to run bf16 foreach parameter tests.",
+)
+
 
 @pytest.mark.parametrize("opt", heavyball.__all__)
 @pytest.mark.parametrize("size,depth", [(256, 1)])
