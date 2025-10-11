@@ -1578,7 +1578,12 @@ def stochastic_round_(ref: Tensor, source: Tensor | None = None):
     if source.dtype == torch.bfloat16:
         return source
     if source.dtype in (torch.float16, torch.float32, torch.float64):
-        return source.to(torch.bfloat16)
+        source = source.to(torch.float32)
+        noise = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
+        bits = source.view(dtype=torch.int32)
+        bits.add_(noise)
+        bits.bitwise_and_(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
+        return bits.view(dtype=torch.float32).bfloat16()
     return source.to(ref.dtype)
 
 
