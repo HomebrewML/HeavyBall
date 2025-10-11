@@ -954,11 +954,11 @@ class SAMWrapper(torch.optim.Optimizer):
             closure()
         old_params = [utils.sam_step(group["params"], group["ball"]) for group in self.param_groups]
 
-        originaL_handle_closure = self.wrapped_optimizer._handle_closure
+        original_handle_closure = self.wrapped_optimizer._handle_closure
 
         def _handle_closure(closure):
             try:
-                _loss = originaL_handle_closure(closure)
+                _loss = original_handle_closure(closure)
             finally:
                 for group, old in zip(self.param_groups, old_params):
                     utils.copy_stochastic_list_(group["params"], old)
@@ -968,7 +968,7 @@ class SAMWrapper(torch.optim.Optimizer):
             self.wrapped_optimizer._handle_closure = _handle_closure
             loss = self.wrapped_optimizer.step(closure)
         finally:
-            self.wrapped_optimizer._handle_closure = originaL_handle_closure
+            self.wrapped_optimizer._handle_closure = original_handle_closure
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
