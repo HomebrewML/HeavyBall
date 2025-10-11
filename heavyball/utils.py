@@ -1053,13 +1053,15 @@ class StatefulOptimizer(torch.optim.Optimizer):
     def get_groups(self, group):
         return [group]
 
-    @functools.lru_cache(maxsize=None)
     def state_(self, arg: Tensor, fail: bool = True):
-        if not fail and arg not in self.mapping:
-            return {}
-        if _tensor_key(arg) not in self.mapping_inverse:
+        key = _tensor_key(arg)
+        if key not in self.mapping_inverse:
             self._init_mapping()
-        state_param, index = self.mapping_inverse[_tensor_key(arg)]
+        if key not in self.mapping_inverse:
+            if not fail:
+                return {}
+            raise KeyError("Tensor has no tracked state.")
+        state_param, index = self.mapping_inverse[key]
         if state_param not in self.state:
             self.state[state_param] = collections.defaultdict(dict)
         return self.state[state_param][index]
@@ -1251,7 +1253,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
         if closure is None:
             if hessian_approx:
-                raise ValueError("Hessian approximation requires a closure.")
+                self._is_preconditioning = False
             return None
 
         step = self.inner_group["total_hvp_steps"] = self.inner_group.get("total_hvp_steps", 0) + 1
@@ -1569,18 +1571,15 @@ def stochastic_round_list_(ref: List[Tensor], source: List[Tensor]):
 
 @decorator_knowngood
 def stochastic_round_(ref: Tensor, source: Tensor | None = None):
-    if source is not None:
-        if source.dtype == torch.bfloat16 or ref.dtype == source.dtype:
-            return source
-        if ref.dtype != torch.bfloat16:
-            return source.to(ref.dtype)
-    else:
+    if source is None:
         source = ref
-    source = source.float()
-    result = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
-    result.add_(source.view(dtype=torch.int32))
-    result.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
-    return result.view(dtype=torch.float32).bfloat16()
+    if ref.dtype != torch.bfloat16:
+        return source.to(ref.dtype)
+    if source.dtype == torch.bfloat16:
+        return source
+    if source.dtype in (torch.float16, torch.float32, torch.float64):
+        return source.to(torch.bfloat16)
+    return source.to(ref.dtype)
 
 
 @decorator_knowngood
@@ -1913,7 +1912,8 @@ def update_lra_precond_(
 
     # LU factorization to reuse computation
     try:
-        LU, pivots = torch.linalg.lu_factor(IpVtU)
+        lu_matrix = promote(IpVtU)  # operate in fp32 when inputs are bf16/half
+        LU, pivots = torch.linalg.lu_factor(lu_matrix)
     except RuntimeError:
         # Error:
         # U[2,2] is zero and using it on lu_solve would result in a division by zero.
@@ -1923,8 +1923,13 @@ def update_lra_precond_(
         # So, we skip this step and reattempt on the next one
         return U.to(U_orig[0].dtype), V.to(V_orig[0].dtype), d.to(d_orig[0].dtype)
 
-    invQtv = invQtv - V @ torch.linalg.lu_solve(LU, pivots, (U.T @ invQtv).view(-1, 1), adjoint=True).flatten()
-    invPv = U @ torch.linalg.lu_solve(LU, pivots, (V.T @ invQtv).view(-1, 1)).flatten()
+    solve_dtype = LU.dtype
+    rhs = (U.T @ invQtv).view(-1, 1).to(solve_dtype)
+    correction = torch.linalg.lu_solve(LU, pivots, rhs, adjoint=True).to(V.dtype)
+    invQtv = invQtv - (V @ correction).flatten()
+    rhs = (V.T @ invQtv).view(-1, 1).to(solve_dtype)
+    solution = torch.linalg.lu_solve(LU, pivots, rhs).to(U.dtype)
+    invPv = (U @ solution).flatten()
 
     eps, step = scalar_guard(eps, step, vector)
     _compilable_d_step(d, d_orig, invQtv, vector, invPv, hessian_vector, Ph, eps, step, delayed)
