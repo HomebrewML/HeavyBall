@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Optional
+from typing import Optional, Type, Union
 
 import torch.optim
 
@@ -928,10 +928,22 @@ class NewtonHybrid2PSGDLRA(ForeachNewtonPSGDLRA):
 
 
 class SAMWrapper(torch.optim.Optimizer):
-    def __init__(self, params, wrapped_optimizer: utils.StatefulOptimizer = ForeachAdamW, ball: float = 0.1):
-        if not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
-            raise ValueError(f"{wrapped_optimizer.__class__.__name__} is not a HeavyBall optimizer")
+    def __init__(
+        self,
+        params,
+        wrapped_optimizer: Union[utils.StatefulOptimizer, Type[utils.StatefulOptimizer]] = ForeachAdamW,
+        ball: float = 0.1,
+    ):
+        params = list(params)
         super().__init__(params, {"ball": ball})
+
+        if isinstance(wrapped_optimizer, type):
+            if not issubclass(wrapped_optimizer, utils.StatefulOptimizer):
+                raise ValueError(f"{wrapped_optimizer.__name__} is not a HeavyBall optimizer")
+            wrapped_optimizer = wrapped_optimizer(params)
+        elif not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
+            raise ValueError(f"{wrapped_optimizer.__class__.__name__} is not a HeavyBall optimizer")
+
         self.wrapped_optimizer = wrapped_optimizer
 
     @torch.no_grad()
