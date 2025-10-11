@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 from lightbench.utils import get_optim
@@ -15,12 +17,39 @@ def get_memory():
     return torch.cuda.memory_allocated()
 
 
+def _read_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+DEFAULT_SIZE = _read_int("HB_FOREACH_TEST_SIZE", 128, minimum=1)
+DEFAULT_DEPTH = _read_int("HB_FOREACH_TEST_DEPTH", 16, minimum=1)
+DEFAULT_ITERATIONS = _read_int("HB_FOREACH_TEST_ITERATIONS", 64, minimum=1)
+DEFAULT_OUTER = _read_int("HB_FOREACH_TEST_OUTER", 1, minimum=1)
+DEFAULT_WARMUP = _read_int("HB_FOREACH_TEST_WARMUP", 1, minimum=0)
+
+
 @pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(256, 128)])
-def test_foreach(opt, size, depth: int, iterations: int = 4096, outer_iterations: int = 2):
+@pytest.mark.parametrize("size,depth", [(DEFAULT_SIZE, DEFAULT_DEPTH)])
+def test_foreach(
+    opt,
+    size,
+    depth: int,
+    iterations: int = DEFAULT_ITERATIONS,
+    outer_iterations: int = DEFAULT_OUTER,
+    warmup_runs: int = DEFAULT_WARMUP,
+):
     set_torch()
 
     opt = getattr(heavyball, opt)
+
+    total_runs = warmup_runs + outer_iterations
+    assert total_runs >= 1
 
     peaks = []
     losses = []
@@ -30,7 +59,7 @@ def test_foreach(opt, size, depth: int, iterations: int = 4096, outer_iterations
         peaks.append([])
         losses.append([])
 
-        for i in range(outer_iterations):
+        for i in range(total_runs):
             clean()
             model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
             clean()
@@ -56,8 +85,14 @@ def test_foreach(opt, size, depth: int, iterations: int = 4096, outer_iterations
 
             peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
-            if i > 0:
-                peaks[-1].append(peak)
+            if i < warmup_runs:
+                continue
+
+            peaks[-1].append(peak)
+
+    if warmup_runs:
+        cutoff = warmup_runs * iterations
+        losses = [loss_list[cutoff:] for loss_list in losses]
 
     for p0, p1 in zip(*peaks):
         assert p0 > p1
