@@ -343,7 +343,8 @@ def set_(dst: Tensor, src: Tensor):
 
 
 def clean():
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
 
 
@@ -470,7 +471,7 @@ def msign(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
 
     if should_transpose:
         x = x.mT
-    return x.float()
+    return x.to(G.dtype)
 
 
 ###### END
@@ -670,9 +671,9 @@ def get_orthogonal_matrix(mat, max_eps: float = 1e-3, min_eps: float = 1e-30):
             final.append(None)
             continue
 
+        device, dtype = m.device, m.dtype
         m = promote(m.data)
 
-        device, dtype = m.device, m.dtype
         eps = min_eps
         while True:
             try:
@@ -700,7 +701,6 @@ def get_orthogonal_matrix(mat, max_eps: float = 1e-3, min_eps: float = 1e-30):
                     raise
             clean()
 
-        eigvec = eigvec.to(device=m.device, dtype=m.dtype)
         eigvec = torch.flip(eigvec, [1])
         final.append(eigvec)
 
@@ -1149,7 +1149,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 active_p = [p for p in group["params"]]
 
                 if not active_p:
-                    return
+                    continue
 
                 k = group["ema_step"] = group.get("ema_step", -1) + 1
 
@@ -1166,7 +1166,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 active_p = [p for p in group["params"]]
 
                 if not active_p:
-                    return
+                    continue
 
                 for p in active_p:
                     if "param_ema" in self.state_(p):
@@ -1180,7 +1180,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 active_p = [p for p in group["params"]]
 
                 if not active_p:
-                    return
+                    continue
 
                 for p in active_p:
                     if "param_ema" in self.state_(p):
@@ -1209,7 +1209,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
         for group in self.param_groups:
             for p, g in self.split_p_and_g_in_group(group, skip_none=True, raw=True):
                 p.grad = grads.pop(0)
-                stochastic_add_(g, p.grad, -1)  # technically, we have to divide by the scale here
+                stochastic_add_divide_(g, p.grad, -1, torch.finfo(p.dtype).eps ** 0.5)
                 p.hessian_vector = g
                 p.data.copy_(p.orig)
                 del p.orig
@@ -1299,6 +1299,8 @@ class StatefulOptimizer(torch.optim.Optimizer):
             self._is_preconditioning = psgd_should_update(self.inner_group, self.precond_schedule, self.precond_rng)
         loss = self._handle_closure(closure)
 
+        if self.use_ema:
+            self.ema_update()
         # we assume that parameters are constant and that there are no excessive recompiles
         with torch.no_grad(), torch._dynamo.utils.disable_cache_limit():
             for group in self.param_groups:
@@ -1306,8 +1308,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
                     group["param_count"] = sum(p.numel() for p in group["params"])
                 group["is_preconditioning"] = self._is_preconditioning
                 self._step(group)
-                if self.use_ema:
-                    self.ema_update()
                 for real, views in self.mapping.items():
                     for tensor in (real, *views):
                         for key in ("grad", "vector", "hessian_vector", "orig"):
@@ -2121,16 +2121,6 @@ def psgd_calc_A_and_conjB(G: Tensor, Q, conjB: Tensor | None):  # conjB ("V", "v
     return A, conjB
 
 
-@decorator_knowngood
-def _random_projection(x: Tensor, scale: Optional[Tensor]):
-    if scale is None:
-        scale = x.norm(float("inf")).clamp(min=1e-8)
-    k = 2 ** math.ceil(math.log2(math.log2(min(x.shape))))  # next-largest-power-of-2 of log2-of-size
-    norm = x.square().sum(0)
-    indices = torch.topk(norm, k, largest=True).indices
-    return x.index_select(1, indices).contiguous() / scale, scale
-
-
 def max_singular_value_exact(A, use_lobpcg: bool = False):
     try:
         if use_lobpcg:
@@ -2174,7 +2164,15 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     """
     Adapted from @evanatyourservice
     """
-    Y, max_abs = _random_projection(A, max_abs)
+    if max_abs is None:
+        max_abs = A.norm(float("inf")).clamp(min=1e-8)
+
+    # cholesky uses random projection, but this uses topk -- topk is a warm start, which may converge to a biased result
+    k = 2 ** math.ceil(math.log2(math.log2(min(A.shape))))  # next-largest-power-of-2 of log2-of-size
+    norm = A.square().sum(0)
+    indices = torch.topk(norm, k, largest=True).indices
+    Y = A.index_select(1, indices).contiguous() / max_abs
+
     Q = inplace_orthogonal_(Y, precise_zeroth_power_mode)
     Q = Q / max_abs
     Z = A.T @ Q
@@ -3116,7 +3114,7 @@ def pointwise_lr_adaptation(
 ):
     grads, update, state, delta = list_guard(grads, update, state, delta)
     lr_lr = scalar_guard(lr_lr, grads[0])
-    _compilable_lr_adapt_(grads, update, state, delta, lr_lr)
+    _compilable_pointwise_lr_adapt_(grads, update, state, delta, lr_lr)
 
 
 def hook_optimizer_into_model(model, optimizer, *args, **kwargs):
@@ -3136,8 +3134,6 @@ def hook_optimizer_into_model(model, optimizer, *args, **kwargs):
 
 def fused_hook(parameters, optimizer, *args, **kwargs):
     parameters = list(parameters)
-    param_count = len(parameters)
-    seen_params = set()
 
     o = optimizer(parameters, *args, **kwargs)
     step_fn = o.step
@@ -3146,12 +3142,8 @@ def fused_hook(parameters, optimizer, *args, **kwargs):
     )
 
     def _step(p: Tensor):
-        seen_params.add(p)
-
-        if len(seen_params) < param_count:
-            step_fn()
-            o.zero_grad()
-            seen_params.clear()
+        step_fn()
+        o.zero_grad()
 
     for p in parameters:
         p.register_post_accumulate_grad_hook(_step)

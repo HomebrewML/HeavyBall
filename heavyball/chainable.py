@@ -750,7 +750,9 @@ def _update_psgd_precond(
     if isinstance(prob, float):
         float_prob = prob
     else:
-        float_prob = prob(group.get(f"cumulative_prob_{id(Q)}_prob_step", 1))
+        prob_step = group.get(f"cumulative_prob_{id(Q)}_prob_step", 1)
+        float_prob = prob(prob_step)
+        group[f"cumulative_prob_{id(Q)}_prob_step"] = prob_step + 1
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if precond is not None:

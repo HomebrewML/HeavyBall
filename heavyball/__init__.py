@@ -26,9 +26,12 @@ class SAMWrapper(torch.optim.Optimizer):
         originaL_handle_closure = self.wrapped_optimizer._handle_closure
 
         def _handle_closure(closure):
-            originaL_handle_closure(closure)
-            for group, old in zip(self.param_groups, old_params):
-                utils.copy_stochastic_list_(group["params"], old)
+            try:
+                _loss = originaL_handle_closure(closure)
+            finally:
+                for group, old in zip(self.param_groups, old_params):
+                    utils.copy_stochastic_list_(group["params"], old)
+            return _loss
 
         try:
             self.wrapped_optimizer._handle_closure = _handle_closure
@@ -38,7 +41,7 @@ class SAMWrapper(torch.optim.Optimizer):
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
-        self.wrapped_optimizer.zero_grad()
+        self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
 
 
 class SGD(C.BaseOpt):
@@ -778,7 +781,7 @@ class ForeachPSGDKron(C.BaseOpt):
         beta=None,
         betas=(0.9, 0.999),
         weight_decay=0.0,
-        preconditioner_update_probability=None,
+        preconditioner_update_probability=C.use_default,
         max_size_triangular=2048,
         min_ndim_triangular=2,
         memory_save_mode=None,
@@ -830,8 +833,8 @@ class ForeachPSGDKron(C.BaseOpt):
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
 
-        self.precond_schedule = (
-            defaults.pop("preconditioner_update_probability") or utils.precond_update_prob_schedule()
+        self.precond_schedule = C.default(
+            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
         )
         params = defaults.pop("params")
 
@@ -890,7 +893,7 @@ class ForeachPSGDLRA(C.BaseOpt):
         lr=0.001,
         beta=0.9,
         weight_decay=0.0,
-        preconditioner_update_probability=None,
+        preconditioner_update_probability=C.use_default,
         momentum_into_precond_update=True,
         rank: Optional[int] = None,
         warmup_steps: int = 0,
@@ -924,8 +927,8 @@ class ForeachPSGDLRA(C.BaseOpt):
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
 
-        self.precond_schedule = (
-            defaults.pop("preconditioner_update_probability") or utils.precond_update_prob_schedule()
+        self.precond_schedule = C.default(
+            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
         )
         params = defaults.pop("params")
 
@@ -982,53 +985,3 @@ DelayedPSGDLRA = ForeachDelayedPSGDLRA
 PSGDLRA = ForeachPSGDLRA
 NewtonPSGDLRA = ForeachNewtonPSGDLRA
 NewtonPSGDKron = ForeachCachedNewtonPSGD
-
-__all__ = [
-    "Muon",
-    "RMSprop",
-    "PrecondSchedulePaLMSOAP",
-    "PSGDKron",
-    "PurePSGD",
-    "DelayedPSGD",
-    "CachedPSGDKron",
-    "CachedDelayedPSGDKron",
-    "PalmForEachSoap",
-    "PaLMSOAP",
-    "PaLMSFAdamW",
-    "LaProp",
-    "ADOPT",
-    "PrecondScheduleSOAP",
-    "PrecondSchedulePaLMSOAP",
-    "RMSprop",
-    "MuonLaProp",
-    "ForeachSignLaProp",
-    "ForeachDelayedPSGDLRA",
-    "ForeachPSGDLRA",
-    "ForeachPSGDLRA",
-    "ForeachNewtonPSGDLRA",  #
-    "ForeachAdamW",
-    "ForeachSFAdamW",
-    "ForeachLaProp",
-    "ForeachADOPT",
-    "ForeachSOAP",
-    "ForeachPSGDKron",
-    "ForeachPurePSGD",
-    "ForeachDelayedPSGD",
-    "ForeachCachedPSGDKron",
-    "ForeachCachedDelayedPSGDKron",
-    "ForeachRMSprop",
-    "ForeachMuon",
-    "ForeachCachedNewtonPSGD",
-    "OrthoLaProp",
-    "LaPropOrtho",
-    "SignLaProp",
-    "DelayedPSGD",
-    "PSGDLRA",
-    "NewtonPSGDLRA",
-    "NewtonHybrid2PSGDLRA",
-    "NewtonHybrid2PSGDKron",
-    "MSAMLaProp",
-    "NewtonPSGDKron",
-    "ForeachAdamC",
-    "SGD",
-]

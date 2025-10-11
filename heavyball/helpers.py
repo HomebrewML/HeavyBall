@@ -451,10 +451,12 @@ class FastINGO:
         learning_rate: Optional[float] = None,
         last_n: int = 4096,
         loco_step_size: float = 0.1,
-        device="cuda",
+        device: str | None = None,
         batchnorm_decay: float = 0.99,
         score_decay: float = 0.99,
     ) -> None:
+        if device is None:
+            device = _use_cuda()
         n_dimension = len(mean)
         if population_size is None:
             population_size = 4 + int(np.floor(3 * np.log(n_dimension)))
@@ -583,7 +585,7 @@ class ImplicitNaturalGradientSampler(BaseSampler):
     def reseed_rng(self) -> None:
         self._independent_sampler.reseed_rng()
         if self._optimizer:
-            self._optimizer._rng.seed()
+            self._optimizer.generator.seed()
 
     def infer_relative_search_space(
         self, study: "optuna.Study", trial: "optuna.trial.FrozenTrial"
@@ -716,8 +718,14 @@ def init_hebo(study, seed, trials, search_space):
     return sampler
 
 
+def _use_cuda():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def init_botorch(study, seed, trials, search_space):
-    return BoTorchSampler(search_space=search_space, seed=seed, device="cuda")  # will automatically pull in latest data
+    return BoTorchSampler(
+        search_space=search_space, seed=seed, device=_use_cuda()
+    )  # will automatically pull in latest data
 
 
 def init_nsgaii(study, seed, trials, search_space):
