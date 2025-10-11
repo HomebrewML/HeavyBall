@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import functools
 import math
 import threading
@@ -14,7 +12,7 @@ import pandas as pd
 import torch
 from hebo.design_space.design_space import DesignSpace
 from hebo.optimizers.hebo import HEBO
-from optuna._transform import _SearchSpaceTransform
+from optuna._transform import _SearchSpaceTransform as SearchSpaceTransform
 from optuna.distributions import BaseDistribution, CategoricalDistribution, FloatDistribution, IntDistribution
 from optuna.samplers import BaseSampler, CmaEsSampler, RandomSampler
 from optuna.samplers._lazy_random_state import LazyRandomState
@@ -154,7 +152,7 @@ def _untransform_numerical_param_torch(
 
 
 @torch.no_grad()
-def untransform(self: _SearchSpaceTransform, trans_params: Tensor) -> dict[str, Any]:
+def untransform(self: SearchSpaceTransform, trans_params: Tensor) -> dict[str, Any]:
     assert trans_params.shape == (self._raw_bounds.shape[0],)
 
     if self._transform_0_1:
@@ -218,7 +216,7 @@ class BoTorchSampler(SimpleAPIBaseSampler):
 
     @torch.no_grad()
     def _preprocess_trials(
-        self, trans: _SearchSpaceTransform, study: Study, trials: list[FrozenTrial]
+        self, trans: SearchSpaceTransform, study: Study, trials: list[FrozenTrial]
     ) -> Tuple[int, Tensor, Tensor]:
         new_trials = []
         for trial in trials:
@@ -276,7 +274,7 @@ class BoTorchSampler(SimpleAPIBaseSampler):
         if n_completed_trials < self._n_startup_trials:
             return {}
 
-        trans = _SearchSpaceTransform(search_space)
+        trans = SearchSpaceTransform(search_space)
         n_objectives, values, params = self._preprocess_trials(trans, study, completed_trials)
 
         if self._candidates_func is None:
@@ -635,7 +633,7 @@ class ImplicitNaturalGradientSampler(BaseSampler):
             self._warn_independent_sampling = False
             return {}
 
-        trans = _SearchSpaceTransform(search_space)
+        trans = SearchSpaceTransform(search_space)
 
         if self._optimizer is None:
             self._optimizer = self._init_optimizer(trans, population_size=self._population_size)
@@ -653,7 +651,7 @@ class ImplicitNaturalGradientSampler(BaseSampler):
 
     def _init_optimizer(
         self,
-        trans: _SearchSpaceTransform,
+        trans: SearchSpaceTransform,
         population_size: Optional[int] = None,
     ) -> FastINGO:
         lower_bounds = trans.bounds[:, 0]

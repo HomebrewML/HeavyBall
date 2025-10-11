@@ -2049,7 +2049,10 @@ def extract_from_flat_update(params: List[Tensor], update: Tensor):
 @decorator_knowngood
 def flatten(x: List[Tensor], remaining: int = 0) -> Tensor:
     last_dim = x[0].shape[-remaining:] if remaining else []
-    return torch.cat([i.reshape(-1, *last_dim) for i in x if i.numel()], 0)
+    tensors = [i.reshape(-1, *last_dim) for i in x if i.numel()]
+    if not tensors:
+        return torch.zeros((), dtype=x[0].device, device=x[0].device)
+    return torch.cat(tensors, 0)
 
 
 @decorator_knowngood
@@ -2560,7 +2563,7 @@ def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], numel: int
         else:
             scale = gg.size(0) / numel
             gg = 2 * torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) - gg * scale
-            update = q - gg @ q @ gg
+            update = q - casted_einsum("ab,cd,bc", gg, gg, q)
             out.append(update + update.T)  # make matrix symmetric
     return out
 
