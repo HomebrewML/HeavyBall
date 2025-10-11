@@ -3171,6 +3171,8 @@ def sam_step(parameters, ball_size, adaptive: bool = True):
     old_params = []
     for p in parameters:
         old_params.append(p.detach().clone())
+        if not hasattr_none(p, "grad"):
+            continue
         grad = promote(p.grad)
         if adaptive:
             grad = grad * promote(p).square()

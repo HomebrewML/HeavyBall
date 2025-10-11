@@ -1,3 +1,4 @@
+import copy
 import functools
 import math
 import threading
@@ -705,6 +706,7 @@ class ThreadLocalSampler(threading.local):
 
 
 def init_cmaes(study, seed, trials, search_space):
+    trials = copy.deepcopy(trials)
     trials.sort(key=lambda trial: trial.datetime_complete)
     return CmaEsSampler(seed=seed, source_trials=trials, lr_adapt=True)
 
@@ -798,7 +800,7 @@ class AutoSampler(BaseSampler):
         complete_trials = study._get_trials(deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True)
         self._completed_trials = max(self._completed_trials, len(complete_trials))
         new_index = (self._completed_trials >= self.sampler_indices).sum() - 1
-        if new_index == self._current_index:
+        if new_index == self._current_index or new_index < 0:
             return
         self._current_index = new_index
         self._sampler = self.samplers[new_index](
@@ -811,7 +813,7 @@ class AutoSampler(BaseSampler):
     def sample_relative(
         self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
     ) -> dict[str, Any]:
-        return self._sampler.sample_relative(study, trial, self.search_space)
+        return self._sampler.sample_relative(study, trial, search_space or self.search_space)
 
     def sample_independent(
         self,

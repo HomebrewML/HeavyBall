@@ -985,3 +985,6 @@ DelayedPSGDLRA = ForeachDelayedPSGDLRA
 PSGDLRA = ForeachPSGDLRA
 NewtonPSGDLRA = ForeachNewtonPSGDLRA
 NewtonPSGDKron = ForeachCachedNewtonPSGD
+
+
+__all__ = [k for k, v in globals().items() if issubclass(v, torch.optim.Optimizer)]
