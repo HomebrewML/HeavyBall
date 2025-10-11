@@ -8,42 +8,6 @@ from . import chainable as C
 from . import utils
 
 
-class SAMWrapper(torch.optim.Optimizer):
-    def __init__(self, params, wrapped_optimizer: utils.StatefulOptimizer, ball: float = 0.1):
-        if not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
-            raise ValueError(f"{wrapped_optimizer.__class__.__name__} is not a HeavyBall optimizer")
-        super().__init__(params, {"ball": ball})
-        self.wrapped_optimizer = wrapped_optimizer
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        if closure is None:
-            raise ValueError("SAM requires closure")
-        with torch.enable_grad():
-            closure()
-        old_params = [utils.sam_step(group["params"], group["ball"]) for group in self.param_groups]
-
-        originaL_handle_closure = self.wrapped_optimizer._handle_closure
-
-        def _handle_closure(closure):
-            try:
-                _loss = originaL_handle_closure(closure)
-            finally:
-                for group, old in zip(self.param_groups, old_params):
-                    utils.copy_stochastic_list_(group["params"], old)
-            return _loss
-
-        try:
-            self.wrapped_optimizer._handle_closure = _handle_closure
-            loss = self.wrapped_optimizer.step(closure)
-        finally:
-            self.wrapped_optimizer._handle_closure = originaL_handle_closure
-        return loss
-
-    def zero_grad(self, set_to_none: bool = True):
-        self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
-
-
 class SGD(C.BaseOpt):
     def __init__(
         self,
@@ -963,6 +927,42 @@ class NewtonHybrid2PSGDLRA(ForeachNewtonPSGDLRA):
     hvp_interval = 2
 
 
+class SAMWrapper(torch.optim.Optimizer):
+    def __init__(self, params, wrapped_optimizer: utils.StatefulOptimizer = ForeachAdamW, ball: float = 0.1):
+        if not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
+            raise ValueError(f"{wrapped_optimizer.__class__.__name__} is not a HeavyBall optimizer")
+        super().__init__(params, {"ball": ball})
+        self.wrapped_optimizer = wrapped_optimizer
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if closure is None:
+            raise ValueError("SAM requires closure")
+        with torch.enable_grad():
+            closure()
+        old_params = [utils.sam_step(group["params"], group["ball"]) for group in self.param_groups]
+
+        originaL_handle_closure = self.wrapped_optimizer._handle_closure
+
+        def _handle_closure(closure):
+            try:
+                _loss = originaL_handle_closure(closure)
+            finally:
+                for group, old in zip(self.param_groups, old_params):
+                    utils.copy_stochastic_list_(group["params"], old)
+            return _loss
+
+        try:
+            self.wrapped_optimizer._handle_closure = _handle_closure
+            loss = self.wrapped_optimizer.step(closure)
+        finally:
+            self.wrapped_optimizer._handle_closure = originaL_handle_closure
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
+
+
 PalmForEachSoap = PaLMForeachSOAP
 PaLMSOAP = PaLMForeachSOAP
 PaLMSFAdamW = PaLMForeachSFAdamW
@@ -985,6 +985,5 @@ DelayedPSGDLRA = ForeachDelayedPSGDLRA
 PSGDLRA = ForeachPSGDLRA
 NewtonPSGDLRA = ForeachNewtonPSGDLRA
 NewtonPSGDKron = ForeachCachedNewtonPSGD
-
 
 __all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer)]
