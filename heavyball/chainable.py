@@ -497,6 +497,7 @@ def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx
     precond_update, _ = utils.eigvecs_product_rank1(precond_update.flatten(), fisher_approx.flatten(), w)
 
     new_approx = utils.oja_update(fisher_approx.flatten().to(update.dtype), update.flatten(), group["precond_lr"])
+    new_approx = new_approx.view_as(fisher_approx)
     utils.copy_stochastic_(fisher_approx, new_approx)
     return precond_update
 
