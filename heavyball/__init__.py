@@ -987,4 +987,4 @@ NewtonPSGDLRA = ForeachNewtonPSGDLRA
 NewtonPSGDKron = ForeachCachedNewtonPSGD
 
 
-__all__ = [k for k, v in globals().items() if issubclass(v, torch.optim.Optimizer)]
+__all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer)]
