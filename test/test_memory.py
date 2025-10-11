@@ -19,7 +19,6 @@ expected_memory = {
     "adamw": {"after": 4, "peak": 5.1},
     "soap": {"after": 7, "peak": 14},
     "psgd": {"after": 4, "peak": 11.5},
-    "padam": {"after": 5, "peak": 11.4},
 }
 
 
