@@ -1253,7 +1253,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
         if closure is None:
             if hessian_approx:
-                self._is_preconditioning = False
+                raise ValueError("Hessian approximation requires a closure.")
             return None
 
         step = self.inner_group["total_hvp_steps"] = self.inner_group.get("total_hvp_steps", 0) + 1
