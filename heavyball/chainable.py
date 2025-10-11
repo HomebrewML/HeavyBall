@@ -62,8 +62,6 @@ class FunctionTransform:
                     self._init(st, group, *a, **kwargs)
                 except SkipUpdate:
                     skip_update = True
-                except:
-                    raise
                 finally:
                     if "is_initialized" not in st:
                         st["is_initialized"] = set()

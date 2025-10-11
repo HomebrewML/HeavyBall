@@ -59,9 +59,9 @@ def manual_seed(seed: int | None = None) -> Generator[None, None, None]:
 class SimpleAPIBaseSampler(BaseSampler):
     def __init__(
         self,
-        search_space: dict[str, BaseDistribution] = None,
+        search_space: Optional[dict[str, BaseDistribution]] = None,
     ):
-        self.search_space = search_space
+        self.search_space = {} if search_space is None else dict(search_space)
 
     def suggest_all(self, trial: FrozenTrial):
         return {k: trial._suggest(k, dist) for k, dist in self.search_space.items()}
@@ -181,29 +181,31 @@ class BoTorchSampler(SimpleAPIBaseSampler):
 
     def __init__(
         self,
-        search_space: dict[str, BaseDistribution] = None,
+        search_space: Optional[dict[str, BaseDistribution]] = None,
         *,
-        candidates_func: None = None,
-        constraints_func: None = None,
+        candidates_func: Optional[Callable[..., Tensor]] = None,
+        constraints_func: Optional[Callable[..., Tensor]] = None,
         n_startup_trials: int = 10,
         consider_running_trials: bool = False,
-        independent_sampler: None = None,
+        independent_sampler: Optional[BaseSampler] = None,
         seed: int | None = None,
         device: torch.device | str | None = None,
         trial_chunks: int = 128,
     ):
-        assert constraints_func is None
-        assert candidates_func is None
-        assert consider_running_trials is False
-        assert independent_sampler is None
-        self._candidates_func = None
-        self._independent_sampler = RandomSampler(seed=seed)
+        if constraints_func is not None:
+            raise NotImplementedError("constraints_func is currently not supported by BoTorchSampler.")
+        if consider_running_trials:
+            raise NotImplementedError("consider_running_trials is currently not supported by BoTorchSampler.")
+        if candidates_func is not None and not callable(candidates_func):
+            raise TypeError("candidates_func must be callable.")
+        self._candidates_func = candidates_func
+        self._independent_sampler = independent_sampler or RandomSampler(seed=seed)
         self._n_startup_trials = n_startup_trials
         self._seed = seed
         self.trial_chunks = trial_chunks
 
         self._study_id: int | None = None
-        self.search_space = search_space
+        self.search_space = {} if search_space is None else dict(search_space)
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device or torch.device("cpu")
@@ -211,6 +213,7 @@ class BoTorchSampler(SimpleAPIBaseSampler):
         self._values = None
         self._params = None
         self._index = 0
+        self._bounds_dim: int | None = None
 
     def infer_relative_search_space(self, study: Study, trial: FrozenTrial) -> dict[str, BaseDistribution]:
         return self.search_space
@@ -219,6 +222,15 @@ class BoTorchSampler(SimpleAPIBaseSampler):
     def _preprocess_trials(
         self, trans: SearchSpaceTransform, study: Study, trials: list[FrozenTrial]
     ) -> Tuple[int, Tensor, Tensor]:
+        bounds_dim = trans.bounds.shape[0]
+        if self._bounds_dim is not None and self._bounds_dim != bounds_dim:
+            self._values = None
+            self._params = None
+            self._index = 0
+            self.seen_trials = set()
+        if self._bounds_dim is None:
+            self._bounds_dim = bounds_dim
+
         new_trials = []
         for trial in trials:
             tid: int = trial._trial_id
@@ -229,6 +241,10 @@ class BoTorchSampler(SimpleAPIBaseSampler):
 
         n_objectives = len(study.directions)
         if not new_trials:
+            if self._values is None or self._params is None:
+                empty_values = torch.zeros((0, n_objectives), dtype=torch.float64, device=self._device)
+                empty_params = torch.zeros((0, bounds_dim), dtype=torch.float64, device=self._device)
+                return n_objectives, empty_values, empty_params
             return n_objectives, self._values[: self._index], self._params[: self._index]
 
         n_completed_trials = len(trials)
@@ -245,18 +261,28 @@ class BoTorchSampler(SimpleAPIBaseSampler):
             if direction == StudyDirection.MINIMIZE:  # BoTorch always assumes maximization.
                 values[:, obj_idx] *= -1
 
-        if self._values is None:
+        bounds_dim = trans.bounds.shape[0]
+        cache_stale = (
+            self._values is None
+            or self._params is None
+            or self._values.size(1) != n_objectives
+            or self._params.size(1) != bounds_dim
+        )
+        if cache_stale:
             self._values = torch.zeros((self.trial_chunks, n_objectives), dtype=torch.float64, device=self._device)
-            self._params = torch.zeros(
-                (self.trial_chunks, trans.bounds.shape[0]), dtype=torch.float64, device=self._device
-            )
+            self._params = torch.zeros((self.trial_chunks, bounds_dim), dtype=torch.float64, device=self._device)
+            self._index = 0
+            self.seen_trials = set()
+            self._bounds_dim = bounds_dim
         spillage = (self._index + n_completed_trials) - self._values.size(0)
         if spillage > 0:
             pad = int(math.ceil(spillage / self.trial_chunks) * self.trial_chunks)
             self._values = F.pad(self._values, (0, 0, 0, pad))
             self._params = F.pad(self._params, (0, 0, 0, pad))
-        self._values[self._index : self._index + n_completed_trials] = torch.from_numpy(values)
-        self._params[self._index : self._index + n_completed_trials] = torch.from_numpy(params)
+        values_tensor = torch.from_numpy(values).to(self._device)
+        params_tensor = torch.from_numpy(params).to(self._device)
+        self._values[self._index : self._index + n_completed_trials] = values_tensor
+        self._params[self._index : self._index + n_completed_trials] = params_tensor
         self._index += n_completed_trials
 
         return n_objectives, self._values[: self._index], self._params[: self._index]
@@ -378,10 +404,10 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler, SimpleAPIBaseSampler):
         independent_sampler: BaseSampler | None = None,
     ) -> None:
         super().__init__(search_space, seed)
-        assert constant_liar is False
-        assert independent_sampler is None
+        if constant_liar:
+            raise NotImplementedError("constant_liar is not supported by HEBOSampler.")
         self._hebo = HEBO(_convert_to_hebo_design_space(search_space), scramble_seed=self._seed)
-        self._independent_sampler = optuna.samplers.RandomSampler(seed=seed)
+        self._independent_sampler = independent_sampler or optuna.samplers.RandomSampler(seed=seed)
         self._rng = np.random.default_rng(seed)
 
     def sample_relative(
@@ -522,8 +548,14 @@ class FastINGO:
         if y.numel() <= 2:
             return
 
-        y = y + torch.where(y.min() <= 0, 1e-8 - y.min(), 0)
-        y = y.log()
+        min_y = y.min()
+        max_y = y.max()
+        if torch.isclose(max_y, min_y, rtol=0.0, atol=1e-12):
+            return
+
+        if min_y <= 0:
+            y = y + (1e-8 - min_y)
+        y = y.clamp_min_(1e-8).log()
 
         ema = -torch.arange(y.size(0), device=y.device, dtype=y.dtype)
         weight = self.batchnorm_decay**ema
@@ -636,12 +668,9 @@ class ImplicitNaturalGradientSampler(BaseSampler):
 
         trans = SearchSpaceTransform(search_space)
 
-        if self._optimizer is None:
+        if self._optimizer is None or self._optimizer.dim != len(trans.bounds):
             self._optimizer = self._init_optimizer(trans, population_size=self._population_size)
-
-        if self._optimizer.dim != len(trans.bounds):
-            self._warn_independent_sampling = False
-            return {}
+            self._param_queue.clear()
 
         solution_trials = [t for t in completed_trials if self._check_trial_is_generation(t)]
         for t in solution_trials:
@@ -747,17 +776,20 @@ class AutoSampler(BaseSampler):
     def __init__(
         self,
         samplers: Iterable[Tuple[int, Callable]] | None = None,
-        search_space: dict[str, BaseDistribution] = None,
+        search_space: Optional[dict[str, BaseDistribution]] = None,
         *,
         seed: int | None = None,
-        constraints_func: None = None,
+        constraints_func: Optional[Callable[..., Any]] = None,
     ) -> None:
-        assert constraints_func is None
+        if constraints_func is not None:
+            raise NotImplementedError("constraints_func is not supported by AutoSampler.")
         if samplers is None:
+            if search_space is None:
+                raise ValueError("AutoSampler requires a search_space when using the default sampler schedule.")
             samplers = ((0, init_hebo), (100, init_nsgaii))
         self.sampler_indices = np.sort(np.array([x[0] for x in samplers], dtype=np.int32))
         self.samplers = [x[1] for x in sorted(samplers, key=lambda x: x[0])]
-        self.search_space = search_space
+        self.search_space = {} if search_space is None else dict(search_space)
         self._rng = LazyRandomState(seed)
         self._random_sampler = RandomSampler(seed=seed)
         self._thread_local_sampler = ThreadLocalSampler()
@@ -842,5 +874,6 @@ class AutoSampler(BaseSampler):
         state: TrialState,
         values: Sequence[float] | None,
     ) -> None:
-        assert state in [TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED]
+        if state not in (TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED):
+            raise ValueError(f"Unsupported trial state: {state}.")
         self._sampler.after_trial(study, trial, state, values)
