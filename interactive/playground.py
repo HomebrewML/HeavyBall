@@ -448,7 +448,7 @@ OPTIMIZER_BLOCKS = {
                 "name": "SOAP",
                 "icon": "🧼",
                 "description": "Shampoo-based preconditioning",
-                "func": functools.partial(C.scale_by_soap, inner="adam"),
+                "func": C.scale_by_soap,
                 "params": {
                     "shampoo_beta": 0.99,
                     "max_precond_dim": 10000,
