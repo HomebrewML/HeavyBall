@@ -803,6 +803,31 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.nadam_(
+        grad_projected,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+        group["momentum_decay"],
+        group["eps"],
+        0.0,
+        False,
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg)
+    return precond
+
+
+@zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
