@@ -719,8 +719,8 @@ def _init_soap(state, group, update, grad, param):
     utils.init_preconditioner(grad, state, group["max_precond_dim"], group["precondition_1d"])
 
 
-def _apply_soap_preconditioner(group, update, Q, GG, reference):
-    for upd, q, gg, ref in zip(update, Q, GG, reference):
+def _apply_soap_preconditioner(group, update, Q, GG, *references):
+    for upd, q, gg, *ref in zip(update, Q, GG, *references):
         utils.update_preconditioner(
             utils.promote(upd),
             q,
@@ -788,7 +788,7 @@ def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slo
         group.get("alpha_warmup"),
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
-    _apply_soap_preconditioner(group, update, Q, GG, [exp_avg_slow, exp_avg_fast])
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg_slow, exp_avg_fast)
     return precond
 
 
