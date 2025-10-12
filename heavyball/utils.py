@@ -10,7 +10,7 @@ import random
 import re
 import string
 import warnings
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -909,7 +909,7 @@ def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
         stochastic_lerp_(m, outer_product, 1 - beta)
 
 
-def tree_apply(fn):
+def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     def _fn(*args):
         return tree_map(fn, *args)
 
@@ -1513,23 +1513,13 @@ def _compilable_ademamix_update_(
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
-    update32 = list(map(promote, update))
+    update32 = promote(update)
     fast32 = _lerp(exp_avg_fast, update32, beta1)
+    slow32 = _lerp(exp_avg_slow, update32, beta3)
 
-    beta3_val = float(beta3.item())
-    slow32 = list(map(promote, exp_avg_slow))
-    one_minus_beta3 = 1.0 - beta3_val
-    for slow, upd in zip(slow32, update32):
-        slow.mul_(beta3_val)
-        if one_minus_beta3 != 0:
-            slow.add_(upd, alpha=one_minus_beta3)
-    copy_stochastic_list_(exp_avg_slow, slow32)
-
-    denom = _compilable_exp_avg_sq_(exp_avg_sq, update32, beta2, eps, [None])
-
-    alpha_val = float(alpha.item())
-    slow_scaled = torch._foreach_mul(slow32, alpha_val)
+    slow_scaled = torch._foreach_mul(slow32, alpha)
     mixed = torch._foreach_add(fast32, slow_scaled)
+    denom = _compilable_exp_avg_sq_(exp_avg_sq, update32, beta2, eps, [None])
     return torch._foreach_div(mixed, denom)
 
 
