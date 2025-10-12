@@ -403,7 +403,7 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
     raise SkipUpdate from None
 
 
-@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+@zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
     utils.fused_adam_(
