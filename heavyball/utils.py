@@ -644,7 +644,7 @@ def _compilable_scatter_set(target, source, index):
 
 
 # @decorator_knowngood
-def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], exp_avg: Optional[Tensor] = None):
+def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor):
     """
     Computes the eigenbases of the preconditioner using one round of power iteration
     followed by torch.linalg.qr decomposition, and updates exp_avg in-place from old to new eigenspace.
@@ -653,15 +653,19 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], exp_avg: Optiona
     :param Q: List of current eigenbases (updated in-place to Q_new).
     :param exp_avg: Exponential moving average in the old eigenspace (updated in-place if provided).
     """
-    if exp_avg.dim() == 0:  # preconditioning doesn't make sense here
+    if not exp_avg:
+        return
+
+    ref = exp_avg[0]
+    if ref.dim() == 0:  # preconditioning doesn't make sense here
         Q.clear()
         return
 
     if isinstance(Q, list) and not Q:
         return
 
-    if exp_avg is not None and exp_avg.dim() != len(Q):
-        raise ValueError(f"exp_avg dim {exp_avg.dim()} does not match Q length {len(Q)}")
+    if ref is not None and ref.dim() != len(Q):
+        raise ValueError(f"ref dim {ref.dim()} does not match Q length {len(Q)}")
 
     new_qs = []
 
@@ -680,14 +684,14 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], exp_avg: Optiona
         tmp[:, sort_idx] = inplace_orthogonal_(tmp[:, sort_idx], precise_zeroth_power_mode)
         new_qs.append(tmp)
 
-    if exp_avg is None:
+    if ref is None:
         for q, q_new in zip(Q, new_qs):
             copy_stochastic_(q, q_new)
         return
 
-    assert exp_avg.ndim < 13, "exp_avg.ndim must be less than 13"
-    in_str = einsum_base[: exp_avg.dim()]
-    out_str = einsum_base[exp_avg.dim() : 2 * exp_avg.dim()]
+    assert ref.ndim < 13, "ref.ndim must be less than 13"
+    in_str = einsum_base[: ref.dim()]
+    out_str = einsum_base[ref.dim() : 2 * ref.dim()]
 
     from_shampoo = ",".join([o + i for m, i, o in zip(Q, in_str, in_str.upper()) if m is not None])
     if not from_shampoo:
@@ -697,10 +701,9 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], exp_avg: Optiona
     out_str = "".join([o if o in to_shampoo else i for i, o in zip(in_str, out_str)])
 
     subscripts = f"{in_str},{from_shampoo},{to_shampoo}->{out_str}"
-    exp_avg_new = compiled_einsum(
-        subscripts, exp_avg, *[q for q in Q if q is not None], *[q for q in new_qs if q is not None]
-    )
-    copy_stochastic_(exp_avg, exp_avg_new)
+    for r in exp_avg:
+        new = compiled_einsum(subscripts, r, *[q for q in Q if q is not None], *[q for q in new_qs if q is not None])
+        copy_stochastic_(r, new)
 
     for q, q_new in zip(Q, new_qs):
         if q is not None:
@@ -950,7 +953,8 @@ def update_preconditioner(grad, Q, GG, exp_avg, max_precond_dim, precondition_1d
     """
     update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
     if update_precond:
-        get_orthogonal_matrix_QR(GG, Q, exp_avg)
+        exp_avg = list_guard(exp_avg)
+        get_orthogonal_matrix_QR(GG, Q, *exp_avg)
 
 
 def init_preconditioner(grad, state, max_precond_dim, precondition_1d):

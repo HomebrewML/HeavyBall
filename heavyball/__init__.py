@@ -731,7 +731,7 @@ class ForeachSOLP(C.BaseOpt):
             gradient_clipping,
             update_clipping,
             palm,  #
-            fns=(functools.partial(C.scale_by_soap, inner="laprop"),),
+            fns=(C.scale_by_soap_laprop,),
         )
 
 
