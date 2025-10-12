@@ -109,6 +109,11 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+def _init_mu_product(state, group, update, grad, param, **kwargs):
+    dtype = _storage_dtype(group)
+    state["mu_product"] = torch.ones((), dtype=dtype, device=param.device)
+
+
 class ZeroGuard(FunctionTransform):
     def __init__(self, fn, names):
         super().__init__(fn, names)
@@ -354,6 +359,51 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
+@no_state
+def scale_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
+    utils.nadam_(
+        param,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        update,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"],
+        group["momentum_decay"],
+        group["eps"],
+        group["weight_decay"],
+        group.get("decoupled_weight_decay", False),
+    )
+    return update
+
+
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
+@no_state
+def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
+    utils.fused_nadam_(
+        param,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        update,
+        grad,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"],
+        group["lr"],
+        group["eps"],
+        group["momentum_decay"],
+        group["weight_decay"],
+        group.get("decoupled_weight_decay", False),
+        group["caution"],
+    )
+    raise SkipUpdate from None
+
+
+@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @no_state
 def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
     utils.fused_adam_(
@@ -1204,6 +1254,7 @@ _scale_to_update_map = {
     scale_by_psgd_lra.get_fn(): update_by_psgd_lra,  #
     scale_by_delayed_psgd_lra.get_fn(): update_by_delayed_psgd_lra,  #
     scale_by_adam.get_fn(): update_by_adam,  #
+    scale_by_nadam.get_fn(): update_by_nadam,  #
     scale_by_laprop.get_fn(): update_by_laprop,  #
     scale_by_adopt.get_fn(): update_by_adopt,  #
     scale_by_ademamix.get_fn(): update_by_ademamix,  #
@@ -1214,6 +1265,7 @@ _scale_to_update_map_inv = {
     update_by_psgd_lra.get_fn(): scale_by_psgd_lra,  #
     update_by_delayed_psgd_lra.get_fn(): scale_by_delayed_psgd_lra,  #
     update_by_adam.get_fn(): scale_by_adam,  #
+    update_by_nadam.get_fn(): scale_by_nadam,  #
     update_by_laprop.get_fn(): scale_by_laprop,  #
     update_by_adopt.get_fn(): scale_by_adopt,  #
     update_by_ademamix.get_fn(): scale_by_ademamix,  #

@@ -299,6 +299,79 @@ def beta_debias(beta, step):
     return 1 - (1 - beta) / (1 - beta**step)
 
 
+def _nadam_moments(beta1: Tensor, step: Tensor, momentum_decay: float) -> tuple[Tensor, Tensor]:
+    md = torch.as_tensor(momentum_decay, dtype=beta1.dtype, device=beta1.device)
+    base = torch.tensor(0.96, dtype=beta1.dtype, device=beta1.device)
+    step_f = step.to(beta1.dtype)
+    mu = beta1 * (1 - 0.5 * torch.pow(base, step_f * md))
+    mu_next = beta1 * (1 - 0.5 * torch.pow(base, (step_f + 1) * md))
+    return mu, mu_next
+
+
+def _nadam_prepare_weight_decay(
+    update: List[Tensor],
+    param: List[Tensor],
+    grad: List[Tensor] | None,
+    weight_decay: float,
+    decoupled: bool,
+) -> float:
+    if weight_decay == 0:
+        return 0.0
+    if decoupled:
+        return weight_decay
+    torch._foreach_add_(update, param, alpha=weight_decay)
+    if grad is not None:
+        torch._foreach_add_(grad, param, alpha=weight_decay)
+    return 0.0
+
+
+def _nadam_finish_weight_decay(
+    update: List[Tensor],
+    param: List[Tensor],
+    weight_decay: float,
+    decoupled: bool,
+) -> List[Tensor]:
+    if weight_decay != 0 and not decoupled:
+        decay_term = torch._foreach_mul(param, weight_decay)
+        update = torch._foreach_sub(update, decay_term)
+    return update
+
+
+def _nadam_compute_update(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    mu_product: List[Tensor],
+    update: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    eps: Tensor,
+    mu: Tensor,
+    mu_next: Tensor,
+) -> List[Tensor]:
+    exp_avg32 = _lerp(exp_avg, update, beta1)
+    beta2_corr = beta_debias(beta2, step)
+    denom = _compilable_exp_avg_sq_(exp_avg_sq, update, beta2_corr, eps, [None])
+    grad_hat = torch._foreach_div(update, denom)
+    exp_avg_hat = torch._foreach_div(exp_avg32, denom)
+
+    torch._foreach_mul_(mu_product, mu)
+    mu_product32 = promote(mu_product)
+    mu_t, mu_next_t = scalar_guard(mu, mu_next, mu_product32[0])
+
+    one = mu_t.new_ones(())
+    grad_scale = one - mu_t
+    grad_weights: List[Tensor] = []
+    exp_weights: List[Tensor] = []
+    for mp in mu_product32:
+        grad_weights.append(grad_scale / (one - mp))
+        exp_weights.append(mu_next_t / (one - mp * mu_next_t))
+
+    grad_component = torch._foreach_mul(grad_hat, grad_weights)
+    exp_component = torch._foreach_mul(exp_avg_hat, exp_weights)
+    return torch._foreach_add(grad_component, exp_component)
+
+
 def eps_sqrt(item, eps):
     return item.sqrt().clamp(min=eps)
 
@@ -1495,6 +1568,121 @@ def fused_adam_(
     y, exp_avg, exp_avg_sq, grad = list_guard(y, exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, lr, decay = scalar_guard(beta1, beta2, step, lr, decay, y[0])
     _fused_compilable_adam_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, decay, lr, eps, caution)
+
+
+def nadam_(
+    param: List[Tensor] | Tensor,
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    mu_product: List[Tensor] | Tensor,
+    update: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    momentum_decay: float,
+    eps: float,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+) -> List[Tensor]:
+    param, exp_avg, exp_avg_sq, mu_product, update = map(list_guard, (param, exp_avg, exp_avg_sq, mu_product, update))
+    if not param:
+        return update
+
+    beta1_t, beta2_t, step_t, eps_t = scalar_guard(beta1, beta2, step, eps, param[0])
+    weight_decay_val = float(weight_decay)
+
+    update32 = promote(update)
+    param32 = promote(param)
+
+    _nadam_prepare_weight_decay(update32, param32, None, weight_decay_val, decoupled_weight_decay)
+    mu_t, mu_next_t = _nadam_moments(beta1_t, step_t, momentum_decay)
+    update32 = _nadam_compute_update(
+        exp_avg, exp_avg_sq, mu_product, update32, beta1_t, beta2_t, step_t, eps_t, mu_t, mu_next_t
+    )
+    update32 = _nadam_finish_weight_decay(update32, param32, weight_decay_val, decoupled_weight_decay)
+
+    copy_stochastic_list_(update, update32)
+    return update
+
+
+@decorator_knowngood
+def _fused_compilable_nadam_(
+    param: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    mu_product: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    lr: Tensor,
+    eps: Tensor,
+    mu: Tensor,
+    mu_next: Tensor,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+    caution: bool,
+):
+    weight_decay_val = float(weight_decay)
+
+    update32 = promote(update)
+    grad32 = promote(grad)
+    param32 = promote(param)
+
+    decay = _nadam_prepare_weight_decay(update32, param32, grad32, weight_decay_val, decoupled_weight_decay)
+    update32 = _nadam_compute_update(exp_avg, exp_avg_sq, mu_product, update32, beta1, beta2, step, eps, mu, mu_next)
+    update32 = _nadam_finish_weight_decay(update32, param32, weight_decay_val, decoupled_weight_decay)
+
+    copy_stochastic_list_(update, update32)
+
+    decay_t = scalar_guard(decay, param[0])
+    _compilable_update_(param, update32, decay_t, lr, caution, grad32)
+
+
+def fused_nadam_(
+    param: List[Tensor] | Tensor,
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    mu_product: List[Tensor] | Tensor,
+    update: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    lr: float,
+    eps: float,
+    momentum_decay: float,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+    caution: bool,
+):
+    param, exp_avg, exp_avg_sq, mu_product, update, grad = list_guard(
+        param, exp_avg, exp_avg_sq, mu_product, update, grad
+    )
+    if not param:
+        return
+
+    beta1_t, beta2_t, step_t, lr_t, eps_t = scalar_guard(beta1, beta2, step, lr, eps, param[0])
+    mu_t, mu_next_t = _nadam_moments(beta1_t, step_t, momentum_decay)
+    _fused_compilable_nadam_(
+        param,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        update,
+        grad,
+        beta1_t,
+        beta2_t,
+        step_t,
+        lr_t,
+        eps_t,
+        mu_t,
+        mu_next_t,
+        weight_decay,
+        decoupled_weight_decay,
+        caution,
+    )
 
 
 @decorator_knowngood
