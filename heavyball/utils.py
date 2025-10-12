@@ -248,6 +248,53 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
     return new_grads
 
 
+def linear_warmup_scheduler(
+    step: int, alpha_end: float, alpha_start: float = 0.0, warmup: Optional[int] = None
+) -> float:
+    if warmup is None or warmup <= 0:
+        return alpha_end
+    if step < warmup:
+        a = step / float(warmup)
+        return (1.0 - a) * alpha_start + a * alpha_end
+    return alpha_end
+
+
+def linear_hl_warmup_scheduler(
+    step: int, beta_end: float, beta_start: float, warmup: Optional[int] = None, eps: float = 1e-8
+) -> float:
+    if warmup is None or warmup <= 0:
+        return beta_end
+
+    def half_life(beta: float) -> float:
+        return math.log(0.5) / math.log(beta + eps) - 1
+
+    def inv_half_life(t: float) -> float:
+        return math.pow(0.5, 1.0 / (t + 1.0))
+
+    if step < warmup:
+        a = step / float(warmup)
+        target = (1.0 - a) * half_life(beta_start) + a * half_life(beta_end)
+        beta = inv_half_life(target)
+        return min(max(beta, 0.0), 1.0 - eps)
+    return beta_end
+
+
+def _compute_ademamix_hparams(
+    betas: tuple[float, float, float],
+    step: int,
+    alpha: float,
+    beta3_warmup: Optional[int],
+    alpha_warmup: Optional[int],
+) -> tuple[float, float, float, float]:
+    if len(betas) != 3:
+        raise ValueError("AdEMAMix expects betas=(beta1, beta2, beta3).")
+    beta1, beta2, beta3_final = betas
+    step = int(step)
+    alpha_eff = linear_warmup_scheduler(step, alpha_end=alpha, alpha_start=0.0, warmup=alpha_warmup)
+    beta3_eff = linear_hl_warmup_scheduler(step, beta_end=beta3_final, beta_start=beta1, warmup=beta3_warmup)
+    return beta1, beta2, beta3_eff, alpha_eff
+
+
 def beta_debias(beta, step):
     return 1 - (1 - beta) / (1 - beta**step)
 
@@ -1444,6 +1491,142 @@ def fused_adam_(
     y, exp_avg, exp_avg_sq, grad = list_guard(y, exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, lr, decay = scalar_guard(beta1, beta2, step, lr, decay, y[0])
     _fused_compilable_adam_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, decay, lr, eps, caution)
+
+
+@decorator_knowngood
+def _compilable_ademamix_update_(
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    beta3: Tensor,
+    step: Tensor,
+    alpha: Tensor,
+    eps: Tensor,
+):
+    beta1 = beta_debias(beta1, step)
+    beta2 = beta_debias(beta2, step)
+
+    update32 = list(map(promote, update))
+    fast32 = _lerp(exp_avg_fast, update32, beta1)
+
+    beta3_val = float(beta3.item())
+    slow32 = list(map(promote, exp_avg_slow))
+    one_minus_beta3 = 1.0 - beta3_val
+    for slow, upd in zip(slow32, update32):
+        slow.mul_(beta3_val)
+        if one_minus_beta3 != 0:
+            slow.add_(upd, alpha=one_minus_beta3)
+    copy_stochastic_list_(exp_avg_slow, slow32)
+
+    denom = _compilable_exp_avg_sq_(exp_avg_sq, update32, beta2, eps, [None])
+
+    alpha_val = float(alpha.item())
+    slow_scaled = torch._foreach_mul(slow32, alpha_val)
+    mixed = torch._foreach_add(fast32, slow_scaled)
+    return torch._foreach_div(mixed, denom)
+
+
+@decorator_knowngood
+def _fused_compilable_ademamix_(
+    y: List[Tensor],
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    beta3: Tensor,
+    step: Tensor,
+    alpha: Tensor,
+    lr: Tensor,
+    eps: Tensor,
+    decay: Tensor,
+    caution: bool,
+):
+    grad32 = list(map(promote, grad))
+    update32 = _compilable_ademamix_update_(
+        exp_avg_fast, exp_avg_slow, exp_avg_sq, update, beta1, beta2, beta3, step, alpha, eps
+    )
+    _compilable_update_(y, update32, decay, lr, caution, grad32)
+
+
+def fused_ademamix_(
+    y: List[Tensor],
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    betas: tuple[float, float, float],
+    step: int,
+    lr: float,
+    eps: float,
+    decay: float,
+    alpha: float,
+    caution: bool,
+    beta3_warmup: Optional[int] = None,
+    alpha_warmup: Optional[int] = None,
+):
+    y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad = list_guard(
+        y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad
+    )
+    if not y:
+        return
+
+    ref = y[0]
+    beta1_f, beta2_f, beta3_f, alpha_f = _compute_ademamix_hparams(betas, step, alpha, beta3_warmup, alpha_warmup)
+    beta1_t, beta2_t, beta3_t, alpha_t, step_t, lr_t, eps_t, decay_t = scalar_guard(
+        beta1_f, beta2_f, beta3_f, alpha_f, step, lr, eps, decay, ref
+    )
+
+    _fused_compilable_ademamix_(
+        y,
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        update,
+        grad,
+        beta1_t,
+        beta2_t,
+        beta3_t,
+        step_t,
+        alpha_t,
+        lr_t,
+        eps_t,
+        decay_t,
+        caution,
+    )
+
+
+def ademamix_(
+    exp_avg_fast: List[Tensor] | Tensor,
+    exp_avg_slow: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    betas: tuple[float, float, float],
+    step: int,
+    eps: float,
+    alpha: float,
+    beta3_warmup: Optional[int] = None,
+    alpha_warmup: Optional[int] = None,
+):
+    exp_avg_fast, exp_avg_slow, exp_avg_sq, grad = list_guard(exp_avg_fast, exp_avg_slow, exp_avg_sq, grad)
+    if not grad:
+        return grad
+
+    ref = grad[0]
+    beta1_f, beta2_f, beta3_f, alpha_f = _compute_ademamix_hparams(betas, step, alpha, beta3_warmup, alpha_warmup)
+    beta1_t, beta2_t, beta3_t, alpha_t, step_t, eps_t = scalar_guard(beta1_f, beta2_f, beta3_f, alpha_f, step, eps, ref)
+
+    update32 = _compilable_ademamix_update_(
+        exp_avg_fast, exp_avg_slow, exp_avg_sq, grad, beta1_t, beta2_t, beta3_t, step_t, alpha_t, eps_t
+    )
+    copy_stochastic_list_(grad, update32)
+    return grad
 
 
 @decorator_knowngood

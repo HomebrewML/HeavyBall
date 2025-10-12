@@ -373,6 +373,46 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+@no_state
+def scale_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq):
+    return utils.ademamix_(
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        update,
+        group["betas"],
+        group["step"],
+        group["eps"],
+        group["alpha"],
+        group.get("beta3_warmup"),
+        group.get("alpha_warmup"),
+    )
+
+
+@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+@no_state
+def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq):
+    utils.fused_ademamix_(
+        param,
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        update,
+        grad,
+        group["betas"],
+        group["step"],
+        group["lr"],
+        group["eps"],
+        group["weight_decay"],
+        group["alpha"],
+        group["caution"],
+        group.get("beta3_warmup"),
+        group.get("alpha_warmup"),
+    )
+    raise SkipUpdate from None
+
+
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def scale_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
@@ -710,6 +750,40 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG, inner:
             utils.beta_debias(group["shampoo_beta"], group["step"]),
             group["is_preconditioning"],
         )
+    return precond
+
+
+@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.ademamix_(
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        grad_projected,
+        group["betas"],
+        group["step"] - 1,
+        group["eps"],
+        group["alpha"],
+        group.get("beta3_warmup"),
+        group.get("alpha_warmup"),
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+
+    for u, q, gg, exp_fast in zip(update, Q, GG, exp_avg_fast):
+        utils.update_preconditioner(
+            utils.promote(u),
+            q,
+            gg,
+            exp_fast,
+            group["max_precond_dim"],
+            group["precondition_1d"],
+            utils.beta_debias(group["shampoo_beta"], group["step"]),
+            group["is_preconditioning"],
+        )
+
     return precond
 
 
@@ -1127,6 +1201,7 @@ _scale_to_update_map = {
     scale_by_adam.get_fn(): update_by_adam,  #
     scale_by_laprop.get_fn(): update_by_laprop,  #
     scale_by_adopt.get_fn(): update_by_adopt,  #
+    scale_by_ademamix.get_fn(): update_by_ademamix,  #
 }
 _scale_to_update_map_inv = {
     update_by_delayed_psgd.get_fn(): scale_by_delayed_psgd,  #
@@ -1136,6 +1211,7 @@ _scale_to_update_map_inv = {
     update_by_adam.get_fn(): scale_by_adam,  #
     update_by_laprop.get_fn(): scale_by_laprop,  #
     update_by_adopt.get_fn(): scale_by_adopt,  #
+    update_by_ademamix.get_fn(): scale_by_ademamix,  #
 }
 
 
