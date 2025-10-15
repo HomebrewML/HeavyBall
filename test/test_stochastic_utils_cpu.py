@@ -4,7 +4,14 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
 import torch
 
-from heavyball.utils import copy_stochastic_, stochastic_add_, stochastic_divide_with_eps_
+from heavyball.utils import (
+    DivisionBackend,
+    available_division_backends,
+    copy_stochastic_,
+    stochastic_add_,
+    stochastic_divide_,
+    stochastic_divide_with_eps_,
+)
 
 
 def _average_stochastic_round(source: torch.Tensor, trials: int = 512) -> torch.Tensor:
@@ -47,3 +54,29 @@ def test_stochastic_divide_with_eps_matches_float_result():
     stochastic_divide_with_eps_(result, denominator, eps=1e-3)
     expected = numerator.float() / (denominator.float() + 1e-3)
     assert torch.allclose(result.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_stochastic_divide_backend_atan2_matches_torch_result():
+    torch.manual_seed(0x1337)
+    numerator = torch.randn(8, dtype=torch.float32)
+    denominator = torch.randn(8, dtype=torch.float32).clamp_min_(0.1)
+    result = numerator.clone()
+
+    stochastic_divide_(result, denominator, backend=DivisionBackend.atan2)
+    expected = torch.atan2(numerator, denominator)
+    assert torch.allclose(result, expected)
+
+
+def test_stochastic_divide_backend_set_to_nan_zeroes_invalid_entries():
+    numerator = torch.tensor([1.0, 0.5, -2.0], dtype=torch.float32)
+    denominator = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+    result = numerator.clone()
+
+    stochastic_divide_(result, denominator, backend=DivisionBackend.nan_to_0)
+    expected = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+    assert torch.equal(result, expected)
+
+
+def test_available_division_backends_is_in_sync_with_enum():
+    names = available_division_backends()
+    assert set(names) == {backend.value for backend in DivisionBackend}

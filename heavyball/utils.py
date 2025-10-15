@@ -36,6 +36,35 @@ class OrthoScaleMode(enum.Enum):
     graft = "graft"
 
 
+class DivisionBackend(str, enum.Enum):
+    eps_add = "eps_add"
+    eps_clamp = "eps_clamp"
+    atan2 = "atan2"
+    nan_to_0 = "nan_to_0"
+
+    @classmethod
+    def default(cls) -> "DivisionBackend":
+        return cls.eps_clamp
+
+    @classmethod
+    def names(cls) -> Tuple[str, ...]:
+        return tuple(item.value for item in cls)
+
+
+DivisionBackendLike = Union[DivisionBackend, str, None]
+
+
+def _normalize_division_backend(backend: DivisionBackendLike) -> DivisionBackend:
+    if backend is None:
+        return DivisionBackend.default()
+    if isinstance(backend, DivisionBackend):
+        return backend
+    try:
+        return DivisionBackend(backend)
+    except ValueError as error:  # pragma: no cover - defensive
+        raise ValueError(f"Unknown division backend '{backend}'") from error
+
+
 compile_mode = "max-autotune-no-cudagraphs"
 dynamic = False
 compile_mode_recommended_to_none = None
@@ -949,18 +978,51 @@ def stochastic_multiply_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor):
     _compilable_stochastic_multiply_(x, y)
 
 
+def _apply_division_backend(x32: Tensor, y32: Tensor, eps: Tensor, backend: DivisionBackend) -> Tensor:
+    if backend is DivisionBackend.eps_add:
+        return x32 / (y32 + eps)
+    if backend is DivisionBackend.eps_clamp:
+        return x32 / y32.clamp(min=eps)
+    if backend is DivisionBackend.atan2:
+        return torch.atan2(x32, y32)
+    if backend is DivisionBackend.nan_to_0:
+        return torch.nan_to_num(torch.divide(x32, y32), nan=0.0, posinf=0.0, neginf=0.0)
+    raise AssertionError(f"Unhandled division backend: {backend}")
+
+
 @decorator_knowngood
-def _compilable_stochastic_divide_with_eps_(x: List[Tensor], y: List[Tensor], eps: Tensor):
+def _compilable_stochastic_divide_(x: List[Tensor], y: List[Tensor], eps: Tensor, backend: DivisionBackend):
     for x_, y_ in zip(x, y):
         x32 = promote(x_)
         y32 = promote(y_)
-        copy_stochastic_(x_, x32 / (y32 + eps))
+        copy_stochastic_(x_, _apply_division_backend(x32, y32, eps, backend))
 
 
-def stochastic_divide_with_eps_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, eps: float):
+def stochastic_divide_with_eps_(
+    x: List[Tensor] | Tensor,
+    y: List[Tensor] | Tensor,
+    eps: float,
+    *,
+    backend: DivisionBackendLike = DivisionBackend.eps_clamp,
+):
     x, y = broadcastable_list_guard(x, y)
     eps = scalar_guard(eps, y[0])
-    _compilable_stochastic_divide_with_eps_(x, y, eps)
+    backend_enum = _normalize_division_backend(backend)
+    _compilable_stochastic_divide_(x, y, eps, backend_enum)
+
+
+def stochastic_divide_(
+    x: List[Tensor] | Tensor,
+    y: List[Tensor] | Tensor,
+    *,
+    backend: DivisionBackendLike = DivisionBackend.eps_clamp,
+    eps: float = 1e-12,
+):
+    stochastic_divide_with_eps_(x, y, eps, backend=backend)
+
+
+def available_division_backends() -> Tuple[str, ...]:
+    return DivisionBackend.names()
 
 
 @decorator
