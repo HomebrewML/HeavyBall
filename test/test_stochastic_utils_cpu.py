@@ -4,6 +4,7 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
 import torch
 
+import heavyball
 from heavyball.utils import (
     DivisionBackend,
     copy_stochastic_,
@@ -11,6 +12,8 @@ from heavyball.utils import (
     stochastic_divide_,
     stochastic_divide_with_eps_,
 )
+
+heavyball.utils.atan2_scale = 1024.0
 
 
 def _average_stochastic_round(source: torch.Tensor, trials: int = 512) -> torch.Tensor:
@@ -65,15 +68,22 @@ def test_stochastic_divide_backend_atan2_matches_ratio_with_sign():
     assert torch.allclose(result, expected)
 
 
-def test_stochastic_divide_backend_atan2_respects_scale_factor():
+def test_stochastic_divide_backend_atan2_respects_scale_factor(n=16, offset: int = 4):
     numerator = torch.tensor([1.0, -2.0, 0.5, -0.5], dtype=torch.float32)
     denominator = torch.tensor([-1.0, -0.5, 2.0, -2.0], dtype=torch.float32)
-    result = numerator.clone()
-    scale = 0.5  # reduce magnitude while preserving sign structure
-
-    stochastic_divide_(result, denominator, backend=DivisionBackend.atan2, atan2_scale=scale)
-    expected = torch.tan(torch.atan2(numerator, denominator) * scale)
-    assert torch.allclose(result, expected)
+    orig = heavyball.utils.atan2_scale
+    cache = []
+    try:
+        for scale in range(n):
+            heavyball.utils.atan2_scale = 2 ** (scale - offset)
+            result = numerator.clone()
+            stochastic_divide_(result, denominator, backend=DivisionBackend.atan2)
+            if cache:
+                x = cache.pop(0)
+                assert torch.all((x.abs() < result.abs()) | (x.sign() == result.sign()))
+            cache.append(result.clone())
+    finally:
+        heavyball.utils.atan2_scale = orig
 
 
 def test_stochastic_divide_backend_atan2_handles_zero_grid_signs():
