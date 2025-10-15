@@ -201,30 +201,31 @@ def test_psgd_should_update_stochastic_schedule_uses_rng():
     assert calls == expected
 
 
-def test_stochastic_math_helpers_match_expected_results(n=32):
+def test_stochastic_math_helpers_match_expected_results(n=1024):
     torch.manual_seed(0x172893)
-    a = torch.arange(n)
-    b = torch.arange(n) ** 2
+    a = torch.arange(n).float()
+    b = 1 + torch.arange(n).float() ** 2
 
     c = a.clone()
     stochastic_add_(c, b, alpha=0.5)
-    assert torch.allclose(c, a + b)
+    assert torch.allclose(c.float(), a + b * 0.5)
 
     c = a.clone()
     stochastic_multiply_(c, b)
-    assert torch.allclose(c, a * b)
+    assert torch.allclose(c.float(), a * b)
 
     c = a.clone()
     stochastic_add_divide_(c, b, alpha=1.0, divisor=2.0)
-    assert torch.allclose(c, (a + b * 1) / 2)
+    assert torch.allclose(c.float(), (a + b * 1) / 2)
 
     orig = heavyball.utils.default_division_backend
     try:
+        heavyball.utils.atan2_scale = 1024
         for backend in heavyball.utils.DivisionBackend:
             heavyball.utils.default_division_backend = backend
             c = a.clone()
             stochastic_divide_with_eps_(c, b)
-            assert torch.allclose(c, a / b)
+            assert torch.allclose(c.float(), a / b), f"Backend {backend} failed"
     finally:
         heavyball.utils.default_division_backend = orig
 
