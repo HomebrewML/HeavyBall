@@ -20,6 +20,23 @@ from torch.backends import cudnn, opt_einsum
 from torch.nn import functional as F
 from torch.utils._pytree import tree_map
 
+compile_mode = "max-autotune-no-cudagraphs"
+dynamic = False
+compile_mode_recommended_to_none = None
+zeroth_power_mode = "newtonschulz"
+precise_zeroth_power_mode = "qr"
+tiny_bf16 = torch.finfo(torch.bfloat16).tiny
+_cudnn_double_backward_pattern = re.compile(
+    r"the derivative for .* is not implemented\. Double backwards .* To run double backwards"
+)
+_torch_compile_double_backward_pattern = re.compile(r"compile.*does not currently support double backward")
+_fd_error = (
+    "You can accelerate startup by globally enabling finite_differences first "
+    "(via opt.finite_differences=True or by subclassing it)\n"
+    "Original Error: "
+)
+default_division_backend = "eps_clamp"
+
 
 class ZerothPowerMode(enum.Enum):
     newtonschulz = "newtonschulz"
@@ -36,19 +53,11 @@ class OrthoScaleMode(enum.Enum):
     graft = "graft"
 
 
-class DivisionBackend(str, enum.Enum):
+class DivisionBackend(enum.Enum):
     eps_add = "eps_add"
     eps_clamp = "eps_clamp"
     atan2 = "atan2"
     nan_to_0 = "nan_to_0"
-
-    @classmethod
-    def default(cls) -> "DivisionBackend":
-        return cls.eps_clamp
-
-    @classmethod
-    def names(cls) -> Tuple[str, ...]:
-        return tuple(item.value for item in cls)
 
 
 DivisionBackendLike = Union[DivisionBackend, str, None]
@@ -56,30 +65,13 @@ DivisionBackendLike = Union[DivisionBackend, str, None]
 
 def _normalize_division_backend(backend: DivisionBackendLike) -> DivisionBackend:
     if backend is None:
-        return DivisionBackend.default()
+        return DivisionBackend(default_division_backend)
     if isinstance(backend, DivisionBackend):
         return backend
     try:
         return DivisionBackend(backend)
-    except ValueError as error:  # pragma: no cover - defensive
+    except ValueError as error:
         raise ValueError(f"Unknown division backend '{backend}'") from error
-
-
-compile_mode = "max-autotune-no-cudagraphs"
-dynamic = False
-compile_mode_recommended_to_none = None
-zeroth_power_mode = "newtonschulz"
-precise_zeroth_power_mode = "qr"
-tiny_bf16 = torch.finfo(torch.bfloat16).tiny
-_cudnn_double_backward_pattern = re.compile(
-    r"the derivative for .* is not implemented\. Double backwards .* To run double backwards"
-)
-_torch_compile_double_backward_pattern = re.compile(r"compile.*does not currently support double backward")
-_fd_error = (
-    "You can accelerate startup by globally enabling finite_differences first "
-    "(via opt.finite_differences=True or by subclassing it)\n"
-    "Original Error: "
-)
 
 
 def decorator(func):
@@ -1019,10 +1011,6 @@ def stochastic_divide_(
     eps: float = 1e-12,
 ):
     stochastic_divide_with_eps_(x, y, eps, backend=backend)
-
-
-def available_division_backends() -> Tuple[str, ...]:
-    return DivisionBackend.names()
 
 
 @decorator

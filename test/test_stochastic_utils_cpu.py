@@ -6,7 +6,6 @@ import torch
 
 from heavyball.utils import (
     DivisionBackend,
-    available_division_backends,
     copy_stochastic_,
     stochastic_add_,
     stochastic_divide_,
@@ -75,8 +74,3 @@ def test_stochastic_divide_backend_set_to_nan_zeroes_invalid_entries():
     stochastic_divide_(result, denominator, backend=DivisionBackend.nan_to_0)
     expected = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
     assert torch.equal(result, expected)
-
-
-def test_available_division_backends_is_in_sync_with_enum():
-    names = available_division_backends()
-    assert set(names) == {backend.value for backend in DivisionBackend}

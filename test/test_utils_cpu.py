@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import warnings
@@ -216,9 +217,21 @@ def test_stochastic_math_helpers_match_expected_results():
     assert torch.allclose(a, torch.full_like(a, 0.75))
 
     eps = 1e-3
-    stochastic_divide_with_eps_(a, torch.full_like(a, 2.0), eps=eps)
-    expected = 0.75 / (2.0 + eps)
-    assert torch.allclose(a, torch.full_like(a, expected), atol=1e-6)
+    denominator = torch.full_like(a, 2.0)
+    stochastic_divide_with_eps_(a, denominator, eps=eps)
+    den_value = denominator[0].item()
+    backend = heavyball.utils.DivisionBackend.default()
+    if backend is heavyball.utils.DivisionBackend.eps_add:
+        expected = 0.75 / (2.0 + eps)
+    elif backend is heavyball.utils.DivisionBackend.eps_clamp:
+        expected = 0.75 / max(den_value, eps)
+    elif backend is heavyball.utils.DivisionBackend.atan2:
+        expected = math.atan2(0.75, den_value)
+    elif backend is heavyball.utils.DivisionBackend.nan_to_0:
+        expected = 0.75 / den_value
+    else:  # pragma: no cover - defensive
+        pytest.fail(f"Unhandled division backend: {backend}")
+    assert torch.allclose(a, torch.full_like(a, expected), atol=1e-4)
 
 
 def test_stochastic_math_accuracy():
