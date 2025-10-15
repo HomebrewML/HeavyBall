@@ -304,6 +304,12 @@ def weight_decay_to_ema(group, update, grad, param, exp_avg):
     return update
 
 
+@no_state
+def cautious_weight_decay(group, update, grad, param):
+    utils.cautious_weight_decay_(param, update, group["cautious_weight_decay"] * group["lr"])
+    return update
+
+
 @zero_guard("exp_avg")
 @no_state
 def l1_weight_decay_to_ema(group, update, grad, param, exp_avg):

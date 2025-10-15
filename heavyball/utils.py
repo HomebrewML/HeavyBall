@@ -3190,6 +3190,18 @@ def l1_weight_decay_to_ema_(p, ema, ema_decay, weight_decay):
 
 
 @decorator_knowngood
+def _compilable_cautious_weight_decay_(p, update, weight_decay):
+    xs = [_compilable_cautioning(p_, u_) for p_, u_ in zip(p, update)]
+    stochastic_add_(p, xs, -weight_decay)
+
+
+def cautious_weight_decay_(p: list[Tensor], update: list[Tensor], weight_decay: float):
+    p, update = list_guard(p, update)
+    (weight_decay,) = scalar_guard(weight_decay, p[0])
+    _compilable_cautious_weight_decay_(p, update, weight_decay)
+
+
+@decorator_knowngood
 def _compilable_sign_(grad: List[Tensor], graft: bool):
     for g_ in grad:
         gs = g_.sign()
