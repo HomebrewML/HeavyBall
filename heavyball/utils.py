@@ -36,6 +36,7 @@ _fd_error = (
     "Original Error: "
 )
 default_division_backend = "eps_clamp"
+atan2_scale = 16.0
 
 
 class ZerothPowerMode(enum.Enum):
@@ -976,7 +977,7 @@ def _apply_division_backend(x32: Tensor, y32: Tensor, eps: Tensor, backend: Divi
     if backend is DivisionBackend.eps_clamp:
         return x32 / y32.clamp(min=eps)
     if backend is DivisionBackend.atan2:
-        return torch.atan2(x32, y32)
+        return torch.atan2(x32.abs() / atan2_scale, y32.abs()) * x32.sign() * y32.sign() * atan2_scale
     if backend is DivisionBackend.nan_to_0:
         return torch.nan_to_num(torch.divide(x32, y32), nan=0.0, posinf=0.0, neginf=0.0)
     raise AssertionError(f"Unhandled division backend: {backend}")
@@ -993,7 +994,7 @@ def _compilable_stochastic_divide_(x: List[Tensor], y: List[Tensor], eps: Tensor
 def stochastic_divide_with_eps_(
     x: List[Tensor] | Tensor,
     y: List[Tensor] | Tensor,
-    eps: float,
+    eps: float = 1e-6,
     *,
     backend: DivisionBackendLike = DivisionBackend.eps_clamp,
 ):

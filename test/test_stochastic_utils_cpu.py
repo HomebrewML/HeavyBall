@@ -55,15 +55,38 @@ def test_stochastic_divide_with_eps_matches_float_result():
     assert torch.allclose(result.float(), expected, atol=2e-2, rtol=2e-2)
 
 
-def test_stochastic_divide_backend_atan2_matches_torch_result():
-    torch.manual_seed(0x1337)
-    numerator = torch.randn(8, dtype=torch.float32)
-    denominator = torch.randn(8, dtype=torch.float32).clamp_min_(0.1)
+def test_stochastic_divide_backend_atan2_matches_ratio_with_sign():
+    numerator = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+    denominator = torch.tensor([-1.0, 1.0, -0.5], dtype=torch.float32)
     result = numerator.clone()
 
     stochastic_divide_(result, denominator, backend=DivisionBackend.atan2)
-    expected = torch.atan2(numerator, denominator)
+    expected = numerator / denominator
     assert torch.allclose(result, expected)
+
+
+def test_stochastic_divide_backend_atan2_respects_scale_factor():
+    numerator = torch.tensor([1.0, -2.0, 0.5, -0.5], dtype=torch.float32)
+    denominator = torch.tensor([-1.0, -0.5, 2.0, -2.0], dtype=torch.float32)
+    result = numerator.clone()
+    scale = 0.5  # reduce magnitude while preserving sign structure
+
+    stochastic_divide_(result, denominator, backend=DivisionBackend.atan2, atan2_scale=scale)
+    expected = torch.tan(torch.atan2(numerator, denominator) * scale)
+    assert torch.allclose(result, expected)
+
+
+def test_stochastic_divide_backend_atan2_handles_zero_grid_signs():
+    a = torch.arange(3, dtype=torch.float32) - 1
+    numerator = a[:, None].expand(-1, a.numel()).reshape(-1).clone()
+    denominator = a[None, :].expand(a.numel(), -1).reshape(-1).clone()
+    result = numerator.clone()
+
+    stochastic_divide_(result, denominator, backend=DivisionBackend.atan2)
+    expected = numerator / denominator
+
+    nonzero_mask = denominator != 0
+    assert torch.allclose(result[nonzero_mask], expected[nonzero_mask], atol=1e-5)
 
 
 def test_stochastic_divide_backend_set_to_nan_zeroes_invalid_entries():

@@ -1,4 +1,3 @@
-import math
 import os
 import random
 import warnings
@@ -202,36 +201,32 @@ def test_psgd_should_update_stochastic_schedule_uses_rng():
     assert calls == expected
 
 
-def test_stochastic_math_helpers_match_expected_results():
+def test_stochastic_math_helpers_match_expected_results(n=32):
     torch.manual_seed(0x172893)
-    a = torch.zeros(4)
-    b = torch.ones(4)
+    a = torch.arange(n)
+    b = torch.arange(n) ** 2
 
-    stochastic_add_(a, b, alpha=0.5)
-    assert torch.allclose(a, torch.full_like(a, 0.5))
+    c = a.clone()
+    stochastic_add_(c, b, alpha=0.5)
+    assert torch.allclose(c, a + b)
 
-    stochastic_multiply_(a, b)
-    assert torch.allclose(a, torch.full_like(a, 0.5))
+    c = a.clone()
+    stochastic_multiply_(c, b)
+    assert torch.allclose(c, a * b)
 
-    stochastic_add_divide_(a, b, alpha=1.0, divisor=2.0)
-    assert torch.allclose(a, torch.full_like(a, 0.75))
+    c = a.clone()
+    stochastic_add_divide_(c, b, alpha=1.0, divisor=2.0)
+    assert torch.allclose(c, (a + b * 1) / 2)
 
-    eps = 1e-3
-    denominator = torch.full_like(a, 2.0)
-    stochastic_divide_with_eps_(a, denominator, eps=eps)
-    den_value = denominator[0].item()
-    backend = heavyball.utils.DivisionBackend.default()
-    if backend is heavyball.utils.DivisionBackend.eps_add:
-        expected = 0.75 / (2.0 + eps)
-    elif backend is heavyball.utils.DivisionBackend.eps_clamp:
-        expected = 0.75 / max(den_value, eps)
-    elif backend is heavyball.utils.DivisionBackend.atan2:
-        expected = math.atan2(0.75, den_value)
-    elif backend is heavyball.utils.DivisionBackend.nan_to_0:
-        expected = 0.75 / den_value
-    else:  # pragma: no cover - defensive
-        pytest.fail(f"Unhandled division backend: {backend}")
-    assert torch.allclose(a, torch.full_like(a, expected), atol=1e-4)
+    orig = heavyball.utils.default_division_backend
+    try:
+        for backend in heavyball.utils.DivisionBackend:
+            heavyball.utils.default_division_backend = backend
+            c = a.clone()
+            stochastic_divide_with_eps_(c, b)
+            assert torch.allclose(c, a / b)
+    finally:
+        heavyball.utils.default_division_backend = orig
 
 
 def test_stochastic_math_accuracy():
