@@ -647,33 +647,31 @@ def _scion_bias_rms_direction(x: Tensor, eps: float = 1e-8) -> Tensor:
     if x.ndim == 0:
         return x / x.abs().clamp(min=eps)
     rms = x.square().mean(dim=0, keepdim=True).sqrt()
-    return x / (rms + eps)
+    stochastic_divide_(x, rms, eps=eps)
+    return x
 
 
-def _scion_spectral_direction(x: Tensor, steps: int = 5) -> Tensor:
+def _scion_spectral_direction(x: Tensor) -> Tensor:
     flat = x.reshape(x.shape[0], -1)
-    normalized = zeropower_via_newtonschulz5(flat, steps).view_as(x)
+    inplace_orthogonal_(flat)
+    normalized = flat.reshape_as(x)
     in_dim = max(flat.shape[1], 1)
     scale = math.sqrt(x.shape[0] / in_dim)
     return normalized * scale
 
 
-def _scion_spectral_conv_direction(x: Tensor, steps: int = 5) -> Tensor:
+def _scion_spectral_conv_direction(x: Tensor) -> Tensor:
     flat = x.reshape(x.shape[0], -1)
-    normalized = zeropower_via_newtonschulz5(flat, steps).view_as(x)
+    inplace_orthogonal_(flat)
+    normalized = flat.reshape_as(x)
     out_channels, in_channels = x.shape[:2]
     spatial = math.prod(x.shape[2:]) if x.ndim > 2 else 1
     scale = math.sqrt(out_channels / max(in_channels, 1)) / max(spatial, 1)
     return normalized * scale
 
 
-def scion_auto_lmo_(update: List[Tensor] | Tensor, scale: Union[float, Tensor]):
-    update = list_guard(update)
-    if not update:
-        return update
-
-    scale_tensor = scalar_guard(scale, update[0])
-
+@decorator_knowngood
+def _compilable_scion_lmo_(update: List[Tensor] | Tensor, scale: Tensor):
     for tensor in update:
         promoted = promote(tensor)
         if promoted.ndim in (3, 4):
@@ -683,10 +681,18 @@ def scion_auto_lmo_(update: List[Tensor] | Tensor, scale: Union[float, Tensor]):
         else:
             direction = _scion_bias_rms_direction(promoted)
 
-        scale_value = scale_tensor.to(dtype=direction.dtype, device=direction.device)
+        scale_value = scale.to(dtype=direction.dtype, device=direction.device)
         direction = direction * scale_value
         copy_stochastic_(tensor, direction)
 
+
+def scion_auto_lmo_(update: List[Tensor] | Tensor, scale: Union[float, Tensor]):
+    update = list_guard(update)
+    if not update:
+        return update
+
+    scale_tensor = scalar_guard(scale, update[0])
+    _compilable_scion_lmo_(update, scale_tensor)
     return update
 
 
