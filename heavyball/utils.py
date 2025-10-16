@@ -4,6 +4,7 @@ import enum
 import functools
 import gc
 import inspect
+import itertools
 import math
 import pickle
 import random
@@ -640,6 +641,84 @@ def legacy_zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     if G.size(0) > G.size(1):
         x = x.T
     return x.to(G.dtype)
+
+
+def _scion_bias_rms_direction(x: Tensor, eps: float = 1e-8) -> Tensor:
+    if x.ndim == 0:
+        return x / x.abs().clamp(min=eps)
+    rms = x.square().mean(dim=0, keepdim=True).sqrt()
+    return x / (rms + eps)
+
+
+def _scion_spectral_direction(x: Tensor, steps: int = 5) -> Tensor:
+    flat = x.reshape(x.shape[0], -1)
+    normalized = zeropower_via_newtonschulz5(flat, steps).view_as(x)
+    in_dim = max(flat.shape[1], 1)
+    scale = math.sqrt(x.shape[0] / in_dim)
+    return normalized * scale
+
+
+def _scion_spectral_conv_direction(x: Tensor, steps: int = 5) -> Tensor:
+    flat = x.reshape(x.shape[0], -1)
+    normalized = zeropower_via_newtonschulz5(flat, steps).view_as(x)
+    out_channels, in_channels = x.shape[:2]
+    spatial = math.prod(x.shape[2:]) if x.ndim > 2 else 1
+    scale = math.sqrt(out_channels / max(in_channels, 1)) / max(spatial, 1)
+    return normalized * scale
+
+
+def scion_auto_lmo_(update: List[Tensor] | Tensor, scale: Union[float, Tensor]):
+    update = list_guard(update)
+    if not update:
+        return update
+
+    scale_tensor = scalar_guard(scale, update[0])
+
+    for tensor in update:
+        promoted = promote(tensor)
+        if promoted.ndim in (3, 4):
+            direction = _scion_spectral_conv_direction(promoted)
+        elif promoted.ndim == 2:
+            direction = _scion_spectral_direction(promoted)
+        else:
+            direction = _scion_bias_rms_direction(promoted)
+
+        scale_value = scale_tensor.to(dtype=direction.dtype, device=direction.device)
+        direction = direction * scale_value
+        copy_stochastic_(tensor, direction)
+
+    return update
+
+
+def scion_auto_init_param_(param: Tensor, scale: Union[float, Tensor]):
+    scale_tensor = scalar_guard(scale, param)
+    promoted = promote(param)
+
+    if param.ndim in (3, 4):
+        init = promoted.clone()
+        init_fp64 = init.double()
+        spatial_dims = [range(size) for size in init_fp64.shape[2:]]
+        for idx in itertools.product(*spatial_dims):
+            torch.nn.init.orthogonal_(init_fp64[(slice(None), slice(None), *idx)])
+        out_channels, in_channels = init_fp64.shape[:2]
+        spatial = math.prod(init_fp64.shape[2:]) if init_fp64.ndim > 2 else 1
+        scale_val = math.sqrt(out_channels / max(in_channels, 1)) / max(spatial, 1)
+        init_fp64.mul_(scale_val)
+        init = init_fp64.to(dtype=init.dtype)
+    elif param.ndim == 2:
+        init = promoted.clone()
+        init_fp64 = init.double()
+        torch.nn.init.orthogonal_(init_fp64)
+        out_dim, in_dim = init_fp64.shape
+        scale_val = math.sqrt(out_dim / max(in_dim, 1))
+        init_fp64.mul_(scale_val)
+        init = init_fp64.to(dtype=init.dtype)
+    else:
+        init = promoted.clone()
+        torch.nn.init.zeros_(init)
+
+    init.mul_(scale_tensor.to(dtype=init.dtype, device=init.device))
+    copy_stochastic_(param, init.to(dtype=param.dtype, device=param.device))
 
 
 @decorator_knowngood

@@ -771,6 +771,21 @@ def heavyball_momentum(group, updates, grads, params, momentum):
     return utils.heavyball_momentum(momentum, updates, utils.get_beta1(group))
 
 
+def _init_scion_state(state, group, update, grad, param):
+    state["scion_state"] = {"initialized": False}
+
+
+@general_guard("scion_state", init_fn=_init_scion_state, skip_first=False)
+@no_state
+def scion_auto_norm(group, update, grad, param, scion_state):
+    scale = group.get("scale", 1.0)
+    for ctx, p in zip(scion_state, param):
+        if not ctx["initialized"]:
+            utils.scion_auto_init_param_(p, scale)
+            ctx["initialized"] = True
+    return utils.scion_auto_lmo_(update, scale)
+
+
 def _init_soap(state, group, update, grad, param):
     utils.init_preconditioner(grad, state, group["max_precond_dim"], group["precondition_1d"])
 

@@ -200,6 +200,53 @@ class SUDSAdamW(C.BaseOpt):
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
 
 
+class Scion(C.BaseOpt):
+    def __init__(
+        self,
+        params,
+        lr: float = 0.0025,
+        betas: tuple[float, float] = (0.9, 0.99),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        warmup_steps: int = 0,
+        foreach: bool = True,
+        storage_dtype: str = "float32",
+        mars: bool = False,
+        caution: bool = False,
+        mars_gamma: float = 0.0025,
+        gradient_clipping: C.str_or_fn = C.use_default,
+        update_clipping: C.str_or_fn = C.use_default,
+        scale: float = 1.0,
+        momentum: Optional[float] = None,
+        **kwargs,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if len(betas) == 0 and momentum is None:
+            raise ValueError("Scion expects at least one beta or an explicit momentum.")
+
+        beta1 = momentum if momentum is not None else betas[0]
+        if not 0 <= beta1 <= 1:
+            raise ValueError(f"Invalid momentum value: {beta1}")
+        beta2 = betas[1] if len(betas) > 1 else beta1
+
+        defaults = locals()
+        defaults.pop("self")
+        params = defaults.pop("params")
+        defaults.update(defaults.pop("kwargs"))
+
+        if kwargs:
+            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+
+        defaults["betas"] = (beta1, beta2)
+        defaults["scale"] = scale
+        defaults.pop("momentum", None)
+
+        super().__init__(
+            params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
+        )
+
+
 class ForeachAdamC(C.BaseOpt):
     def __init__(
         self,
