@@ -3271,6 +3271,7 @@ def _log_ulp(x):
 
 
 def _scale_by_exp2(x, log_scale):
+    # Split to avoid intermediate overflow when log_scale is large
     h = (log_scale / 2.0).floor()
     return (x * torch.exp2(h)) * torch.exp2(log_scale - h)
 
@@ -3315,6 +3316,13 @@ def apply_ecc(x_narrow, ecc, out):
     x_narrow, ecc, out = list_guard(x_narrow, ecc, out)
     smax = scalar_guard({torch.int8: 127.0, torch.int16: 32767.0}[ecc[0].dtype], out[0])
     _compilable_apply_ecc_(x_narrow, ecc, out, smax)
+
+
+def encode_ecc(fp32, primaries, ecc_out):
+    fp32, primaries, ecc_out = list_guard(fp32, primaries, ecc_out)
+    for p, f in zip(primaries, fp32):
+        p.copy_(f)
+    compute_ecc(fp32, primaries, ecc_out)
 
 
 @decorator_knowngood

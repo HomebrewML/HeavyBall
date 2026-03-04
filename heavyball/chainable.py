@@ -156,9 +156,7 @@ class ECCConfig:
             scales = [st[key + "::scales"] for st in states]
             utils.quantize_int8_ecc(fp32, primaries, scales, corrections, self.group_size, self.compand)
         else:
-            for p, f in zip(primaries, fp32):
-                p.copy_(f)
-            utils.compute_ecc(fp32, primaries, corrections)
+            utils.encode_ecc(fp32, primaries, corrections)
 
 
 def _init_mu_product(state, group, update, grad, param, **kwargs):
@@ -186,16 +184,34 @@ class ZeroGuard(FunctionTransform):
 
         states = [state(p) for p in param]
         names = [self.val_name(n) for n in self.names]
-        fp32_vars = []
-        for vn in names:
-            fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
-            ecc.decode([st[vn] for st in states], states, vn, fp32)
-            fp32_vars.append(fp32)
 
-        result = self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
+        if ecc.is_int8:
+            fp32_vars = []
+            for vn in names:
+                fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+                ecc.decode([st[vn] for st in states], states, vn, fp32)
+                fp32_vars.append(fp32)
+            try:
+                return self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
+            finally:
+                for vn, fp32 in zip(names, fp32_vars):
+                    ecc.encode(fp32, [st[vn] for st in states], states, vn)
 
-        for vn, fp32 in zip(names, fp32_vars):
-            ecc.encode(fp32, [st[vn] for st in states], states, vn)
+        primary_lists = [[st[vn] for st in states] for vn in names]
+        ecc_lists = [[st[vn + "::ecc"] for st in states] for vn in names]
+        fp32_vars = [[torch.empty_like(p, dtype=torch.float32) for p in param] for _ in names]
+        smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc_lists[0][0].dtype]
+        smax = utils.scalar_guard(smax, fp32_vars[0][0])
+        if isinstance(group.get("step"), int):
+            group["step"] = utils.scalar_guard(group["step"], fp32_vars[0][0])
+
+        try:
+            result = _ecc_fused_decode_compute(
+                self.fn, primary_lists, ecc_lists, fp32_vars, smax,
+                state, group, update, grad, param, *args, **kwargs)
+        finally:
+            for primaries, fp32, eccs in zip(primary_lists, fp32_vars, ecc_lists):
+                utils.compute_ecc(fp32, primaries, eccs)
 
         return result
 
@@ -1258,18 +1274,16 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
             fp32_backup = [p.data.float()]
             p.data = p.data.to(ecc.primary_dtype)
             ecc.encode(fp32_backup, [p.data], [st], "param")
-            # Update mapping: original key → bf16 key
             bf16_key = utils._tensor_key(p)
             if bf16_key != orig_key and orig_key in mapping:
                 mapping[bf16_key] = mapping.pop(orig_key)
 
-    # Decode params to fp32 so _inner_chain (including SkipUpdate functions) operates at full precision
     bf16_data = [p.data for p in param]
     bf16_keys = [utils._tensor_key(p) for p in param]
     fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
     ecc.decode(bf16_data, states, "param", fp32)
 
-    # Swap p.data to fp32, register temp keys so state_(p) still works
+    # Remap tensor keys so state_(p) resolves after data-pointer swap
     fp32_to_bf16 = {}
     for p, f, bf16_key in zip(param, fp32, bf16_keys):
         p.data = f
@@ -1284,7 +1298,6 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         utils.update_param_(param, update, group["lr"], group["weight_decay"],
                             caution=group["caution"], grad=grad)
 
-    # Encode fp32 back to ECC, restore reduced-precision storage and mapping
     fp32 = [p.data for p in param]
     for p, b in zip(param, bf16_data):
         p.data = b
@@ -1416,6 +1429,27 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
 
 def default(a, b):
     return b if a is use_default else a
+
+
+_ecc_fused_cache = {}
+
+
+def _ecc_fused_decode_compute(fn, primary_lists, ecc_lists, fp32_lists, smax,
+                              state, group, update, grad, param, *args, **kwargs):
+    key = id(fn)
+    if key not in _ecc_fused_cache:
+        def _impl(p_ls, e_ls, f_ls, s, _st, _gr, _up, _gd, _pa, *a, **kw):
+            for p_l, e_l, f_l in zip(p_ls, e_ls, f_ls):
+                utils._compilable_apply_ecc_(p_l, e_l, f_l, s)
+            result = fn(_st, _gr, _up, _gd, _pa, *a, *f_ls, **kw)
+            for p_l, f_l in zip(p_ls, f_ls):
+                for p, f in zip(p_l, f_l):
+                    p.copy_(f)
+            return result
+        _ecc_fused_cache[key] = utils.decorator_knowngood(_impl)
+    return _ecc_fused_cache[key](
+        primary_lists, ecc_lists, fp32_lists, smax,
+        state, group, update, grad, param, *args, **kwargs)
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
