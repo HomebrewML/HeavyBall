@@ -1239,27 +1239,58 @@ def _inner_chain(state, group, update, grad, param, *fns):
 
 def chain(state: Union[callable, dict], group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
-    update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
-    if skip_update or update is None:
-        return
 
     ecc = ECCConfig.from_group(group, key="param_ecc")
     if ecc is None:
+        update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+        if skip_update or update is None:
+            return
         utils.update_param_(param, update, group["lr"], group["weight_decay"],
                             caution=group["caution"], grad=grad)
         return
 
+    mapping = state.__self__.mapping_inverse
     states = [state(p) for p in param]
-    for st, p in zip(states, param):
+    orig_keys = [utils._tensor_key(p) for p in param]
+    for st, p, orig_key in zip(states, param, orig_keys):
         if "param::ecc" not in st:
             ecc.init_state(st, "param", p)
             fp32_backup = [p.data.float()]
             p.data = p.data.to(ecc.primary_dtype)
             ecc.encode(fp32_backup, [p.data], [st], "param")
+            # Update mapping: original key → bf16 key
+            bf16_key = utils._tensor_key(p)
+            if bf16_key != orig_key and orig_key in mapping:
+                mapping[bf16_key] = mapping.pop(orig_key)
+
+    # Decode params to fp32 so _inner_chain (including SkipUpdate functions) operates at full precision
+    bf16_data = [p.data for p in param]
+    bf16_keys = [utils._tensor_key(p) for p in param]
     fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
-    ecc.decode([p.data for p in param], states, "param", fp32)
-    utils.update_param_(fp32, update, group["lr"], group["weight_decay"],
-                        caution=group["caution"], grad=grad)
+    ecc.decode(bf16_data, states, "param", fp32)
+
+    # Swap p.data to fp32, register temp keys so state_(p) still works
+    fp32_to_bf16 = {}
+    for p, f, bf16_key in zip(param, fp32, bf16_keys):
+        p.data = f
+        fp32_key = utils._tensor_key(p)
+        if fp32_key != bf16_key and bf16_key in mapping:
+            mapping[fp32_key] = mapping[bf16_key]
+            fp32_to_bf16[fp32_key] = bf16_key
+
+    update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+
+    if not skip_update and update is not None:
+        utils.update_param_(param, update, group["lr"], group["weight_decay"],
+                            caution=group["caution"], grad=grad)
+
+    # Encode fp32 back to ECC, restore reduced-precision storage and mapping
+    fp32 = [p.data for p in param]
+    for p, b in zip(param, bf16_data):
+        p.data = b
+    for fp32_key, bf16_key in fp32_to_bf16.items():
+        if fp32_key in mapping:
+            mapping[bf16_key] = mapping.pop(fp32_key)
     ecc.encode(fp32, [p.data for p in param], states, "param")
 
 
