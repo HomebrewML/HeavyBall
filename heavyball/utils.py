@@ -3243,6 +3243,120 @@ def a_law_compress(x, A=87.6):
     return x
 
 
+@decorator_knowngood
+def _compilable_softsign_compress_(x):
+    for x_ in x:
+        xa = promote(x_)
+        xa = 2.0 * xa / (1.0 + xa.abs())
+        copy_stochastic_(x_, xa)
+
+
+def softsign_compress(x):
+    x = list_guard(x)
+    _compilable_softsign_compress_(x)
+    return x
+
+
+_NUM_MANTISSA_BITS = {torch.float16: 10, torch.bfloat16: 7}
+_EXPONENT_BIAS = {torch.float16: 15, torch.bfloat16: 127}
+
+
+def _log_ulp(x):
+    m = _NUM_MANTISSA_BITS[x.dtype]
+    bias = _EXPONENT_BIAS[x.dtype]
+    exp = ((x.view(torch.int16) & 0x7FFF) >> m)
+    return torch.where(exp == 0,
+                       torch.tensor(1 - bias - m, device=x.device, dtype=torch.int32),
+                       exp.to(torch.int32) - (bias + m))
+
+
+def _scale_by_exp2(x, log_scale):
+    h = (log_scale / 2.0).floor()
+    return (x * torch.exp2(h)) * torch.exp2(log_scale - h)
+
+
+def _inv_softsign(x):
+    xa = x.abs()
+    return x.sign() * xa / (2.0 - xa)
+
+
+def _pad_groups(flat, group_size):
+    n = flat.numel()
+    pad = (-n) % group_size
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    return flat.reshape(-1, group_size), n
+
+
+@decorator_knowngood
+def _compilable_compute_ecc_(x32_list, xn_list, ecc_list, smax):
+    for x32, xn, ecc in zip(x32_list, xn_list, ecc_list):
+        e = x32 - xn.float()
+        ls = (_log_ulp(xn) - 1).float()
+        e_norm = _scale_by_exp2(e, -ls)
+        scaled = e_norm.clamp(-1.0, 1.0) * smax
+        ecc.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(ecc.dtype))
+
+
+@decorator_knowngood
+def _compilable_apply_ecc_(xn_list, ecc_list, out_list, smax):
+    for xn, ecc, out in zip(xn_list, ecc_list, out_list):
+        ls = (_log_ulp(xn) - 1).float()
+        out.copy_(xn.float() + _scale_by_exp2(ecc.float() / smax, ls))
+
+
+def compute_ecc(x_fp32, x_narrow, ecc_out):
+    x_fp32, x_narrow, ecc_out = list_guard(x_fp32, x_narrow, ecc_out)
+    smax = scalar_guard({torch.int8: 127.0, torch.int16: 32767.0}[ecc_out[0].dtype], x_fp32[0])
+    _compilable_compute_ecc_(x_fp32, x_narrow, ecc_out, smax)
+
+
+def apply_ecc(x_narrow, ecc, out):
+    x_narrow, ecc, out = list_guard(x_narrow, ecc, out)
+    smax = scalar_guard({torch.int8: 127.0, torch.int16: 32767.0}[ecc[0].dtype], out[0])
+    _compilable_apply_ecc_(x_narrow, ecc, out, smax)
+
+
+@decorator_knowngood
+def _compilable_quantize_int8_ecc_(x_list, q_list, s_list, c_list, group_size, compand):
+    for x, q, s, c in zip(x_list, q_list, s_list, c_list):
+        groups, n = _pad_groups(x.reshape(-1), group_size)
+        absmax = groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+        normed = groups / absmax
+        if compand:
+            normed = 2.0 * normed / (1.0 + normed.abs())
+        quantized = (normed * 127.0).round().clamp(-127, 127)
+        s_bf16 = absmax.squeeze(1).bfloat16()
+        deq = quantized / 127.0
+        if compand:
+            deq = _inv_softsign(deq)
+        residual = groups - deq * s_bf16.unsqueeze(1).float()
+        q.copy_(quantized.reshape(-1)[:n].to(torch.int8).view_as(q))
+        s.copy_(s_bf16.view_as(s))
+        c.copy_(residual.reshape(-1)[:n].bfloat16().view_as(c))
+
+
+@decorator_knowngood
+def _compilable_dequantize_int8_ecc_(q_list, s_list, c_list, out_list, group_size, compand):
+    for q, s, c, out in zip(q_list, s_list, c_list, out_list):
+        groups, n = _pad_groups(q.reshape(-1).float(), group_size)
+        deq = groups / 127.0
+        if compand:
+            deq = _inv_softsign(deq)
+        result = deq * s.reshape(-1, 1).float()
+        out.copy_((result.reshape(-1)[:n] + c.reshape(-1).float()).view_as(out))
+
+
+def quantize_int8_ecc(x, q_out, scales_out, corr_out, group_size=32, compand=False):
+    x, q_out, scales_out, corr_out = list_guard(x, q_out, scales_out, corr_out)
+    _compilable_quantize_int8_ecc_(x, q_out, scales_out, corr_out, group_size, compand)
+
+
+def dequantize_int8_ecc(q, scales, corr, out, group_size=32, compand=False):
+    q, scales, corr, out = list_guard(q, scales, corr, out)
+    _compilable_dequantize_int8_ecc_(q, scales, corr, out, group_size, compand)
+
+
 def identity(x):
     return x
 

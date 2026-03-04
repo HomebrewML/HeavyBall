@@ -109,6 +109,58 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+class ECCConfig:
+    __slots__ = ("primary_dtype", "corr_dtype", "is_int8", "group_size", "compand")
+
+    _MODES = {
+        "bf16+8": (torch.bfloat16, torch.int8, False),
+        "bf16+16": (torch.bfloat16, torch.int16, False),
+        "fp16+8": (torch.float16, torch.int8, False),
+        "fp16+16": (torch.float16, torch.int16, False),
+        "8+16": (torch.int8, torch.bfloat16, True),
+    }
+
+    def __init__(self, mode, group_size=32, compand=False):
+        self.primary_dtype, self.corr_dtype, self.is_int8 = self._MODES[mode]
+        self.group_size = group_size
+        self.compand = compand
+
+    @classmethod
+    def from_group(cls, group, key="ecc"):
+        mode = group.get(key)
+        if not mode:
+            return None
+        return cls(mode, group.get("ecc_group_size", 32), group.get("ecc_compand", False))
+
+    def init_state(self, state, key, ref):
+        _guard_in_state(state, key,
+                        lambda: torch.zeros_like(ref, dtype=self.primary_dtype, memory_format=torch.preserve_format))
+        _guard_in_state(state, key + "::ecc",
+                        lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format))
+        if self.is_int8:
+            ns = (ref.numel() + self.group_size - 1) // self.group_size
+            _guard_in_state(state, key + "::scales",
+                            lambda: torch.zeros(ns, dtype=torch.bfloat16, device=ref.device))
+
+    def decode(self, primaries, states, key, out):
+        corrections = [st[key + "::ecc"] for st in states]
+        if self.is_int8:
+            scales = [st[key + "::scales"] for st in states]
+            utils.dequantize_int8_ecc(primaries, scales, corrections, out, self.group_size, self.compand)
+        else:
+            utils.apply_ecc(primaries, corrections, out)
+
+    def encode(self, fp32, primaries, states, key):
+        corrections = [st[key + "::ecc"] for st in states]
+        if self.is_int8:
+            scales = [st[key + "::scales"] for st in states]
+            utils.quantize_int8_ecc(fp32, primaries, scales, corrections, self.group_size, self.compand)
+        else:
+            for p, f in zip(primaries, fp32):
+                p.copy_(f)
+            utils.compute_ecc(fp32, primaries, corrections)
+
+
 def _init_mu_product(state, group, update, grad, param, **kwargs):
     dtype = _storage_dtype(group)
     state["mu_product"] = torch.ones((), dtype=dtype, device=param.device)
@@ -119,11 +171,33 @@ class ZeroGuard(FunctionTransform):
         super().__init__(fn, names)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
+        ecc = ECCConfig.from_group(group)
         for name in self.names:
-            _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
+            vn = self.val_name(name)
+            if ecc is None:
+                _zero_guard(state, vn, param, _storage_dtype(group))
+            else:
+                ecc.init_state(state, vn, param)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
-        return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+        ecc = ECCConfig.from_group(group)
+        if ecc is None:
+            return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+
+        states = [state(p) for p in param]
+        names = [self.val_name(n) for n in self.names]
+        fp32_vars = []
+        for vn in names:
+            fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+            ecc.decode([st[vn] for st in states], states, vn, fp32)
+            fp32_vars.append(fp32)
+
+        result = self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
+
+        for vn, fp32 in zip(names, fp32_vars):
+            ecc.encode(fp32, [st[vn] for st in states], states, vn)
+
+        return result
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -1166,8 +1240,27 @@ def _inner_chain(state, group, update, grad, param, *fns):
 def chain(state: Union[callable, dict], group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
     update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
-    if not skip_update and update is not None:
-        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+    if skip_update or update is None:
+        return
+
+    ecc = ECCConfig.from_group(group, key="param_ecc")
+    if ecc is None:
+        utils.update_param_(param, update, group["lr"], group["weight_decay"],
+                            caution=group["caution"], grad=grad)
+        return
+
+    states = [state(p) for p in param]
+    for st, p in zip(states, param):
+        if "param::ecc" not in st:
+            ecc.init_state(st, "param", p)
+            fp32_backup = [p.data.float()]
+            p.data = p.data.to(ecc.primary_dtype)
+            ecc.encode(fp32_backup, [p.data], [st], "param")
+    fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+    ecc.decode([p.data for p in param], states, "param", fp32)
+    utils.update_param_(fp32, update, group["lr"], group["weight_decay"],
+                        caution=group["caution"], grad=grad)
+    ecc.encode(fp32, [p.data for p in param], states, "param")
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
@@ -1284,6 +1377,7 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
         "trust_region_clip_",
         "a_law_compress",
         "mu_law_compress",
+        "softsign_compress",
     ):
         raise ValueError(f"Clipping function {name} not found")
     return getattr(utils, name)
