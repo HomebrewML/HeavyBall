@@ -2,6 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/heavyball?color=blue)][pypi]
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)][license]
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/HomebrewML/HeavyBall)
 
 _High-performance, extensible, chainable optimizers for PyTorch._
 
