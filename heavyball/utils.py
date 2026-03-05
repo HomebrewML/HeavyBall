@@ -342,9 +342,13 @@ def _nadam_prepare_weight_decay(
         return 0.0
     if decoupled:
         return weight_decay
-    torch._foreach_add_(update, param, alpha=weight_decay)
     if grad is not None:
-        torch._foreach_add_(grad, param, alpha=weight_decay)
+        for u_, g_, p_ in zip(update, grad, param):
+            u_.add_(p_, alpha=weight_decay)
+            g_.add_(p_, alpha=weight_decay)
+    else:
+        for u_, p_ in zip(update, param):
+            u_.add_(p_, alpha=weight_decay)
     return 0.0
 
 
@@ -355,8 +359,7 @@ def _nadam_finish_weight_decay(
     decoupled: bool,
 ) -> List[Tensor]:
     if weight_decay != 0 and not decoupled:
-        decay_term = torch._foreach_mul(param, weight_decay)
-        update = torch._foreach_sub(update, decay_term)
+        update = [u_ - p_ * weight_decay for u_, p_ in zip(update, param)]
     return update
 
 
@@ -375,24 +378,20 @@ def _nadam_compute_update(
     exp_avg32 = _lerp(exp_avg, update, beta1)
     beta2_corr = beta_debias(beta2, step)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, update, beta2_corr, eps, [None])
-    grad_hat = torch._foreach_div(update, denom)
-    exp_avg_hat = torch._foreach_div(exp_avg32, denom)
 
-    torch._foreach_mul_(mu_product, mu)
+    for mp_ in mu_product:
+        mp_.mul_(mu)
     mu_product32 = promote(mu_product)
     mu_t, mu_next_t = scalar_guard(mu, mu_next, mu_product32[0])
-
     one = mu_t.new_ones(())
     grad_scale = one - mu_t
-    grad_weights: List[Tensor] = []
-    exp_weights: List[Tensor] = []
-    for mp in mu_product32:
-        grad_weights.append(grad_scale / (one - mp))
-        exp_weights.append(mu_next_t / (one - mp * mu_next_t))
 
-    grad_component = torch._foreach_mul(grad_hat, grad_weights)
-    exp_component = torch._foreach_mul(exp_avg_hat, exp_weights)
-    return torch._foreach_add(grad_component, exp_component)
+    out = []
+    for u_, e_, d_, mp_ in zip(update, exp_avg32, denom, mu_product32):
+        gw = grad_scale / (one - mp_)
+        ew = mu_next_t / (one - mp_ * mu_next_t)
+        out.append(u_ / d_ * gw + e_ / d_ * ew)
+    return out
 
 
 def eps_sqrt(item, eps):
@@ -404,7 +403,7 @@ def _compilable_exp_avg_sq_(
     state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor]
 ):
     g32 = promote(grad)
-    s32 = _lerp(state, torch._foreach_mul(g32, g32), beta2)
+    s32 = _lerp(state, [g_ * g_ for g_ in g32], beta2)
 
     denom = [eps_sqrt(d, eps) for d in s32]
 
@@ -425,8 +424,7 @@ def exp_avg_sq_(state, grad, beta2, eps, out=None):
 def _compilable_scale_by_exp_avg_sq_(state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor):
     g32 = promote(grad)
     denom = _compilable_exp_avg_sq_(state, g32, beta2, eps, [None])
-    out = torch._foreach_div(g32, denom)
-    copy_stochastic_list_(grad, out)
+    copy_stochastic_list_(grad, [g_ / d_ for g_, d_ in zip(g32, denom)])
 
 
 def scale_by_exp_avg_sq_(exp_avg_sq, grad, beta2, eps):
@@ -451,16 +449,10 @@ def scale_by_exp_avg_(state, grad, beta):
 
 @decorator_knowngood
 def _compilable_agc_(parameters: List[Tensor], gradients: List[Tensor], clip_val: float, minimum: float, eps: float):
-    p32, g32 = [list(map(promote, x)) for x in (parameters, gradients)]
-    p_norm = torch._foreach_norm(p32)
-    g_norm = torch._foreach_norm(g32)
-    p_norm = torch._foreach_maximum(p_norm, minimum)
-    g_norm = torch._foreach_maximum(g_norm, eps)
-    p_norm = torch._foreach_div(p_norm, g_norm)
-    p_norm = torch._foreach_mul(p_norm, clip_val)
-    p_norm = torch._foreach_minimum(p_norm, 1)
-    g32 = torch._foreach_mul(g32, p_norm)
-    copy_stochastic_list_(gradients, g32)
+    for param, grad in zip(parameters, gradients):
+        p32, g32 = promote(param), promote(grad)
+        scale = min(max(p32.norm(), minimum) / max(g32.norm(), eps) * clip_val, 1)
+        copy_stochastic_(grad, g32 * scale)
 
 
 def adaptive_gradient_clipping_(
@@ -729,21 +721,18 @@ def scion_auto_init_param_(param: Tensor, scale: Union[float, Tensor]):
 
 @decorator_knowngood
 def _compilable_heavyball_momentum_(state, grad, beta):
-    s32, g32 = [list(map(promote, x)) for x in (state, grad)]
-    s32 = torch._foreach_mul(s32, beta)
-    s32 = torch._foreach_add(s32, g32)
-    copy_stochastic_list_(state, s32)
-    copy_stochastic_list_(grad, s32)
+    for s_, g_ in zip(state, grad):
+        v = promote(s_) * beta + promote(g_)
+        copy_stochastic_(s_, v)
+        copy_stochastic_(g_, v)
 
 
 @decorator_knowngood
 def _compilable_nesterov_momentum_(state, grad, beta):
-    s32, g32 = [list(map(promote, x)) for x in (state, grad)]
-    s32 = torch._foreach_mul(s32, beta)
-    s32 = torch._foreach_add(s32, g32)
-    g32 = [g + s * beta for g, s in zip(g32, s32)]
-    copy_stochastic_list_(state, s32)
-    copy_stochastic_list_(grad, g32)
+    for s_, g_ in zip(state, grad):
+        v = promote(s_) * beta + promote(g_)
+        copy_stochastic_(s_, v)
+        copy_stochastic_(g_, promote(g_) + v * beta)
 
 
 def heavyball_momentum(state, grad, beta):
@@ -1418,7 +1407,9 @@ class StatefulOptimizer(torch.optim.Optimizer):
                         self.state_(p)["param_ema"] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
 
                 y, param_ema = zip(*[(p.data, self.state_(p)["param_ema"]) for p in active_p])
-                torch._foreach_lerp_(param_ema, y, weight=beta_debias(1 - self.ema_decay, k + 1))
+                w = beta_debias(1 - self.ema_decay, k + 1)
+                for ema_, y_ in zip(param_ema, y):
+                    ema_.lerp_(y_, w)
 
     def copy_emas_to_params(self):
         with torch.no_grad():
@@ -1607,8 +1598,7 @@ def _compilable_adam_(
     g32 = list(map(promote, grad))
     exp_avg32 = _lerp(exp_avg, g32, beta1)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, g32, beta2, eps, [None])
-    u32 = torch._foreach_div(exp_avg32, denom)
-    copy_stochastic_list_(grad, u32)
+    copy_stochastic_list_(grad, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)])
 
 
 def adam_(
@@ -1641,10 +1631,9 @@ def _compilable_unscaled_adam_(
 
     g32 = list(map(promote, grad))
     denom = _compilable_exp_avg_sq_(exp_avg_sq, g32, beta2, eps, [None])
-    g32 = torch._foreach_div(g32, denom)
+    g32 = [g_ / d_ for g_, d_ in zip(g32, denom)]
     exp_avg32 = _lerp(exp_avg, g32, beta1)
-    u32 = torch._foreach_mul(exp_avg32, denom)
-    copy_stochastic_list_(grad, u32)
+    copy_stochastic_list_(grad, [e_ * d_ for e_, d_ in zip(exp_avg32, denom)])
 
 
 def unscaled_adam_(
@@ -1683,8 +1672,7 @@ def _fused_compilable_adam_(
     u32, g32 = [list(map(promote, x)) for x in [update, grad]]
     exp_avg32 = _lerp(exp_avg, u32, beta1)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, u32, beta2, eps, [None])
-    u32 = torch._foreach_div(exp_avg32, denom)
-    _compilable_update_(y, u32, decay, lr, caution, g32)
+    _compilable_update_(y, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)], decay, lr, caution, g32)
 
 
 def fused_adam_(
@@ -1841,10 +1829,8 @@ def _compilable_ademamix_update_(
     fast32 = _lerp(exp_avg_fast, update32, beta1)
     slow32 = _lerp(exp_avg_slow, update32, beta3)
 
-    slow_scaled = torch._foreach_mul(slow32, alpha)
-    mixed = torch._foreach_add(fast32, slow_scaled)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, update32, beta2, eps, [None])
-    return torch._foreach_div(mixed, denom)
+    return [(f_ + s_ * alpha) / d_ for f_, s_, d_ in zip(fast32, slow32, denom)]
 
 
 @decorator_knowngood
@@ -1962,8 +1948,7 @@ def _compilable_laprop_(
 
     gp32 = list(map(promote, grad))
     denom = _compilable_exp_avg_sq_(exp_avg_sq, gp32, beta2, eps, [None])
-    gp32 = torch._foreach_div(gp32, denom)
-    gp32 = _lerp(exp_avg, gp32, beta1)
+    gp32 = _lerp(exp_avg, [g_ / d_ for g_, d_ in zip(gp32, denom)], beta1)
     copy_stochastic_list_(grad, gp32)
 
 
@@ -2002,8 +1987,7 @@ def _fused_compilable_laprop_(
 
     u32, gp32 = [list(map(promote, x)) for x in [update, grad]]
     denom = _compilable_exp_avg_sq_(exp_avg_sq, u32, beta2, eps, [None])
-    u32 = torch._foreach_div(u32, denom)
-    u32 = _lerp(exp_avg, u32, beta1)
+    u32 = _lerp(exp_avg, [u_ / d_ for u_, d_ in zip(u32, denom)], beta1)
     _compilable_update_(y, u32, decay, lr, caution, gp32)
 
 
@@ -2032,11 +2016,10 @@ def _fused_compilable_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2,
     _compilable_update_(y, u32, decay, lr, caution, g32)
 
     beta1 = beta_debias(beta1, step)
-    denom = [eps_sqrt(d, eps) for d in exp_avg_sq32]
-    stochastic_lerp_(exp_avg, torch._foreach_div(g32, denom), 1 - beta1)
+    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
 
     beta2 = beta_debias(beta2, step + 1)
-    stochastic_lerp_(exp_avg_sq, torch._foreach_mul(g32, g32), 1 - beta2)
+    stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
 
 
 def fused_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution):
@@ -2051,11 +2034,8 @@ def _compilable_adopt_(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps):
     update = [e.clone() for e in exp_avg]
 
     beta1 = beta_debias(beta1, step)
-    denom = [eps_sqrt(d, eps) for d in exp_avg_sq32]
-    stochastic_lerp_(exp_avg, torch._foreach_div(g32, denom), 1 - beta1)
-
-    stochastic_lerp_(exp_avg_sq, torch._foreach_mul(g32, g32), 1 - beta2)
-
+    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
+    stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
     copy_stochastic_list_(grad, update)
 
 
