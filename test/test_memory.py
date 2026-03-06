@@ -1,10 +1,13 @@
+import dataclasses
+
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import nn
 
 import heavyball
 from heavyball.utils import clean, set_torch
+
+heavyball.utils.compile_mode = 'default'
 
 
 def get_memory():
@@ -14,21 +17,25 @@ def get_memory():
     torch.cuda.synchronize()
     return torch.cuda.memory_allocated()
 
+@dataclasses.dataclass
+class Memory:
+    peak_compiled: float
+    peak_uncompiled: float
+    optimizer: float
+
+
 
 expected_memory = {
-    "adamw": {"after": 4, "peak": 5.1},
-    "soap": {"after": 7, "peak": 14},
-    "psgd": {"after": 4, "peak": 11.5},
+    "adamw": Memory(peak_compiled=4, peak_uncompiled=8, optimizer=2)
 }
 
 
-@pytest.mark.parametrize("opt", ["NewtonHybrid2PSGDKron"])
-@pytest.mark.parametrize("method", ["qr", "newtonschulz2", "svd", "eigh"])
 @pytest.mark.parametrize("size,depth", [(8192, 2), (2048, 16)])
-def test_memory(opt, method, size, depth: int, iterations: int = 5, outer_iterations: int = 3):
-    if "soap" not in opt.lower() and method != "qr":
-        raise pytest.skip("Only SOAP supports `method` argument")
+@pytest.mark.parametrize("compiled", [True, False])
+def test_memory(size, depth: int, compiled: bool, opt: str = "AdamW", iterations: int = 2, outer_iterations: int = 3):
     set_torch()
+
+    heavyball.utils.compile_mode = "default" if compiled else None
 
     for k, v in expected_memory.items():
         if k in opt.lower():
@@ -37,35 +44,33 @@ def test_memory(opt, method, size, depth: int, iterations: int = 5, outer_iterat
         raise pytest.skip(f"Opt {opt} not supported")
 
     opt = getattr(heavyball, opt)
-    heavyball.utils.zeroth_power_mode = method
+    heavyball.utils.zeroth_power_mode = "qr"
 
     for i in range(outer_iterations):
         model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-        print(model)
+        model_allocated = get_memory()
+        o = opt(model.parameters(), lr=1e-3)
+
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.reset_max_memory_allocated()
         torch.cuda.reset_max_memory_cached()
         torch.cuda.reset_accumulated_memory_stats()
 
-        model_allocated = get_memory()
-        o = get_optim(opt, model.parameters(), lr=1e-3)
         for _ in range(iterations):
-            data = torch.randn((1, size), device="cuda").requires_grad_(True)
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.grad = torch.randn_like(p, requires_grad=False)
+                o.step()
 
-            def _closure():
-                nonlocal model
-                loss = (model(data) - data).square().mean()
-                loss.backward()
-                return loss
-
-            o.step(_closure)
-
-            opt_allocated = get_memory()
+        opt_allocated = get_memory()
 
         del model, o
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
         print(f"Peak: {peak / model_allocated:.2f}x | Opt: {opt_allocated / model_allocated:.2f}x")
         if i > 0:
-            assert peak / model_allocated < v["peak"]
-            assert opt_allocated / model_allocated < v["after"]
+            peak -= model_allocated
+            opt_allocated -= model_allocated
+
+            assert peak / model_allocated < (v.peak_compiled if compiled else v.peak_uncompiled)
+            assert opt_allocated / model_allocated < v.optimizer

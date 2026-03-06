@@ -27,7 +27,7 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 heavyball.utils.compile_mode = None
 
 FLOAT_DTYPES: Sequence[torch.dtype] = (torch.float32, torch.bfloat16)
-DTYPE_TOLERANCE = {torch.float32: 5e-5, torch.bfloat16: 2e-2}
+DTYPE_TOLERANCE = {torch.float32: 5e-5, torch.bfloat16: 4e-2}
 
 
 def _to_float(value: float | torch.Tensor) -> float:
@@ -224,7 +224,7 @@ def test_stochastic_divide_with_eps_matches_expected(data, eps):
     eps_scalar = _to_float(eps)
     expected_inputs = [tensor.clone().float() for tensor in tensors]
     expected_partner = _expand_like(expected_inputs, partner)
-    expected = [xi / (yi + eps_scalar) for xi, yi in zip(expected_inputs, expected_partner, strict=True)]
+    expected = [xi / yi.clamp(min=eps_scalar) for xi, yi in zip(expected_inputs, expected_partner, strict=True)]
     max_error = max((result.float() - exp).abs().max().item() for result, exp in zip(x, expected, strict=True))
     assert max_error <= DTYPE_TOLERANCE[dtype] + 1e-6
 

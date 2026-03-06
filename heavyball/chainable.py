@@ -1242,6 +1242,7 @@ def apply_to_idx(fn, idx):
         args = [state, group, update, grad, param]
         return fn(args[idx])
 
+    _fn.__name__ = _fn.__qualname__ = f"apply_{getattr(fn, '__name__', repr(fn))}_to_{idx}"
     return _fn
 
 

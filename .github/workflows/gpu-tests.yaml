@@ -1,0 +1,106 @@
+name: GPU tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install requests
+        run: pip install requests
+      - name: Run GPU tests on vast.ai
+        id: tests
+        continue-on-error: true
+        env:
+          VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: python ci/gpu_tests.py
+      - name: Post results to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- gpu-tests -->';
+            let body = marker + '\n## GPU Test Results\n\n';
+
+            let results = [];
+            try {
+              results = JSON.parse(fs.readFileSync('gpu-test-results.json', 'utf8'));
+            } catch (e) {
+              body += '**Failed to retrieve test results.** Check the [workflow run](' +
+                `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` +
+                ') for details.\n';
+              await upsertComment(github, context, marker, body);
+              return;
+            }
+
+            const icon = {pass: ':white_check_mark:', fail: ':x:', error: ':warning:', timeout: ':hourglass:'};
+            const passed = results.filter(r => r.status === 'pass').length;
+            const total = results.length;
+            body += `**${passed}/${total} passed**\n\n`;
+            body += '| Test | Status | Duration |\n|------|--------|----------|\n';
+            for (const r of results.sort((a, b) => a.file.localeCompare(b.file))) {
+              body += `| \`${r.file}\` | ${icon[r.status] || r.status} | ${r.duration}s |\n`;
+            }
+
+            const failures = results.filter(r => r.status !== 'pass' && r.log);
+            if (failures.length > 0) {
+              body += '\n<details><summary>Failure details</summary>\n\n';
+              for (const r of failures) {
+                const log = r.log.length > 1500 ? '...' + r.log.slice(-1500) : r.log;
+                body += `#### \`${r.file}\`\n\`\`\`\n${log}\n\`\`\`\n\n`;
+              }
+              body += '</details>\n';
+            }
+
+            await upsertComment(github, context, marker, body);
+
+            async function upsertComment(github, context, marker, body) {
+              const {data: comments} = await github.rest.issues.listComments({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              const existing = comments.find(c => c.body.startsWith(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: existing.id, body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: context.issue.number, body,
+                });
+              }
+            }
+      - name: Destroy leaked instances
+        if: always()
+        env:
+          VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+        run: |
+          python -c "
+          import requests, os
+          key = os.environ.get('VASTAI_API_KEY', '')
+          if not key: exit()
+          r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'})
+          for inst in r.json().get('instances', []):
+              requests.delete(f'https://console.vast.ai/api/v0/instances/{inst[\"id\"]}/', params={'api_key': key})
+              print(f'Destroyed leaked instance {inst[\"id\"]}')
+          "
+      - name: Set exit code
+        if: steps.tests.outcome == 'failure'
+        run: exit 1

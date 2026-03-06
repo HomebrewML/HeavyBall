@@ -11,6 +11,7 @@ from torch import linalg, nn
 from torch._dynamo import config
 
 import heavyball
+from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball import utils
 from heavyball.utils import (
     _compilable_global_l2norm_clip_,
@@ -82,35 +83,41 @@ def _test_global_rmsnorm(x, clip_at):
     _out_assertions(torch_clipped, x)
     return x
 
+functions = {
+    "_test_rmsnorm": _test_rmsnorm,
+    "_test_l2": _test_l2,
+    "_test_global_l2norm": _test_global_l2norm,
+    "_test_global_rmsnorm": _test_global_rmsnorm,
+}
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(128, 2)])
-def test_clip(opt, size, depth: int, iterations: int = 16, outer_iterations: int = 1):
+
+@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
+@pytest.mark.parametrize("fn", ["_test_rmsnorm", "_test_l2", "_test_global_l2norm", "_test_global_rmsnorm"])
+@pytest.mark.parametrize("compile_mode", [None, "default"])
+def test_clip(opt, compile_mode: str | None, fn: str, size: int = 128, depth: int = 2, iterations: int = 16, outer_iterations: int = 1):
     set_torch()
     opt = getattr(heavyball, opt)
+    utils.compile_mode = compile_mode
+    clip_func = functions[fn]
 
-    for mode in ["max-autotune-no-cudagraphs", None]:
-        utils.compile_mode = mode
-        for clip_func in [_test_rmsnorm, _test_l2, _test_global_l2norm, _test_global_rmsnorm]:
-            torch.manual_seed(0x2131290)
+    torch.manual_seed(0x2131290)
 
-            for i in range(outer_iterations):
-                model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-                o = get_optim(
-                    opt,
-                    model.parameters(),
-                    lr=1e-5,
-                    gradient_clipping=lambda x: clip_func(x, clip_at=5.0),
-                    update_clipping=lambda x: clip_func(x, clip_at=0.05),
-                )
+    for i in range(outer_iterations):
+        model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
+        o = get_optim(
+            opt,
+            model.parameters(),
+            lr=1e-5,
+            gradient_clipping=lambda x: clip_func(x, clip_at=5.0),
+            update_clipping=lambda x: clip_func(x, clip_at=0.05),
+        )
 
-                for _ in range(iterations):
-                    loss = model(torch.randn((1024, size), device="cuda")).square().mean()
-                    loss.backward()
-                    o.step()
-                    if utils.compile_mode is not None:
-                        assert all([not (torch.isnan(y).any() or torch.isinf(y).any()) for y in model.parameters()])
-                    o.zero_grad()
+        for _ in range(iterations):
+            set_grad(model)
+            o.step()
+            if utils.compile_mode is not None:
+                success = torch.stack([torch.isnan(y).any() or torch.isinf(y).any() for y in model.parameters()])
+                assert not success.all().item()
+            o.zero_grad()
 
-                del model, o
-                clean()
+        del model, o

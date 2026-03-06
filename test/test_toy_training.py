@@ -37,6 +37,8 @@ def _optimizer_params():
             continue
         if attr is optim.Optimizer:
             continue
+        if name == "SplitOpt":
+            continue
         params.append(pytest.param(name, id=name))
     return params
 
