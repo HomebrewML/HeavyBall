@@ -365,6 +365,13 @@ class SkipUpdate(ValueError):
     pass
 
 
+@zero_guard("mars_old_grad")
+@no_state
+def mars(group, update, grad, param, mars_old_grad):
+    utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
+    return update
+
+
 @zero_guard("exp_avg")
 @no_state
 def exp_avg(group, update, grad, param, exp_avg):
@@ -1014,9 +1021,7 @@ def _update_psgd_precond(
     if isinstance(prob, float):
         float_prob = prob
     else:
-        prob_step = group.get(f"cumulative_prob_{id(Q)}_prob_step", 1)
-        float_prob = prob(prob_step)
-        group[f"cumulative_prob_{id(Q)}_prob_step"] = prob_step + 1
+        float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if precond is not None:
@@ -1377,7 +1382,7 @@ class ChainOpt(utils.StatefulOptimizer):
 
         caution = group["caution"]
 
-        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote, beta1=utils.get_beta1(group)))
+        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
 
         if not vals:
             return
@@ -1553,6 +1558,8 @@ class BaseOpt(ChainOpt):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
             fns = (apply_to_idx(gradient_clipping, 2),) + fns
+        if defaults.get("mars", False):
+            fns = (mars,) + fns
         if default(update_clipping, self.update_clipping) is not None:
             fns = fns + (apply_to_idx(update_clipping, 2),)
 

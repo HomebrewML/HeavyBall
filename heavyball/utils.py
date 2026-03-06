@@ -871,7 +871,7 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
 
     subscripts = f"{in_str},{from_shampoo},{to_shampoo}->{out_str}"
     for r in exp_avg:
-        new = compiled_einsum(subscripts, r, *[q for q in Q if q is not None], *[q for q in new_qs if q is not None])
+        new = compiled_einsum(subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None])
         copy_stochastic_(r, new)
 
     for q, q_new in zip(Q, new_qs):
@@ -1186,7 +1186,7 @@ def project(grad, Q, back: bool):
     preconditioners = ",".join([(g + g.upper())[:: -1 if back else 1] for m, g in zip(Q, param) if m is not None])
     if preconditioners:
         out = "".join([c.upper() if c.upper() in preconditioners else c for c in param])
-        out = compiled_einsum(f"{param},{preconditioners}->{out}", promote(grad), *[q for q in Q if q is not None])
+        out = compiled_einsum(f"{param},{preconditioners}->{out}", promote(grad), *[promote(q) for q in Q if q is not None])
         grad = out.to(grad.dtype)
     return grad
 
@@ -1315,14 +1315,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
             self.state[state_param] = collections.defaultdict(dict)
         return self.state[state_param][index]
 
-    def mars_correct_list(self, group, p_list, g_list, mars_gamma, beta):
-        for p, g in zip(p_list, g_list):
-            state = self.state_(p)
-            if "mars_old_grad" not in state:
-                state["mars_old_grad"] = torch.zeros_like(g)
-        old_gs = [self.state_(p)["mars_old_grad"] for p in p_list]
-        mars_correction(g_list, old_gs, mars_gamma, beta)
-
     def _init_mapping(self, group: dict | None = None):
         if group is None:
             for group in self.param_groups:
@@ -1340,7 +1332,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
         group: dict,
         skip_none: bool = True,
         should_promote: bool = True,
-        beta1: float = -1.0,
         raw: bool = False,
     ):
         for p in group["params"]:
@@ -1353,6 +1344,10 @@ class StatefulOptimizer(torch.optim.Optimizer):
             if raw:
                 yield p, grad
                 continue
+
+            if group.get("merge_dims", False) and p.data.ndim >= 4 and p.data.is_contiguous(memory_format=torch.channels_last):
+                p._restore_channels_last = True
+                p.data = p.data.contiguous()
 
             self.mapping[p] = p_views = merge_group(group, p)
             for i, pv in enumerate(p_views):
@@ -1370,8 +1365,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
             for pv, g, v, hv in zip(p_views, grad, vs, hvs):
                 g = promote_detach(g, should_promote)
-                if beta1 >= 0 and group.get("mars", False):
-                    self.mars_correct_list(group, [pv], [g], group["mars_gamma"], beta1)
                 pv.vector = promote_detach(v, should_promote)
                 pv.hessian_vector = promote_detach(hv, should_promote)
                 yield pv, g
@@ -1560,6 +1553,9 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 group["is_preconditioning"] = self._is_preconditioning
                 self._step(group)
                 for real, views in self.mapping.items():
+                    if getattr(real, '_restore_channels_last', False):
+                        real.data = real.data.to(memory_format=torch.channels_last)
+                        del real._restore_channels_last
                     for tensor in (real, *views):
                         for key in ("grad", "vector", "hessian_vector", "orig"):
                             if hasattr(tensor, key):
@@ -2383,7 +2379,7 @@ def update_lra_precond_(
     U, V, d = _lra_flatten_and_balance(U, V, d)
 
     dtype = min_dtype([U, V, vector, hessian_vector])
-    U, V, vector, hessian_vector = U.to(dtype), V.to(dtype), vector.to(dtype), hessian_vector.to(dtype)
+    U, V, d, vector, hessian_vector = U.to(dtype), V.to(dtype), d.to(dtype), vector.to(dtype), hessian_vector.to(dtype)
 
     eps = scalar_guard(eps, vector)
 
@@ -2637,12 +2633,12 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
         x = x / x_norm
 
         def _mv(x):
-            return promote(A.T.mv(A.mv(stochastic_round_(x))))
+            return promote(A.T.mv(A.mv(x.to(A.dtype))))
 
         for _ in range(iterations):
             # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
             x = F.normalize(_mv(x), dim=0)
-        out = (x @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
+        out = (promote(x) @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
         return out.squeeze().clone()
 
     return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
@@ -2731,9 +2727,9 @@ def min_singular_value(
 
     v = v / promote(v.norm())
     for _ in range(power_iter):
-        v = lambda_upper * v - promote(A.mv(stochastic_round_(v)))
+        v = lambda_upper * v - promote(A.mv(v.to(A.dtype)))
         v = v / promote(v.norm())
-    mu_hat = v @ (lambda_upper * v - promote(A.mv(stochastic_round_(v))))
+    mu_hat = promote(v) @ (lambda_upper * promote(v) - promote(A.mv(v.to(A.dtype))))
 
     lambda_min_hat = lambda_upper - mu_hat
 
@@ -2865,9 +2861,9 @@ def _psgd_default_preconditioner_grad(
         y = promote(y)
         update = x - y
         if q.ndim < 2:
-            update = q * update
+            update = promote(q) * update
         else:
-            update = (q @ update).triu()
+            update = (promote(q) @ update).triu()
         out.append(update)
     return out
 
