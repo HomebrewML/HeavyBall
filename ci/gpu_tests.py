@@ -9,8 +9,30 @@ import requests
 API_BASE = "https://console.vast.ai/api/v0"
 API_KEY = os.environ.get("VASTAI_API_KEY") or os.environ.get("VAST_AI_API_KEY", "")
 IMAGE = "ghcr.io/homebrewml/heavyball-ci:latest"
-REPO_URL = os.environ.get("REPO_URL", "https://github.com/HomebrewML/HeavyBall")
-BRANCH = os.environ.get("BRANCH", "main")
+
+
+def _detect_repo_and_branch():
+    repo = os.environ.get("REPO_URL")
+    branch = os.environ.get("BRANCH")
+    if repo and branch:
+        return repo, branch
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.isfile(event_path):
+        try:
+            with open(event_path) as f:
+                event = json.load(f)
+            head = event.get("pull_request", {}).get("head", {})
+            if not repo:
+                repo = head.get("repo", {}).get("clone_url")
+            if not branch:
+                branch = head.get("ref")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return (repo or "https://github.com/HomebrewML/HeavyBall",
+            branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "main"))
+
+
+REPO_URL, BRANCH = _detect_repo_and_branch()
 TIMEOUT = 1800
 POLL_INTERVAL = 60
 MAX_DPH = 0.20

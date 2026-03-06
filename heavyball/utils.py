@@ -1343,8 +1343,11 @@ class StatefulOptimizer(torch.optim.Optimizer):
         for p in group["params"]:
             if p not in self.mapping:
                 self.mapping[p] = p_views = merge_group(group, p)
+                p_key = _tensor_key(p)
                 for i, pv in enumerate(p_views):
                     self.mapping_inverse[_tensor_key(pv)] = (p, i)
+                if p_key not in self.mapping_inverse:
+                    self.mapping_inverse[p_key] = (p, 0)
 
     def split_p_and_g_in_group(
         self,
@@ -1365,9 +1368,19 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 yield p, grad
                 continue
 
+            if group.get("merge_dims", False) and not p.data.is_contiguous():
+                if p.data.dim() == 5:
+                    p._hb_fmt = torch.channels_last_3d
+                else:
+                    p._hb_fmt = torch.channels_last
+                p.data = p.data.contiguous()
+
             self.mapping[p] = p_views = merge_group(group, p)
+            p_key = _tensor_key(p)
             for i, pv in enumerate(p_views):
                 self.mapping_inverse[_tensor_key(pv)] = (p, i)
+            if p_key not in self.mapping_inverse:
+                self.mapping_inverse[p_key] = (p, 0)
 
             vector = getattr(p, "vector", None)
             hessian_vector = getattr(p, "hessian_vector", None)
@@ -1569,6 +1582,10 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 group["is_preconditioning"] = self._is_preconditioning
                 self._step(group)
                 for real, views in self.mapping.items():
+                    if hasattr(real, '_hb_fmt'):
+                        real.data = real.data.to(memory_format=real._hb_fmt)
+                        self.mapping_inverse[_tensor_key(real)] = (real, 0)
+                        del real._hb_fmt
                     for tensor in (real, *views):
                         for key in ("grad", "vector", "hessian_vector", "orig"):
                             if hasattr(tensor, key):
