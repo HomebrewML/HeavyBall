@@ -46,7 +46,7 @@ preview = true
 relative-imports-order = "closest-to-furthest"
 
 [tool.ruff.format]
-preview = true
+preview = false
 
 [tool.setuptools.packages.find]
 include = ["heavyball*"]
