@@ -1450,10 +1450,12 @@ def _ecc_fused_decode_compute(
         def _impl(p_ls, e_ls, f_ls, s, _st, _gr, _up, _gd, _pa, *a, **kw):
             for p_l, e_l, f_l in zip(p_ls, e_ls, f_ls):
                 utils._compilable_apply_ecc_(p_l, e_l, f_l, s)
-            result = fn(_st, _gr, _up, _gd, _pa, *a, *f_ls, **kw)
-            for p_l, f_l in zip(p_ls, f_ls):
-                for p, f in zip(p_l, f_l):
-                    p.copy_(f)
+            try:
+                result = fn(_st, _gr, _up, _gd, _pa, *a, *f_ls, **kw)
+            finally:
+                for p_l, f_l in zip(p_ls, f_ls):
+                    for p, f in zip(p_l, f_l):
+                        p.copy_(f)
             return result
 
         _ecc_fused_cache[key] = utils.decorator_knowngood(_impl)

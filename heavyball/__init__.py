@@ -1025,8 +1025,6 @@ class ForeachPSGDKron(C.BaseOpt):
         delayed = C.default(delayed, self.delayed)
         cached = C.default(cached, self.cached)
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        if update_clipping is None:
-            update_clipping = C.use_default
         update_clipping = C.default(update_clipping, utils.trust_region_clip_)
         inverse_free = C.default(inverse_free, self.quad)
         if inverse_free:
@@ -1126,8 +1124,6 @@ class ForeachPSGDLRA(C.BaseOpt):
     ):
         delayed = C.default(delayed, self.delayed)
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        if update_clipping is None:
-            update_clipping = C.use_default
         update_clipping = C.default(update_clipping, utils.trust_region_clip_)
 
         defaults = locals()
