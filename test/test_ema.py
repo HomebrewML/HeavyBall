@@ -3,9 +3,9 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS, set_grad
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = "default"
@@ -49,5 +49,6 @@ def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, out
         print(i, w_ema, w_no_ema)
         assert w_ema > 0, "EMA weights should have changed"
         assert w_no_ema > 0, "Non-EMA weights should have changed"
-        assert torch.isclose(torch.tensor(w_ema), torch.tensor(w_no_ema), rtol=0.1), \
+        assert torch.isclose(torch.tensor(w_ema), torch.tensor(w_no_ema), rtol=0.1), (
             f"EMA and non-EMA weight changes differ too much: {w_ema} vs {w_no_ema}"
+        )

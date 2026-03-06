@@ -871,7 +871,9 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
 
     subscripts = f"{in_str},{from_shampoo},{to_shampoo}->{out_str}"
     for r in exp_avg:
-        new = compiled_einsum(subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None])
+        new = compiled_einsum(
+            subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None]
+        )
         copy_stochastic_(r, new)
 
     for q, q_new in zip(Q, new_qs):
@@ -1186,7 +1188,9 @@ def project(grad, Q, back: bool):
     preconditioners = ",".join([(g + g.upper())[:: -1 if back else 1] for m, g in zip(Q, param) if m is not None])
     if preconditioners:
         out = "".join([c.upper() if c.upper() in preconditioners else c for c in param])
-        out = compiled_einsum(f"{param},{preconditioners}->{out}", promote(grad), *[promote(q) for q in Q if q is not None])
+        out = compiled_einsum(
+            f"{param},{preconditioners}->{out}", promote(grad), *[promote(q) for q in Q if q is not None]
+        )
         grad = out.to(grad.dtype)
     return grad
 
@@ -1345,7 +1349,11 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 yield p, grad
                 continue
 
-            if group.get("merge_dims", False) and p.data.ndim >= 4 and p.data.is_contiguous(memory_format=torch.channels_last):
+            if (
+                group.get("merge_dims", False)
+                and p.data.ndim >= 4
+                and p.data.is_contiguous(memory_format=torch.channels_last)
+            ):
                 p._restore_channels_last = True
                 p.data = p.data.contiguous()
 
@@ -1553,7 +1561,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 group["is_preconditioning"] = self._is_preconditioning
                 self._step(group)
                 for real, views in self.mapping.items():
-                    if getattr(real, '_restore_channels_last', False):
+                    if getattr(real, "_restore_channels_last", False):
                         real.data = real.data.to(memory_format=torch.channels_last)
                         del real._restore_channels_last
                     for tensor in (real, *views):
@@ -3240,10 +3248,10 @@ _EXPONENT_BIAS = {torch.float16: 15, torch.bfloat16: 127}
 def _log_ulp(x):
     m = _NUM_MANTISSA_BITS[x.dtype]
     bias = _EXPONENT_BIAS[x.dtype]
-    exp = ((x.view(torch.int16) & 0x7FFF) >> m)
-    return torch.where(exp == 0,
-                       torch.tensor(1 - bias - m, device=x.device, dtype=torch.int32),
-                       exp.to(torch.int32) - (bias + m))
+    exp = (x.view(torch.int16) & 0x7FFF) >> m
+    return torch.where(
+        exp == 0, torch.tensor(1 - bias - m, device=x.device, dtype=torch.int32), exp.to(torch.int32) - (bias + m)
+    )
 
 
 def _scale_by_exp2(x, log_scale):

@@ -11,6 +11,7 @@ concurrency:
 jobs:
   gpu-tests:
     runs-on: ubuntu-latest
+    environment: vast
     permissions:
       pull-requests: write
     steps:

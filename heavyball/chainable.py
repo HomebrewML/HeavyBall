@@ -133,14 +133,17 @@ class ECCConfig:
         return cls(mode, group.get("ecc_group_size", 32), group.get("ecc_compand", False))
 
     def init_state(self, state, key, ref):
-        _guard_in_state(state, key,
-                        lambda: torch.zeros_like(ref, dtype=self.primary_dtype, memory_format=torch.preserve_format))
-        _guard_in_state(state, key + "::ecc",
-                        lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format))
+        _guard_in_state(
+            state, key, lambda: torch.zeros_like(ref, dtype=self.primary_dtype, memory_format=torch.preserve_format)
+        )
+        _guard_in_state(
+            state,
+            key + "::ecc",
+            lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format),
+        )
         if self.is_int8:
             ns = (ref.numel() + self.group_size - 1) // self.group_size
-            _guard_in_state(state, key + "::scales",
-                            lambda: torch.zeros(ns, dtype=torch.bfloat16, device=ref.device))
+            _guard_in_state(state, key + "::scales", lambda: torch.zeros(ns, dtype=torch.bfloat16, device=ref.device))
 
     def decode(self, primaries, states, key, out):
         corrections = [st[key + "::ecc"] for st in states]
@@ -207,8 +210,8 @@ class ZeroGuard(FunctionTransform):
 
         try:
             result = _ecc_fused_decode_compute(
-                self.fn, primary_lists, ecc_lists, fp32_vars, smax,
-                state, group, update, grad, param, *args, **kwargs)
+                self.fn, primary_lists, ecc_lists, fp32_vars, smax, state, group, update, grad, param, *args, **kwargs
+            )
         finally:
             for primaries, fp32, eccs in zip(primary_lists, fp32_vars, ecc_lists):
                 utils.compute_ecc(fp32, primaries, eccs)
@@ -1267,8 +1270,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if skip_update or update is None:
             return
-        utils.update_param_(param, update, group["lr"], group["weight_decay"],
-                            caution=group["caution"], grad=grad)
+        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
         return
 
     mapping = state.__self__.mapping_inverse
@@ -1301,8 +1303,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
     update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
 
     if not skip_update and update is not None:
-        utils.update_param_(param, update, group["lr"], group["weight_decay"],
-                            caution=group["caution"], grad=grad)
+        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
 
     fp32 = [p.data for p in param]
     for p, b in zip(param, bf16_data):
@@ -1440,10 +1441,12 @@ def default(a, b):
 _ecc_fused_cache = {}
 
 
-def _ecc_fused_decode_compute(fn, primary_lists, ecc_lists, fp32_lists, smax,
-                              state, group, update, grad, param, *args, **kwargs):
+def _ecc_fused_decode_compute(
+    fn, primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
+):
     key = id(fn)
     if key not in _ecc_fused_cache:
+
         def _impl(p_ls, e_ls, f_ls, s, _st, _gr, _up, _gd, _pa, *a, **kw):
             for p_l, e_l, f_l in zip(p_ls, e_ls, f_ls):
                 utils._compilable_apply_ecc_(p_l, e_l, f_l, s)
@@ -1452,10 +1455,11 @@ def _ecc_fused_decode_compute(fn, primary_lists, ecc_lists, fp32_lists, smax,
                 for p, f in zip(p_l, f_l):
                     p.copy_(f)
             return result
+
         _ecc_fused_cache[key] = utils.decorator_knowngood(_impl)
     return _ecc_fused_cache[key](
-        primary_lists, ecc_lists, fp32_lists, smax,
-        state, group, update, grad, param, *args, **kwargs)
+        primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
+    )
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq

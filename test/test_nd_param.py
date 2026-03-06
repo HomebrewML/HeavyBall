@@ -2,9 +2,9 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS, set_grad
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball.utils import set_torch
 
 heavyball.utils.compile_mode = None

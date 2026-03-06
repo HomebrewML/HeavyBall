@@ -30,7 +30,6 @@ class SGD(C.BaseOpt):
         params = defaults.pop("params")
         defaults.update(defaults.pop("kwargs"))
 
-
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
 
@@ -317,7 +316,6 @@ class ForeachRMSprop(C.BaseOpt):
         params = defaults.pop("params")
         defaults.update(defaults.pop("kwargs"))
 
-
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
 
@@ -358,7 +356,6 @@ class ForeachSFAdamW(C.ScheduleFree):
         defaults.pop("self")
         params = defaults.pop("params")
         defaults.update(defaults.pop("kwargs"))
-
 
         if kwargs:
             utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")

@@ -1,9 +1,9 @@
 import pytest
 import torch
 from torch import nn
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = "default"

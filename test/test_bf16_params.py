@@ -6,9 +6,9 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS, set_grad
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = "default"
@@ -38,7 +38,7 @@ def test_foreach(opt, size: int = 256, depth: int = 1, iterations: int = 64, out
 
         for i in range(outer_iterations):
             torch.manual_seed(0x2131290 + i)
-            seeds = torch.randint(0, 2**30, (iterations,), device='cpu')
+            seeds = torch.randint(0, 2**30, (iterations,), device="cpu")
             mdl = copy.deepcopy(model).to(dtype)
             o = get_optim(opt, mdl.parameters(), lr=1e-4, update_clipping=None)
 

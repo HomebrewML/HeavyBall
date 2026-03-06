@@ -9,16 +9,15 @@ import torch
 from lightbench.utils import get_optim
 from torch import linalg, nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS, set_grad
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball import utils
 from heavyball.utils import (
     _compilable_global_l2norm_clip_,
     _compilable_global_rmsnorm_clip_,
     _compilable_l2_clip_,
     _compilable_rmsnorm_clip_,
-    clean,
     set_torch,
 )
 
@@ -83,6 +82,7 @@ def _test_global_rmsnorm(x, clip_at):
     _out_assertions(torch_clipped, x)
     return x
 
+
 functions = {
     "_test_rmsnorm": _test_rmsnorm,
     "_test_l2": _test_l2,
@@ -94,7 +94,15 @@ functions = {
 @pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
 @pytest.mark.parametrize("fn", ["_test_rmsnorm", "_test_l2", "_test_global_l2norm", "_test_global_rmsnorm"])
 @pytest.mark.parametrize("compile_mode", [None, "default"])
-def test_clip(opt, compile_mode: str | None, fn: str, size: int = 128, depth: int = 2, iterations: int = 16, outer_iterations: int = 1):
+def test_clip(
+    opt,
+    compile_mode: str | None,
+    fn: str,
+    size: int = 128,
+    depth: int = 2,
+    iterations: int = 16,
+    outer_iterations: int = 1,
+):
     set_torch()
     opt = getattr(heavyball, opt)
     utils.compile_mode = compile_mode

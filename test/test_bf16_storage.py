@@ -3,16 +3,17 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS, set_grad
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS, set_grad
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
-STORAGE_OPTS = [o for o in REPRESENTATIVE_OPTS
-                if "PSGD" not in o and "soap" not in o.lower() and "solp" not in o.lower()]
+STORAGE_OPTS = [
+    o for o in REPRESENTATIVE_OPTS if "PSGD" not in o and "soap" not in o.lower() and "solp" not in o.lower()
+]
 
 
 @pytest.mark.parametrize("opt", STORAGE_OPTS)

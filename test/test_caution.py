@@ -7,9 +7,9 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = None

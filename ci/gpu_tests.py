@@ -57,9 +57,6 @@ def find_offers(n):
 SELF_DESTRUCT_TIMEOUT = 1800
 
 ONSTART_TEMPLATE = """#!/bin/bash
-_self_destruct() {{ sleep 90; curl -s -X DELETE \
-  "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/?api_key=$CONTAINER_API_KEY"; }}
-trap _self_destruct EXIT
 timeout {timeout} bash -c '
 pip install -q opt-einsum numpy pytest hypothesis lightbench 2>&1 &&
 cd / && git clone --depth 1 -b {branch} {repo} /w &&
@@ -75,8 +72,10 @@ def create_instance(offer_id, test_file):
         "image": IMAGE,
         "disk": 16,
         "onstart": ONSTART_TEMPLATE.format(
-            timeout=SELF_DESTRUCT_TIMEOUT, branch=BRANCH,
-            repo=REPO_URL, test=test_file,
+            timeout=SELF_DESTRUCT_TIMEOUT,
+            branch=BRANCH,
+            repo=REPO_URL,
+            test=test_file,
         ),
         "runtype": "ssh_direc ssh_proxy",
     }
@@ -141,7 +140,9 @@ def _make_result(test_file, exit_code, inst, log):
     else:
         status = "fail"
     return {
-        "file": test_file, "status": status, "exit_code": exit_code,
+        "file": test_file,
+        "status": status,
+        "exit_code": exit_code,
         "duration": _instance_elapsed(inst),
         "log": log[-4000:] if log else "",
     }
@@ -167,8 +168,11 @@ def wait_and_collect(instance_map, timeout=TIMEOUT):
             inst = all_instances.get(iid)
             if inst is None:
                 results[iid] = {
-                    "file": instance_map[iid], "status": "error",
-                    "exit_code": -1, "duration": 0, "log": "Instance disappeared",
+                    "file": instance_map[iid],
+                    "status": "error",
+                    "exit_code": -1,
+                    "duration": 0,
+                    "log": "Instance disappeared",
                 }
                 pending.discard(iid)
                 continue
@@ -192,8 +196,10 @@ def wait_and_collect(instance_map, timeout=TIMEOUT):
     for iid in pending:
         log = get_logs(iid)
         results[iid] = {
-            "file": instance_map[iid], "status": "timeout",
-            "exit_code": -1, "duration": timeout,
+            "file": instance_map[iid],
+            "status": "timeout",
+            "exit_code": -1,
+            "duration": timeout,
             "log": (log[-4000:] if log else "Timed out"),
         }
 

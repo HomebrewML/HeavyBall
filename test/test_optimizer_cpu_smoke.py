@@ -25,13 +25,21 @@ def _optimizer_params():
             continue
         seen.add(ident)
         if name == "SplitOpt":
-            params.append(pytest.param(name, obj, id=name,
-                          marks=pytest.mark.skip(reason="SplitOpt requires dict specs, not raw params")))
+            params.append(
+                pytest.param(
+                    name, obj, id=name, marks=pytest.mark.skip(reason="SplitOpt requires dict specs, not raw params")
+                )
+            )
             continue
         if name == "ForeachSOAPNAdam":
-            params.append(pytest.param(name, obj, id=name,
-                          marks=pytest.mark.xfail(reason="torch.compile Inductor AssertionError on CPU",
-                                                strict=False)))
+            params.append(
+                pytest.param(
+                    name,
+                    obj,
+                    id=name,
+                    marks=pytest.mark.xfail(reason="torch.compile Inductor AssertionError on CPU", strict=False),
+                )
+            )
             continue
         params.append(pytest.param(name, obj, id=name))
     return params

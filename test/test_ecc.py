@@ -130,7 +130,8 @@ def test_ecc_convergence(opt_cls, lr, extra_kw, mode):
     _ecc_keys(o1, list(m1.parameters())[0])
     assert losses_ecc[-1] < losses_ecc[0] * 0.5
     assert losses_ecc[-1] / max(losses_base[-1], 1e-12) < 2.0
-    del m0, o0, m1, o1; clean()
+    del m0, o0, m1, o1
+    clean()
 
 
 @pytest.mark.parametrize("combined", [False, True], ids=["param_ecc_only", "state+param_ecc"])
@@ -150,7 +151,8 @@ def test_param_ecc_convergence(combined):
     assert "param::ecc" in st
     assert losses_ecc[-1] < losses_ecc[0] * 0.5
     assert 0.5 < losses_ecc[-1] / max(losses_base[-1], 1e-12) < 2.0
-    del m0, o0, m1, o1; clean()
+    del m0, o0, m1, o1
+    clean()
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -184,16 +186,15 @@ def test_state_layout_and_invariants(mode):
     # step tensor cleaned up after optimizer step
     for group in opt.param_groups:
         assert group["step"] is None
-    del model, opt; clean()
+    del model, opt
+    clean()
 
 
 def test_ademamix_three_vars():
     set_torch()
     torch.manual_seed(42)
     model = nn.Linear(64, 32, bias=False, device="cuda")
-    opt = heavyball.ForeachAdEMAMix(
-        model.parameters(), lr=5e-2, betas=(0.9, 0.999, 0.9999), ecc="bf16+8"
-    )
+    opt = heavyball.ForeachAdEMAMix(model.parameters(), lr=5e-2, betas=(0.9, 0.999, 0.9999), ecc="bf16+8")
     x = torch.randn(4, 64, device="cuda")
     for _ in range(10):
         model(x).sum().backward()
@@ -206,7 +207,8 @@ def test_ademamix_three_vars():
         for pk in pks:
             assert st[pk].dtype == torch.bfloat16
             assert st[pk + "::ecc"].dtype == torch.int8
-    del model, opt; clean()
+    del model, opt
+    clean()
 
 
 def test_combined_ecc_dtypes():
@@ -221,7 +223,8 @@ def test_combined_ecc_dtypes():
         if "param" not in k:
             assert st[k].dtype == torch.int16
     assert st["param::ecc"].dtype == torch.int8
-    del m, o; clean()
+    del m, o
+    clean()
 
 
 def test_shapes_and_bias():
@@ -235,7 +238,8 @@ def test_shapes_and_bias():
         _ecc_keys(opt, p)
         assert p.isfinite().all()
     assert losses[-1] < losses[0] * 0.5
-    del model, opt; clean()
+    del model, opt
+    clean()
 
 
 def test_foreach_false():
@@ -247,17 +251,21 @@ def test_foreach_false():
     losses_nf = _train(m_nf, o_nf, data, target, 50)
     assert losses_nf[-1] < losses_nf[0] * 0.5
     assert 0.3 < losses_nf[-1] / max(losses_fe[-1], 1e-12) < 3.0
-    del m_fe, o_fe, m_nf, o_nf; clean()
+    del m_fe, o_fe, m_nf, o_nf
+    clean()
 
 
 def test_param_groups():
     set_torch()
     torch.manual_seed(42)
     m1, m2 = nn.Linear(16, 8, bias=False, device="cuda"), nn.Linear(8, 4, bias=False, device="cuda")
-    opt = heavyball.ForeachAdamW([
-        {"params": m1.parameters(), "ecc": "bf16+8"},
-        {"params": m2.parameters()},
-    ], lr=1e-2)
+    opt = heavyball.ForeachAdamW(
+        [
+            {"params": m1.parameters(), "ecc": "bf16+8"},
+            {"params": m2.parameters()},
+        ],
+        lr=1e-2,
+    )
     data, target = torch.randn(8, 16, device="cuda"), torch.randn(8, 4, device="cuda")
     for _ in range(50):
         ((m2(m1(data)) - target) ** 2).mean().backward()
@@ -265,7 +273,8 @@ def test_param_groups():
         opt.zero_grad()
     _ecc_keys(opt, list(m1.parameters())[0])
     assert not any(isinstance(k, str) and "::ecc" in k for k in _flat_state(opt, list(m2.parameters())[0]))
-    del m1, m2, opt; clean()
+    del m1, m2, opt
+    clean()
 
 
 def test_zero_gradients():
@@ -278,12 +287,14 @@ def test_zero_gradients():
         opt.step()
         opt.zero_grad()
     assert p.isfinite().all()
-    del opt; clean()
+    del opt
+    clean()
 
 
 @pytest.mark.xfail(reason="load_state_dict deserializes ECC corrections as fp32")
 def test_state_save_restore():
     from copy import deepcopy
+
     set_torch()
     data, target = _problem()
     m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, ecc="bf16+8")
@@ -295,4 +306,5 @@ def test_state_save_restore():
     losses_after = _train(m2, o2, data, target, 10)
     losses_continued = _train(m, o, data, target, 10)
     assert 0.8 < losses_after[-1] / max(losses_continued[-1], 1e-12) < 1.2
-    del m, o, m2, o2; clean()
+    del m, o, m2, o2
+    clean()

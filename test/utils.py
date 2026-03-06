@@ -12,9 +12,19 @@ from heavyball.chainable import FunctionTransform
 # Optimizers incompatible with the standard get_optim(betas=(0.9, 0.999)) call:
 #   AdEMAMix variants require 3 betas, SplitOpt requires dict param specs,
 #   SAMWrapper and Newton variants require closures
-_SKIP_GET_OPTIM = {"ForeachAdEMAMix", "ForeachSOAPAdEMAMix", "SOAPAdEMAMix", "SplitOpt", "SAMWrapper",
-    "ForeachCachedNewtonPSGD", "NewtonHybrid2PSGDKron", "ForeachNewtonPSGDLRA", "NewtonHybrid2PSGDLRA", "NewtonPSGDLRA",
-    "NewtonPSGDKron", }
+_SKIP_GET_OPTIM = {
+    "ForeachAdEMAMix",
+    "ForeachSOAPAdEMAMix",
+    "SOAPAdEMAMix",
+    "SplitOpt",
+    "SAMWrapper",
+    "ForeachCachedNewtonPSGD",
+    "NewtonHybrid2PSGDKron",
+    "ForeachNewtonPSGDLRA",
+    "NewtonHybrid2PSGDLRA",
+    "NewtonPSGDLRA",
+    "NewtonPSGDKron",
+}
 
 
 def _fn_key(f):
@@ -52,11 +62,13 @@ def _deduplicate_by_chain(names):
 
 REPRESENTATIVE_OPTS = _deduplicate_by_chain([name for name in heavyball.__all__ if name not in _SKIP_GET_OPTIM])
 
+
 @torch.no_grad()
 def set_grad(model: torch.nn.Module, *, dtype: torch.dtype = None):
     for p in model.parameters():
         g = torch.randn(p.shape, device=p.device, dtype=dtype or p.dtype, requires_grad=False)
         p.grad = g.to(p.dtype)
+
 
 def scalar_like(x):
     return torch.zeros((), dtype=x.dtype, device=x.device)

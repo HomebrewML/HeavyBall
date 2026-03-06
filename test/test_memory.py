@@ -7,7 +7,7 @@ from torch import nn
 import heavyball
 from heavyball.utils import clean, set_torch
 
-heavyball.utils.compile_mode = 'default'
+heavyball.utils.compile_mode = "default"
 
 
 def get_memory():
@@ -17,6 +17,7 @@ def get_memory():
     torch.cuda.synchronize()
     return torch.cuda.memory_allocated()
 
+
 @dataclasses.dataclass
 class Memory:
     peak_compiled: float
@@ -24,10 +25,7 @@ class Memory:
     optimizer: float
 
 
-
-expected_memory = {
-    "adamw": Memory(peak_compiled=4, peak_uncompiled=8, optimizer=2)
-}
+expected_memory = {"adamw": Memory(peak_compiled=4, peak_uncompiled=8, optimizer=2)}
 
 
 @pytest.mark.parametrize("size,depth", [(8192, 2), (2048, 16)])

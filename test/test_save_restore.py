@@ -10,16 +10,17 @@ from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
 from torch.utils._pytree import tree_map
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS
 from heavyball.utils import set_torch
 
 heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
 MERGE_SPLIT_OPTS = [
-    o for o in REPRESENTATIVE_OPTS
+    o
+    for o in REPRESENTATIVE_OPTS
     if {"split", "merge_dims"} & set(inspect.signature(getattr(heavyball, o).__init__).parameters)
 ]
 
@@ -76,13 +77,19 @@ def _run_save_restore(opt_name, size, depth, split, merge_dims, iterations, oute
 
 @pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
 def test_save_restore(opt, size: int = 32, depth: int = 2, iterations: int = 16, outer_iterations: int = 4):
-    _run_save_restore(opt, size, depth, split=False, merge_dims=False, iterations=iterations, outer_iterations=outer_iterations)
+    _run_save_restore(
+        opt, size, depth, split=False, merge_dims=False, iterations=iterations, outer_iterations=outer_iterations
+    )
 
 
 @pytest.mark.parametrize("opt", MERGE_SPLIT_OPTS)
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("merge_dims", [False, True])
-def test_save_restore_merge_split(opt, split, merge_dims, size: int = 32, depth: int = 2, iterations: int = 16, outer_iterations: int = 4):
+def test_save_restore_merge_split(
+    opt, split, merge_dims, size: int = 32, depth: int = 2, iterations: int = 16, outer_iterations: int = 4
+):
     if not split and not merge_dims:
         pytest.skip("Covered by test_save_restore")
-    _run_save_restore(opt, size, depth, split=split, merge_dims=merge_dims, iterations=iterations, outer_iterations=outer_iterations)
+    _run_save_restore(
+        opt, size, depth, split=split, merge_dims=merge_dims, iterations=iterations, outer_iterations=outer_iterations
+    )

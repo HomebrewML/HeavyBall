@@ -4,9 +4,9 @@ import pytest
 import torch
 from lightbench.utils import get_optim
 from torch import nn
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
-from utils import REPRESENTATIVE_OPTS
 from heavyball.utils import clean, set_torch
 
 heavyball.utils.compile_mode = "default"
@@ -70,7 +70,6 @@ def test_foreach(
             torch.cuda.reset_max_memory_allocated()
             torch.cuda.reset_max_memory_cached()
             torch.cuda.reset_accumulated_memory_stats()
-
 
             for _ in range(iterations):
                 loss = model(torch.randn((1, size), device="cuda")).sum()
