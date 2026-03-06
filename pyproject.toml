@@ -40,7 +40,7 @@ line-length = 120
 [tool.ruff.lint]
 extend-select = ["I", "W"]
 ignore = ["E741"]
-preview = true
+preview = false
 
 [tool.ruff.lint.isort]
 relative-imports-order = "closest-to-furthest"
