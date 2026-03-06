@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Run GPU tests on vast.ai instances in parallel. Each test file gets its own instance."""
-
 import glob
 import json
 import os
