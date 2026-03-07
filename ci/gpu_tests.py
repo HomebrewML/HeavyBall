@@ -114,8 +114,11 @@ def create_instance(offer_id, test_file):
 
 
 def get_instances():
-    r = api("GET", "/instances", params={"owner": "me"})
-    return {inst["id"]: inst for inst in r.json().get("instances", [])}
+    try:
+        r = api("GET", "/instances", params={"owner": "me"})
+        return {inst["id"]: inst for inst in r.json().get("instances", [])}
+    except Exception:
+        return {}
 
 
 def get_logs(instance_id):
@@ -145,19 +148,13 @@ def destroy(instance_id):
 
 def destroy_all(extra_ids=()):
     to_destroy = set(extra_ids)
-    try:
-        to_destroy.update(get_instances())
-    except Exception:
-        pass
-    if not to_destroy:
-        return
+    to_destroy.update(get_instances())
 
-    for iid in to_destroy:
-        destroy(iid)
+    while to_destroy:
+        for iid in to_destroy:
+            destroy(iid)
         time.sleep(3)
-
-    destroy_all()
-
+        to_destroy = set(get_instances())
 
 def _instance_elapsed(inst):
     start = inst.get("start_date")

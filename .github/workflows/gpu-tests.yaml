@@ -99,10 +99,14 @@ jobs:
           import requests, os
           key = os.environ.get('VASTAI_API_KEY', '')
           if not key: exit()
-          r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'})
-          for inst in r.json().get('instances', []):
-              requests.delete(f'https://console.vast.ai/api/v0/instances/{inst[\"id\"]}/', params={'api_key': key})
-              print(f'Destroyed leaked instance {inst[\"id\"]}')
+          r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'}).json().get('instances', [])
+          while r:
+            for inst in r:
+                requests.delete(f'https://console.vast.ai/api/v0/instances/{inst[\"id\"]}/', params={'api_key': key})
+                print(f'Destroyed leaked instance {inst[\"id\"]}')
+            time.sleep(3)
+            r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'}).json().get('instances', [])
+
           "
       - name: Set exit code
         if: steps.tests.outcome == 'failure'
