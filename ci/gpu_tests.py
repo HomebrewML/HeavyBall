@@ -28,8 +28,10 @@ def _detect_repo_and_branch():
                 branch = head.get("ref")
         except (json.JSONDecodeError, KeyError):
             pass
-    return (repo or "https://github.com/HomebrewML/HeavyBall",
-            branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "main"))
+    return (
+        repo or "https://github.com/HomebrewML/HeavyBall",
+        branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "main"),
+    )
 
 
 REPO_URL, BRANCH = _detect_repo_and_branch()
