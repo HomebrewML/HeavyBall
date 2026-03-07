@@ -1562,7 +1562,9 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 self._step(group)
                 for real, views in self.mapping.items():
                     if getattr(real, "_restore_channels_last", False):
+                        del self.mapping_inverse[_tensor_key(real)]
                         real.data = real.data.to(memory_format=torch.channels_last)
+                        self.mapping_inverse[_tensor_key(real)] = (real, 0)
                         del real._restore_channels_last
                     for tensor in (real, *views):
                         for key in ("grad", "vector", "hessian_vector", "orig"):
