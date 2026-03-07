@@ -2,8 +2,8 @@ import glob
 import json
 import os
 import sys
-import time
 import threading
+import time
 
 import requests
 
@@ -200,7 +200,13 @@ def wait_and_collect(instance_map, timeout=TIMEOUT):
         for iid in list(pending):
             inst = all_instances.get(iid)
             if inst is None:
-                results[iid] = {"file": instance_map[iid], "status": "error", "exit_code": -1, "duration": 0, "log": "Instance disappeared"}
+                results[iid] = {
+                    "file": instance_map[iid],
+                    "status": "error",
+                    "exit_code": -1,
+                    "duration": 0,
+                    "log": "Instance disappeared",
+                }
                 pending.discard(iid)
                 continue
 
@@ -227,7 +233,13 @@ def wait_and_collect(instance_map, timeout=TIMEOUT):
 
     for iid in pending:
         log = get_logs(iid)
-        results[iid] = {"file": instance_map[iid], "status": "timeout", "exit_code": -1, "duration": timeout, "log": (log[-4000:] if log else "Timed out")}
+        results[iid] = {
+            "file": instance_map[iid],
+            "status": "timeout",
+            "exit_code": -1,
+            "duration": timeout,
+            "log": (log[-4000:] if log else "Timed out"),
+        }
 
     return list(results.values())
 
