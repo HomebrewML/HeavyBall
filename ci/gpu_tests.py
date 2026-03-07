@@ -156,6 +156,7 @@ def destroy_all(extra_ids=()):
         time.sleep(3)
         to_destroy = set(get_instances())
 
+
 def _instance_elapsed(inst):
     start = inst.get("start_date")
     if start:
@@ -202,10 +203,7 @@ def _print_progress(results, total):
 
 def _is_infra_error(inst):
     msg = (inst.get("status_msg") or "").lower()
-    return ("error response from daemon" in msg
-            or "oci runtime" in msg
-            or "not running" in msg
-            or "error writing" in msg)
+    return "error response from daemon" in msg or "oci runtime" in msg or "not running" in msg or "error writing" in msg
 
 
 def _error_result(test_file, log=""):
