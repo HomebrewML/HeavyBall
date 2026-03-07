@@ -202,7 +202,7 @@ def _print_progress(results, total):
 
 def _is_docker_error(inst):
     msg = (inst.get("status_msg") or "").lower()
-    return "error response from daemon" in msg or "oci runtime" in msg or "not running" in msg
+    return "error response from daemon" in msg or "oci runtime" in msg or "not running" in msg or "error writing" in msg
 
 
 def _error_result(test_file, log=""):
@@ -292,9 +292,12 @@ def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
                 pending.discard(iid)
                 destroy(iid)
                 _log(_ICONS[result["status"]], instance_map[iid], f"{result['status']} ({result['duration']}s)")
-            elif iid in stuck_candidates and not log.strip():
-                age = int(time.time() - created_at[iid])
-                _recycle_or_fail(iid, instance_map[iid], f"no logs after {age}s", *ctx)
+            elif iid in stuck_candidates:
+                inst_status = inst.get("actual_status", "")
+                has_test_output = "HEAVYBALL_EXIT=" in log or "passed" in log or "failed" in log or "error" in log
+                if not log.strip() or (inst_status != "running" and not has_test_output):
+                    age = int(time.time() - created_at[iid])
+                    _recycle_or_fail(iid, instance_map[iid], f"no progress after {age}s (status={inst_status})", *ctx)
 
         _print_progress(results, total)
 
