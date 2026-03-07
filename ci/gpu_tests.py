@@ -83,9 +83,8 @@ SELF_DESTRUCT_TIMEOUT = 1800
 ONSTART_TEMPLATE = """#!/bin/bash
 timeout {timeout} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
-pip install -q opt-einsum numpy pytest hypothesis lightbench --break-system-packages 2>&1 &&
 cd / && git clone --depth 1 -b {branch} {repo} /w &&
-cd /w && pip install -e . --no-deps -q --break-system-packages &&
+cd /w && pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
 python -m pytest {test} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
 """
