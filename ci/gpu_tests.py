@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import threading
 
 import requests
 
@@ -195,44 +196,38 @@ def wait_and_collect(instance_map, timeout=TIMEOUT):
         time.sleep(POLL_INTERVAL)
         all_instances = get_instances()
 
+        to_fetch = {}
         for iid in list(pending):
             inst = all_instances.get(iid)
             if inst is None:
-                results[iid] = {
-                    "file": instance_map[iid],
-                    "status": "error",
-                    "exit_code": -1,
-                    "duration": 0,
-                    "log": "Instance disappeared",
-                }
+                results[iid] = {"file": instance_map[iid], "status": "error", "exit_code": -1, "duration": 0, "log": "Instance disappeared"}
                 pending.discard(iid)
                 continue
 
             status = inst.get("actual_status", "")
-            if status in ("exited", "error", "offline"):
-                log = get_logs(iid)
-                ec = parse_exit_code(log)
+            done = status in ("exited", "error", "offline")
+            if done or (status == "running" and _instance_elapsed(inst) >= 60):
+                to_fetch[iid] = (inst, done)
+
+        logs = {}
+        threads = [threading.Thread(target=lambda i=iid: logs.__setitem__(i, get_logs(i))) for iid in to_fetch]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for iid, (inst, done) in to_fetch.items():
+            log = logs[iid]
+            ec = parse_exit_code(log)
+            if done or ec is not None:
                 results[iid] = _make_result(instance_map[iid], ec, inst, log)
                 pending.discard(iid)
-            elif status == "running" and _instance_elapsed(inst) >= 60:
-                log = get_logs(iid)
-                ec = parse_exit_code(log)
-                if ec is not None:
-                    results[iid] = _make_result(instance_map[iid], ec, inst, log)
-                    pending.discard(iid)
 
-        done = len(instance_map) - len(pending)
-        print(f"  Progress: {done}/{len(instance_map)} complete, {int(deadline - time.time())}s remaining")
+        print(f"  Progress: {len(results)}/{len(instance_map)} complete, {int(deadline - time.time())}s remaining")
 
     for iid in pending:
         log = get_logs(iid)
-        results[iid] = {
-            "file": instance_map[iid],
-            "status": "timeout",
-            "exit_code": -1,
-            "duration": timeout,
-            "log": (log[-4000:] if log else "Timed out"),
-        }
+        results[iid] = {"file": instance_map[iid], "status": "timeout", "exit_code": -1, "duration": timeout, "log": (log[-4000:] if log else "Timed out")}
 
     return list(results.values())
 
