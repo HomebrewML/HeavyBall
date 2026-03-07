@@ -7,7 +7,7 @@ from heavyball import utils
 from heavyball.chainable import ECCConfig
 from heavyball.utils import clean, set_torch
 
-heavyball.utils.compile_mode = None
+heavyball.utils.compile_mode = 'default'
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
