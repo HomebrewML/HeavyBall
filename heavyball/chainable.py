@@ -109,6 +109,59 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+class ECCConfig:
+    __slots__ = ("primary_dtype", "corr_dtype", "is_int8", "group_size", "compand")
+
+    _MODES = {
+        "bf16+8": (torch.bfloat16, torch.int8, False),
+        "bf16+16": (torch.bfloat16, torch.int16, False),
+        "fp16+8": (torch.float16, torch.int8, False),
+        "fp16+16": (torch.float16, torch.int16, False),
+        "8+16": (torch.int8, torch.bfloat16, True),
+    }
+
+    def __init__(self, mode, group_size=32, compand=False):
+        self.primary_dtype, self.corr_dtype, self.is_int8 = self._MODES[mode]
+        self.group_size = group_size
+        self.compand = compand
+
+    @classmethod
+    def from_group(cls, group, key="ecc"):
+        mode = group.get(key)
+        if not mode:
+            return None
+        return cls(mode, group.get("ecc_group_size", 32), group.get("ecc_compand", False))
+
+    def init_state(self, state, key, ref):
+        _guard_in_state(
+            state, key, lambda: torch.zeros_like(ref, dtype=self.primary_dtype, memory_format=torch.preserve_format)
+        )
+        _guard_in_state(
+            state,
+            key + "::ecc",
+            lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format),
+        )
+        if self.is_int8:
+            ns = (ref.numel() + self.group_size - 1) // self.group_size
+            _guard_in_state(state, key + "::scales", lambda: torch.zeros(ns, dtype=torch.bfloat16, device=ref.device))
+
+    def decode(self, primaries, states, key, out):
+        corrections = [st[key + "::ecc"] for st in states]
+        if self.is_int8:
+            scales = [st[key + "::scales"] for st in states]
+            utils.dequantize_int8_ecc(primaries, scales, corrections, out, self.group_size, self.compand)
+        else:
+            utils.apply_ecc(primaries, corrections, out)
+
+    def encode(self, fp32, primaries, states, key):
+        corrections = [st[key + "::ecc"] for st in states]
+        if self.is_int8:
+            scales = [st[key + "::scales"] for st in states]
+            utils.quantize_int8_ecc(fp32, primaries, scales, corrections, self.group_size, self.compand)
+        else:
+            utils.encode_ecc(fp32, primaries, corrections)
+
+
 def _init_mu_product(state, group, update, grad, param, **kwargs):
     dtype = _storage_dtype(group)
     state["mu_product"] = torch.ones((), dtype=dtype, device=param.device)
@@ -119,11 +172,51 @@ class ZeroGuard(FunctionTransform):
         super().__init__(fn, names)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
+        ecc = ECCConfig.from_group(group)
         for name in self.names:
-            _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
+            vn = self.val_name(name)
+            if ecc is None:
+                _zero_guard(state, vn, param, _storage_dtype(group))
+            else:
+                ecc.init_state(state, vn, param)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
-        return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+        ecc = ECCConfig.from_group(group)
+        if ecc is None:
+            return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+
+        states = [state(p) for p in param]
+        names = [self.val_name(n) for n in self.names]
+
+        if ecc.is_int8:
+            fp32_vars = []
+            for vn in names:
+                fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+                ecc.decode([st[vn] for st in states], states, vn, fp32)
+                fp32_vars.append(fp32)
+            try:
+                return self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
+            finally:
+                for vn, fp32 in zip(names, fp32_vars):
+                    ecc.encode(fp32, [st[vn] for st in states], states, vn)
+
+        primary_lists = [[st[vn] for st in states] for vn in names]
+        ecc_lists = [[st[vn + "::ecc"] for st in states] for vn in names]
+        fp32_vars = [[torch.empty_like(p, dtype=torch.float32) for p in param] for _ in names]
+        smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc_lists[0][0].dtype]
+        smax = utils.scalar_guard(smax, fp32_vars[0][0])
+        if isinstance(group.get("step"), int):
+            group["step"] = utils.scalar_guard(group["step"], fp32_vars[0][0])
+
+        try:
+            result = _ecc_fused_decode_compute(
+                self.fn, primary_lists, ecc_lists, fp32_vars, smax, state, group, update, grad, param, *args, **kwargs
+            )
+        finally:
+            for primaries, fp32, eccs in zip(primary_lists, fp32_vars, ecc_lists):
+                utils.compute_ecc(fp32, primaries, eccs)
+
+        return result
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -273,6 +366,14 @@ def no_state_no_foreach(fn):
 
 class SkipUpdate(ValueError):
     pass
+
+
+@zero_guard("mars_old_grad")
+@no_state
+def mars(group, update, grad, param, mars_old_grad):
+    utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
+    utils.copy_stochastic_list_(grad, update)
+    return update
 
 
 @zero_guard("exp_avg")
@@ -924,9 +1025,7 @@ def _update_psgd_precond(
     if isinstance(prob, float):
         float_prob = prob
     else:
-        prob_step = group.get(f"cumulative_prob_{id(Q)}_prob_step", 1)
-        float_prob = prob(prob_step)
-        group[f"cumulative_prob_{id(Q)}_prob_step"] = prob_step + 1
+        float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if precond is not None:
@@ -1147,6 +1246,7 @@ def apply_to_idx(fn, idx):
         args = [state, group, update, grad, param]
         return fn(args[idx])
 
+    _fn.__name__ = _fn.__qualname__ = f"apply_{getattr(fn, '__name__', repr(fn))}_to_{idx}"
     return _fn
 
 
@@ -1165,9 +1265,54 @@ def _inner_chain(state, group, update, grad, param, *fns):
 
 def chain(state: Union[callable, dict], group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
+
+    ecc = ECCConfig.from_group(group, key="param_ecc")
+    if ecc is None:
+        update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+        if skip_update or update is None:
+            return
+        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+        return
+
+    mapping = state.__self__.mapping_inverse
+    states = [state(p) for p in param]
+    orig_keys = [utils._tensor_key(p) for p in param]
+    for st, p, orig_key in zip(states, param, orig_keys):
+        if "param::ecc" not in st:
+            ecc.init_state(st, "param", p)
+            fp32_backup = [p.data.float()]
+            p.data = p.data.to(ecc.primary_dtype)
+            ecc.encode(fp32_backup, [p.data], [st], "param")
+            bf16_key = utils._tensor_key(p)
+            if bf16_key != orig_key and orig_key in mapping:
+                mapping[bf16_key] = mapping.pop(orig_key)
+
+    bf16_data = [p.data for p in param]
+    bf16_keys = [utils._tensor_key(p) for p in param]
+    fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+    ecc.decode(bf16_data, states, "param", fp32)
+
+    # Remap tensor keys so state_(p) resolves after data-pointer swap
+    fp32_to_bf16 = {}
+    for p, f, bf16_key in zip(param, fp32, bf16_keys):
+        p.data = f
+        fp32_key = utils._tensor_key(p)
+        if fp32_key != bf16_key and bf16_key in mapping:
+            mapping[fp32_key] = mapping[bf16_key]
+            fp32_to_bf16[fp32_key] = bf16_key
+
     update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+
     if not skip_update and update is not None:
         utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+
+    fp32 = [p.data for p in param]
+    for p, b in zip(param, bf16_data):
+        p.data = b
+    for fp32_key, bf16_key in fp32_to_bf16.items():
+        if fp32_key in mapping:
+            mapping[bf16_key] = mapping.pop(fp32_key)
+    ecc.encode(fp32, [p.data for p in param], states, "param")
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
@@ -1240,7 +1385,7 @@ class ChainOpt(utils.StatefulOptimizer):
 
         caution = group["caution"]
 
-        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote, beta1=utils.get_beta1(group)))
+        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
 
         if not vals:
             return
@@ -1284,6 +1429,7 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
         "trust_region_clip_",
         "a_law_compress",
         "mu_law_compress",
+        "softsign_compress",
     ):
         raise ValueError(f"Clipping function {name} not found")
     return getattr(utils, name)
@@ -1291,6 +1437,32 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
 
 def default(a, b):
     return b if a is use_default else a
+
+
+_ecc_fused_cache = {}
+
+
+def _ecc_fused_decode_compute(
+    fn, primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
+):
+    key = id(fn)
+    if key not in _ecc_fused_cache:
+
+        def _impl(p_ls, e_ls, f_ls, s, _st, _gr, _up, _gd, _pa, *a, **kw):
+            for p_l, e_l, f_l in zip(p_ls, e_ls, f_ls):
+                utils._compilable_apply_ecc_(p_l, e_l, f_l, s)
+            try:
+                result = fn(_st, _gr, _up, _gd, _pa, *a, *f_ls, **kw)
+            finally:
+                for p_l, f_l in zip(p_ls, f_ls):
+                    for p, f in zip(p_l, f_l):
+                        p.copy_(f)
+            return result
+
+        _ecc_fused_cache[key] = utils.decorator_knowngood(_impl)
+    return _ecc_fused_cache[key](
+        primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
+    )
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
@@ -1394,6 +1566,8 @@ class BaseOpt(ChainOpt):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
             fns = (apply_to_idx(gradient_clipping, 2),) + fns
+        if defaults.get("mars", False):
+            fns = (mars,) + fns
         if default(update_clipping, self.update_clipping) is not None:
             fns = fns + (apply_to_idx(update_clipping, 2),)
 

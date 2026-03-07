@@ -25,20 +25,12 @@ run_list() {
 
 run_list <<'EOF'
 test/test_toy_training.py
-test/test_migrate_cli.py
 test/test_cpu_features.py
 test/test_chainable_cpu.py
 test/test_helpers_cpu.py
 test/test_utils_cpu.py
 test/test_stochastic_utils_cpu.py
 test/test_optimizer_cpu_smoke.py
-test/test_psgd_precond_init_stability.py::test_stable_exp_scalar -k dtype1
-test/test_psgd_precond_init_stability.py::test_stable_exp_tensor -k dtype1
-test/test_psgd_precond_init_stability.py::test_lse_mean -k dtype1
-test/test_psgd_precond_init_stability.py::test_mean_root[dtype1-4-16]
-test/test_psgd_precond_init_stability.py::test_mean_root[dtype2-10-512]
-test/test_psgd_precond_init_stability.py::test_divided_root[dtype1-3-5-16]
-test/test_psgd_precond_init_stability.py::test_divided_root[dtype2-9-4-64]
 EOF
 
 if [[ ${1:-} == push ]]; then

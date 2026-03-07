@@ -54,7 +54,7 @@ _DIST = {
     "laplace": lambda s, d: torch.distributions.Laplace(0.0, 1.0).sample(s).to(d),
     "cauchy": lambda s, d: torch.distributions.Cauchy(0.0, 1.0).sample(s).to(d),
     "uniform": lambda s, d: torch.rand(*s, device=d) * 2 - 1,
-    "rademacher": lambda s, d: (torch.randint(0, 2, s, device=d, dtype=torch.float32) * 2 - 1),
+    "rademacher": lambda s, d: torch.randint(0, 2, s, device=d, dtype=torch.float32) * 2 - 1,
     "poisson": lambda s, d: torch.poisson(torch.ones(*s, device=d)),
 }
 

@@ -1143,7 +1143,7 @@ class ForeachPSGDLRA(C.BaseOpt):
                 f"{rank=}. It will be set to log2(param_count). This requires `params` to be of type list. Currently, {type(params)=}"
             )
             params = list(params)
-            defaults["rank"] = round(math.log2(sum(p.numel() for p in params)))
+            defaults["rank"] = max(1, round(math.log2(sum(p.numel() for p in params))))
             utils.warn_once(f"rank was set to {defaults['rank']}")
 
         super().__init__(

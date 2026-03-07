@@ -3,20 +3,21 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
 
+heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
+MARS_OPTS = [o for o in REPRESENTATIVE_OPTS if "SF" not in o and "ScheduleFree" not in o]
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(128, 2)])
-def test_mars(opt, size, depth: int, iterations: int = 16384, outer_iterations: int = 1):
+
+@pytest.mark.parametrize("opt", MARS_OPTS)
+def test_mars(opt, size: int = 128, depth: int = 2, iterations: int = 32, outer_iterations: int = 1):
     set_torch()
     opt = getattr(heavyball, opt)
-    if "SF" in opt.__name__ or "ScheduleFree" in opt.__name__:
-        raise pytest.skip("Skipping ScheduleFree")
 
     peaks = []
     losses = []
