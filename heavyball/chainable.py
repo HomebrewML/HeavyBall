@@ -372,6 +372,7 @@ class SkipUpdate(ValueError):
 @no_state
 def mars(group, update, grad, param, mars_old_grad):
     utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
+    utils.copy_stochastic_list_(grad, update)
     return update
 
 

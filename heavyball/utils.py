@@ -1349,12 +1349,11 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 yield p, grad
                 continue
 
-            if (
-                group.get("merge_dims", False)
-                and p.data.ndim >= 4
-                and p.data.is_contiguous(memory_format=torch.channels_last)
-            ):
-                p._restore_channels_last = True
+            if group.get("merge_dims", False) and not p.data.is_contiguous():
+                for fmt in (torch.channels_last, torch.channels_last_3d):
+                    if p.data.is_contiguous(memory_format=fmt):
+                        p._restore_memory_format = fmt
+                        break
                 p.data = p.data.contiguous()
 
             self.mapping[p] = p_views = merge_group(group, p)
@@ -1561,11 +1560,12 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 group["is_preconditioning"] = self._is_preconditioning
                 self._step(group)
                 for real, views in self.mapping.items():
-                    if getattr(real, "_restore_channels_last", False):
+                    fmt = getattr(real, "_restore_memory_format", None)
+                    if fmt is not None:
                         del self.mapping_inverse[_tensor_key(real)]
-                        real.data = real.data.to(memory_format=torch.channels_last)
+                        real.data = real.data.to(memory_format=fmt)
                         self.mapping_inverse[_tensor_key(real)] = (real, 0)
-                        del real._restore_channels_last
+                        del real._restore_memory_format
                     for tensor in (real, *views):
                         for key in ("grad", "vector", "hessian_vector", "orig"):
                             if hasattr(tensor, key):
