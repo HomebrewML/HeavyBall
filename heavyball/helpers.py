@@ -2,17 +2,17 @@ import copy
 import functools
 import math
 import threading
+from collections.abc import Generator, Iterable, Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import gpytorch
 import numpy
 import numpy as np
 import optuna
 import optunahub
 import pandas as pd
 import torch
-from hebo.design_space.design_space import DesignSpace
-from hebo.optimizers.hebo import HEBO
 from optuna._transform import _SearchSpaceTransform as SearchSpaceTransform
 from optuna.distributions import BaseDistribution, CategoricalDistribution, FloatDistribution, IntDistribution
 from optuna.samplers import BaseSampler, CmaEsSampler, RandomSampler
@@ -20,8 +20,10 @@ from optuna.samplers._lazy_random_state import LazyRandomState
 from optuna.study import Study
 from optuna.study._study_direction import StudyDirection
 from optuna.trial import FrozenTrial, TrialState
+from sklearn.preprocessing import power_transform
 from torch import Tensor
 from torch.nn import functional as F
+from torch.quasirandom import SobolEngine
 
 from heavyball.utils import scalar_guard
 
@@ -106,20 +108,20 @@ def _get_default_candidates_func(
         return logei_candidates_func
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def bound_to_torch(bound: bytes, shape: tuple, device: str):
     bound = np.frombuffer(bound, dtype=np.float64).reshape(shape)
     bound = np.transpose(bound, (1, 0))
     return torch.from_numpy(bound).to(torch.device(device))
 
 
-@functools.lru_cache(maxsize=None)
-def nextafter(x: Union[float, int], y: Union[float, int]) -> Union[float, int]:
+@functools.cache
+def nextafter(x: float, y: float) -> Union[float, int]:
     return numpy.nextafter(x, y)
 
 
 def _untransform_numerical_param_torch(
-    trans_param: Union[float, int, Tensor],
+    trans_param: Union[float, Tensor],
     distribution: BaseDistribution,
     transform_log: bool,
 ) -> Tensor:
@@ -362,6 +364,247 @@ class BoTorchSampler(SimpleAPIBaseSampler):
         self._independent_sampler.after_trial(study, trial, state, values)
 
 
+# Minimal Bayesian optimization, based on HEBO (Huawei, MIT License).
+# Replaces the `hebo` package which is broken on Python 3.12+ due to its GPy dependency.
+# Original: https://github.com/huawei-noah/HEBO
+
+
+class _Param:
+    __slots__ = ('lb', 'name', 'ptype', 'ub')
+
+    def __init__(self, name, ptype, lb, ub):
+        self.name, self.ptype, self.lb, self.ub = name, ptype, float(lb), float(ub)
+
+    @property
+    def is_log(self):
+        return self.ptype in ('pow', 'pow_int')
+
+    @property
+    def is_int(self):
+        return self.ptype in ('int', 'pow_int')
+
+    @property
+    def is_discrete_after_transform(self):
+        return self.ptype == 'int'
+
+    @property
+    def opt_lb(self):
+        return np.log(self.lb) if self.is_log else self.lb
+
+    @property
+    def opt_ub(self):
+        return np.log(self.ub) if self.is_log else self.ub
+
+    def transform(self, x):
+        return np.log(x) if self.is_log else x
+
+    def inverse(self, x):
+        v = np.exp(x) if self.is_log else x
+        return np.round(v).astype(int) if self.is_int else v
+
+
+class DesignSpace:
+    def __init__(self):
+        self.paras = {}
+        self.para_names = []
+
+    def parse(self, configs):
+        self.paras = {}
+        self.para_names = []
+        for c in configs:
+            p = _Param(c['name'], c['type'], c['lb'], c['ub'])
+            self.paras[p.name] = p
+            self.para_names.append(p.name)
+        return self
+
+    @property
+    def num_paras(self):
+        return len(self.para_names)
+
+    def opt_lb(self, device='cpu'):
+        return torch.tensor([self.paras[n].opt_lb for n in self.para_names], device=device)
+
+    def opt_ub(self, device='cpu'):
+        return torch.tensor([self.paras[n].opt_ub for n in self.para_names], device=device)
+
+    def transform(self, df, device='cpu'):
+        cols = [self.paras[n].transform(df[n].values.astype(float)) for n in self.para_names]
+        data = np.column_stack(cols) if cols else np.zeros((len(df), 0))
+        return torch.as_tensor(data, dtype=torch.float32, device=device)
+
+    def inverse_transform(self, x):
+        x = x.numpy() if isinstance(x, torch.Tensor) else x
+        return pd.DataFrame({n: self.paras[n].inverse(x[:, i]) for i, n in enumerate(self.para_names)})
+
+
+class _GP(gpytorch.models.ExactGP):
+    def __init__(self, X, y, lik, ard_dims):
+        super().__init__(X, y, lik)
+        self.mean = gpytorch.means.ConstantMean()
+        self.covar = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims))
+
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(self.mean(x), self.covar(x))
+
+
+class _Surrogate:
+    def __init__(self, num_epochs=100, lr=0.01, noise_lb=8e-4):
+        self.num_epochs, self.lr, self.noise_lb = num_epochs, lr, noise_lb
+
+    def fit(self, X, y):
+        self._x_min, self._x_max = X.min(0).values, X.max(0).values
+        span = (self._x_max - self._x_min).clamp(min=1e-8)
+        Xs = 2 * (X - self._x_min) / span - 1
+
+        self._y_mu, self._y_std = y.mean(), y.std(correction=0).clamp(min=1e-8)
+        ys = ((y - self._y_mu) / self._y_std).squeeze()
+
+        with torch.device(X.device):
+            self.lik = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=gpytorch.constraints.GreaterThan(self.noise_lb),
+                noise_prior=gpytorch.priors.LogNormalPrior(np.log(0.01), 0.5),
+            )
+            self.gp = _GP(Xs, ys, self.lik, ard_dims=X.shape[1])
+        self.lik.noise = max(1e-2, self.noise_lb)
+
+        self.gp.train()
+        self.lik.train()
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.lik, self.gp)
+        opt = torch.optim.Adam(self.gp.parameters(), lr=self.lr)
+
+        for _ in range(self.num_epochs):
+            try:
+                opt.zero_grad()
+                loss = -mll(self.gp(Xs), ys)
+                loss.backward()
+                opt.step()
+            except RuntimeError:
+                break
+
+        self.gp.eval()
+        self.lik.eval()
+
+    def _scale_x(self, X):
+        span = (self._x_max - self._x_min).clamp(min=1e-8)
+        return 2 * (X - self._x_min) / span - 1
+
+    @torch.no_grad()
+    def predict(self, X):
+        with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(float_value=1e-3):
+            pred = self.gp(self._scale_x(X))
+        mu = pred.mean * self._y_std + self._y_mu
+        var = pred.variance * self._y_std ** 2
+        return mu, var.clamp(min=1e-8)
+
+
+class HEBO:
+    def __init__(self, space, scramble_seed=None, rand_sample=None, device='cpu'):
+        self.space = space
+        self.device = torch.device(device)
+        self.X = pd.DataFrame(columns=space.para_names)
+        self.y = np.zeros((0, 1))
+        self.rand_sample = rand_sample if rand_sample is not None else (1 + space.num_paras)
+        self._seed = scramble_seed
+        self.sobol = SobolEngine(space.num_paras, scramble=True, seed=scramble_seed)
+
+    def _quasi_sample(self, n):
+        lb, ub = self.space.opt_lb(), self.space.opt_ub()
+        samp = self.sobol.draw(n)
+        samp = samp * (ub - lb) + lb
+        for i, name in enumerate(self.space.para_names):
+            if self.space.paras[name].is_discrete_after_transform:
+                samp[:, i] = samp[:, i].round()
+        return self.space.inverse_transform(samp)
+
+    def _transform_y(self):
+        ys = self.y / max(self.y.std(), 1e-8)
+        try:
+            if self.y.min() <= 0:
+                y = power_transform(ys, method='yeo-johnson')
+            else:
+                y = power_transform(ys, method='box-cox')
+                if y.std() < 0.5:
+                    y = power_transform(ys, method='yeo-johnson')
+            if y.std() < 0.5:
+                raise RuntimeError()
+            return torch.as_tensor(y, dtype=torch.float32, device=self.device)
+        except (RuntimeError, ValueError):
+            return torch.as_tensor(self.y, dtype=torch.float32, device=self.device)
+
+    def suggest(self, n_suggestions=1):
+        if self.X.shape[0] < self.rand_sample:
+            return self._quasi_sample(n_suggestions)
+
+        try:
+            return self._suggest_bo(n_suggestions)
+        except (RuntimeError, ValueError):
+            return self._quasi_sample(n_suggestions)
+
+    def _suggest_bo(self, n_suggestions):
+        dev = self.device
+        X = self.space.transform(self.X, device=dev)
+        y = self._transform_y()
+
+        model = _Surrogate()
+        model.fit(X, y)
+
+        dim = X.shape[1]
+        n_obs = max(1, self.X.shape[0])
+        kappa = np.sqrt(2.0 * np.log(n_obs * dim))
+
+        lb, ub = self.space.opt_lb(dev).float(), self.space.opt_ub(dev).float()
+        n_cand = max(2000, 200 * dim)
+        seed = None if self._seed is None else self._seed + n_obs
+        cands = torch.empty(n_cand, dim, device=dev)
+        SobolEngine(dim, scramble=True, seed=seed).draw(n_cand, out=cands)
+        cands = lb + (ub - lb) * cands
+
+        for i, name in enumerate(self.space.para_names):
+            if self.space.paras[name].is_discrete_after_transform:
+                cands[:, i] = cands[:, i].round()
+
+        mu, var = model.predict(cands)
+        lcb = mu - kappa * var.sqrt()
+
+        order = lcb.argsort().cpu().numpy()
+        cands_cpu = cands.cpu().numpy()
+        X_cpu = X.cpu().numpy()
+        selected = []
+        seen = {tuple(row) for row in X_cpu}
+        for idx in order:
+            key = tuple(cands_cpu[idx])
+            if key not in seen:
+                seen.add(key)
+                selected.append(idx)
+            if len(selected) >= n_suggestions:
+                break
+
+        result = self.space.inverse_transform(cands_cpu[selected])
+
+        while len(result) < n_suggestions:
+            extra = self._quasi_sample(n_suggestions - len(result))
+            result = pd.concat([result, extra], ignore_index=True)
+
+        return result.head(n_suggestions)
+
+    def observe(self, X, y):
+        valid = np.isfinite(y.reshape(-1))
+        new_x = X[valid]
+        if len(self.X) == 0:
+            self.X = new_x.reset_index(drop=True)
+        else:
+            self.X = pd.concat([self.X, new_x], ignore_index=True)
+        self.y = np.vstack([self.y, y[valid].reshape(-1, 1)])
+
+    @property
+    def best_x(self):
+        return self.X.iloc[[self.y.ravel().argmin()]]
+
+    @property
+    def best_y(self):
+        return self.y.min()
+
+
 def _convert_to_hebo_design_space(search_space: dict[str, BaseDistribution]) -> DesignSpace:
     if not search_space:
         raise ValueError("Empty search space.")
@@ -433,7 +676,7 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler, SimpleAPIBaseSampler):
         state: TrialState,
         values: Sequence[float] | None,
     ) -> None:
-        if self._hebo is None or values is None:
+        if values is None:
             return
         sign = 1 if study.direction == StudyDirection.MINIMIZE else -1
         values = np.array([values[0]])
