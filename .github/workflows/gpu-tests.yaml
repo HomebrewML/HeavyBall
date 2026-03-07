@@ -64,7 +64,7 @@ jobs:
             if (failures.length > 0) {
               body += '\n<details><summary>Failure details</summary>\n\n';
               for (const r of failures) {
-                const log = r.log.length > 1500 ? '...' + r.log.slice(-1500) : r.log;
+                const log = r.log;
                 body += `#### \`${r.file}\`\n\`\`\`\n${log}\n\`\`\`\n\n`;
               }
               body += '</details>\n';

@@ -175,7 +175,7 @@ def _make_result(test_file, exit_code, inst, log):
         "status": status,
         "exit_code": exit_code,
         "duration": _instance_elapsed(inst),
-        "log": log[-4000:] if log else "",
+        "log": log or "",
     }
 
 
