@@ -149,15 +149,14 @@ def destroy_all(extra_ids=()):
         to_destroy.update(get_instances())
     except Exception:
         pass
+    if not to_destroy:
+        return
+
     for iid in to_destroy:
         destroy(iid)
         time.sleep(3)
-    try:
-        for iid in get_instances():
-            destroy(iid)
-            time.sleep(3)
-    except Exception:
-        pass
+
+    destroy_all()
 
 
 def _instance_elapsed(inst):
