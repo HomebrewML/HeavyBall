@@ -400,7 +400,7 @@ def eps_sqrt(item, eps):
 
 @decorator_knowngood
 def _compilable_exp_avg_sq_(
-    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor]
+    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor],
 ):
     g32 = promote(grad)
     s32 = _lerp(state, [g_ * g_ for g_ in g32], beta2)
@@ -1116,12 +1116,55 @@ def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     return _fn
 
 
+class _ULPState:
+    __slots__ = ('correction', 'smax')
+
+    def __init__(self, correction, smax):
+        self.correction = correction
+        self.smax = smax
+
+    def decode(self, x):
+        ls = (_log_ulp(x) - 1).float()
+        return x.float() + _scale_by_exp2(self.correction.float() / self.smax, ls)
+
+    def encode(self, fp32, target):
+        if target.dtype == torch.bfloat16 and fp32.dtype in (torch.float16, torch.float32, torch.float64):
+            rounded = stochastic_round_(target, fp32)
+        else:
+            rounded = fp32.to(target.dtype)
+        set_(target, rounded)
+        e = fp32 - target.float()
+        ls = (_log_ulp(target) - 1).float()
+        e_norm = _scale_by_exp2(e, -ls)
+        scaled = e_norm.clamp(-1.0, 1.0) * self.smax
+        self.correction.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(self.correction.dtype))
+
+
+class _Int8State:
+    __slots__ = ('correction', 'scales', 'group_size')
+
+    def __init__(self, correction, scales, group_size):
+        self.correction = correction
+        self.scales = scales
+        self.group_size = group_size
+
+    def decode(self, x):
+        return _int8_decode_single(x, self.correction, self.scales, self.group_size)
+
+    def encode(self, fp32, target):
+        _int8_encode_single(fp32, target, self.correction, self.scales, self.group_size)
+
+
 @tree_apply
 def promote(x):
-    if isinstance(x, torch.dtype) and x in (torch.bfloat16, torch.float16):
+    if isinstance(x, torch.dtype) and x in (torch.bfloat16, torch.float16, torch.int8):
         return torch.float32
-    if isinstance(x, Tensor) and x.dtype in (torch.bfloat16, torch.float16):
-        return x.float()
+    if isinstance(x, Tensor):
+        ecc = getattr(x, '_ecc', None)
+        if ecc is not None:
+            return ecc.decode(x)
+        if x.dtype in (torch.bfloat16, torch.float16):
+            return x.float()
     return x
 
 
@@ -1576,6 +1619,45 @@ class StatefulOptimizer(torch.optim.Optimizer):
 def copy_stochastic_list_(target: List[Tensor], source: List[Tensor]):
     for t, s in zip(target, source):
         copy_stochastic_(t, s)
+
+
+
+def _int8_decode_single(q, bf16_corr, scales, group_size):
+    groups, n = _pad_groups(q.reshape(-1).float(), group_size)
+    deq = groups / 127.0
+    result = deq * scales.reshape(-1, 1).float()
+    return (result.reshape(-1)[:n] + bf16_corr.reshape(-1).float()).view_as(q)
+
+
+def _int8_encode_single(fp32, q, bf16_corr, scales, group_size):
+    groups, n = _pad_groups(fp32.reshape(-1), group_size)
+    s = scales.reshape(-1, 1).float().clamp(min=1e-12)
+    normed = groups / s
+    quantized = (normed * 127.0).round().clamp(-127, 127)
+    deq = quantized / 127.0 * s
+    residual = groups - deq
+    q.copy_(quantized.reshape(-1)[:n].to(torch.int8).view_as(q))
+    bf16_corr.copy_(residual.reshape(-1)[:n].bfloat16().view_as(bf16_corr))
+
+
+@decorator_knowngood
+def _compilable_refresh_int8_scales_(q_list, scales_list, corr_list, group_size):
+    for q, scales, corr in zip(q_list, scales_list, corr_list):
+        groups_q, n = _pad_groups(q.reshape(-1).float(), group_size)
+        groups_c, _ = _pad_groups(corr.reshape(-1).float(), group_size)
+        decoded = groups_q / 127.0 * scales.reshape(-1, 1).float() + groups_c
+        new_scales = decoded.abs().amax(dim=1).clamp(min=1e-12).bfloat16()
+        normed = decoded / new_scales.reshape(-1, 1).float().clamp(min=1e-12)
+        new_q = (normed * 127.0).round().clamp(-127, 127)
+        new_corr = decoded - new_q / 127.0 * new_scales.reshape(-1, 1).float()
+        q.copy_(new_q.reshape(-1)[:n].to(torch.int8).view_as(q))
+        scales.copy_(new_scales.view_as(scales))
+        corr.copy_(new_corr.reshape(-1)[:n].bfloat16().view_as(corr))
+
+
+def refresh_int8_scales_(q_list, scales_list, corr_list, group_size):
+    q_list, scales_list, corr_list = list_guard(q_list, scales_list, corr_list)
+    _compilable_refresh_int8_scales_(q_list, scales_list, corr_list, group_size)
 
 
 @decorator_knowngood
@@ -2037,7 +2119,7 @@ def fused_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, e
 @decorator_knowngood
 def _compilable_adopt_(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps):
     g32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, exp_avg_sq]]
-    update = [e.clone() for e in exp_avg]
+    update = list(map(promote, exp_avg))
 
     beta1 = beta_debias(beta1, step)
     stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
@@ -2080,6 +2162,10 @@ def _compilable_copy_stochastic_(target: Tensor, source: Tensor):
 
 
 def copy_stochastic_(target: Tensor, source: Tensor):
+    ecc = getattr(target, '_ecc', None)
+    if ecc is not None:
+        ecc.encode(source, target)
+        return
     if target.dtype == torch.bfloat16 and source.dtype in (torch.float16, torch.float32, torch.float64):
         source = stochastic_round_(target, source)
     set_(target, source)
@@ -2087,9 +2173,9 @@ def copy_stochastic_(target: Tensor, source: Tensor):
 
 @decorator_knowngood
 def _compilable_update_(
-    p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Tensor, caution: bool, g: List[Optional[Tensor]]
+    p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Tensor, caution: bool, g: List[Optional[Tensor]],
 ):
-    for u_, g_, p_ in zip(u, g, p):  # lr is data-dependent -> can't compile a foreach
+    for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a foreach
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
         if caution:
@@ -2099,7 +2185,7 @@ def _compilable_update_(
 
 
 def update_param_(
-    param: List[Tensor], update: List[Tensor], lr: float, decay: float, caution: bool = False, grad: List[Tensor] = None
+    param: List[Tensor], update: List[Tensor], lr: float, decay: float, caution: bool = False, grad: List[Tensor] = None,
 ):
     param, update, grad = list_guard(param, update, grad)
     lr = scalar_guard(lr, param[0])

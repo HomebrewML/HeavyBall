@@ -188,16 +188,29 @@ class ZeroGuard(FunctionTransform):
         states = [state(p) for p in param]
         names = [self.val_name(n) for n in self.names]
 
-        fp32_vars = []
-        for vn in names:
-            fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
-            ecc.decode([st[vn] for st in states], states, vn, fp32)
-            fp32_vars.append(fp32)
+        primary_vars = [[st[vn] for st in states] for vn in names]
+        for vn, plist in zip(names, primary_vars):
+            for st, p in zip(states, plist):
+                if ecc.is_int8:
+                    p._ecc = utils._Int8State(st[vn + "::ecc"], st[vn + "::scales"], ecc.group_size)
+                else:
+                    smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc.corr_dtype]
+                    p._ecc = utils._ULPState(st[vn + "::ecc"], smax)
         try:
-            return self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
+            return self.fn(state, group, update, grad, param, *args, *primary_vars, **kwargs)
         finally:
-            for vn, fp32 in zip(names, fp32_vars):
-                ecc.encode(fp32, [st[vn] for st in states], states, vn)
+            for plist in primary_vars:
+                for p in plist:
+                    if hasattr(p, '_ecc'):
+                        del p._ecc
+            if ecc.is_int8:
+                for vn in names:
+                    utils.refresh_int8_scales_(
+                        [st[vn] for st in states],
+                        [st[vn + "::scales"] for st in states],
+                        [st[vn + "::ecc"] for st in states],
+                        ecc.group_size,
+                    )
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -308,25 +321,34 @@ class NoStateNoForeach(FunctionTransform):
         return updates
 
 
+def _view_preserve_ecc(src, target):
+    v = src.view_as(target)
+    ecc = getattr(src, '_ecc', None)
+    if ecc is not None:
+        v._ecc = ecc
+    return v
+
+
 class SqueezeGrad(FunctionTransform):
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         original_shapes = [u.shape for u in update]
         update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
-        grad = [x.view_as(u) for x, u in zip(grad, update)]
-        param = [x.view_as(u) for x, u in zip(param, update)]
+        grad = [_view_preserve_ecc(x, u) for x, u in zip(grad, update)]
+        param = [_view_preserve_ecc(x, u) for x, u in zip(param, update)]
         args = list(args)
         for i, a in enumerate(args):
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
-                args[i] = [x.view_as(u) for x, u in zip(a, update)]
+                args[i] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         for k, a in kwargs.items():
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
-                kwargs[k] = [x.view_as(u) for x, u in zip(a, update)]
+                kwargs[k] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         out = self.fn(state, group, update, grad, param, *args, **kwargs)
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
 
 def zero_guard(*names):
     return functools.partial(ZeroGuard, names=names)
+
 
 
 def copy_guard(index, *names):
@@ -408,7 +430,7 @@ def l1_weight_decay_to_ema(group, update, grad, param, exp_avg):
 @no_state
 def scale_by_exp_avg_sq(group, update, grad, param, exp_avg_sq):
     return utils.scale_by_exp_avg_sq_(
-        exp_avg_sq, update, utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"]
+        exp_avg_sq, update, utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"],
     )
 
 
@@ -630,7 +652,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.set_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -704,7 +726,7 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.set_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -1260,7 +1282,13 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
     orig_keys = [utils._tensor_key(p) for p in param]
     for st, p, orig_key in zip(states, param, orig_keys):
         if "param::ecc" not in st:
-            ecc.init_state(st, "param", p)
+            _guard_in_state(
+                st, "param::ecc",
+                lambda: torch.zeros_like(p, dtype=ecc.corr_dtype, memory_format=torch.preserve_format),
+            )
+            if ecc.is_int8:
+                ns = (p.numel() + ecc.group_size - 1) // ecc.group_size
+                _guard_in_state(st, "param::scales", lambda: torch.zeros(ns, dtype=torch.bfloat16, device=p.device))
             fp32_backup = [p.data.float()]
             p.data = p.data.to(ecc.primary_dtype)
             ecc.encode(fp32_backup, [p.data], [st], "param")
@@ -1268,32 +1296,28 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
             if bf16_key != orig_key and orig_key in mapping:
                 mapping[bf16_key] = mapping.pop(orig_key)
 
-    bf16_data = [p.data for p in param]
-    bf16_keys = [utils._tensor_key(p) for p in param]
-    fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
-    ecc.decode(bf16_data, states, "param", fp32)
-
-    # Remap tensor keys so state_(p) resolves after data-pointer swap
-    fp32_to_bf16 = {}
-    for p, f, bf16_key in zip(param, fp32, bf16_keys):
-        p.data = f
-        fp32_key = utils._tensor_key(p)
-        if fp32_key != bf16_key and bf16_key in mapping:
-            mapping[fp32_key] = mapping[bf16_key]
-            fp32_to_bf16[fp32_key] = bf16_key
-
+    for st, p in zip(states, param):
+        if ecc.is_int8:
+            p._ecc = utils._Int8State(st["param::ecc"], st["param::scales"], ecc.group_size)
+        else:
+            smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc.corr_dtype]
+            p._ecc = utils._ULPState(st["param::ecc"], smax)
     try:
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
-            utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+            utils.update_param_(param, update, group["lr"], group["weight_decay"],
+                                caution=group["caution"], grad=grad)
     finally:
-        fp32 = [p.data for p in param]
-        for p, b in zip(param, bf16_data):
-            p.data = b
-        for fp32_key, bf16_key in fp32_to_bf16.items():
-            if fp32_key in mapping:
-                mapping[bf16_key] = mapping.pop(fp32_key)
-        ecc.encode(fp32, [p.data for p in param], states, "param")
+        for p in param:
+            if hasattr(p, '_ecc'):
+                del p._ecc
+        if ecc.is_int8:
+            utils.refresh_int8_scales_(
+                list(param),
+                [st["param::scales"] for st in states],
+                [st["param::ecc"] for st in states],
+                ecc.group_size,
+            )
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
