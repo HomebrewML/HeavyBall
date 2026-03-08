@@ -291,7 +291,6 @@ def test_zero_gradients():
     clean()
 
 
-@pytest.mark.xfail(reason="load_state_dict deserializes ECC corrections as fp32")
 def test_state_save_restore():
     from copy import deepcopy
 
@@ -308,3 +307,74 @@ def test_state_save_restore():
     assert 0.8 < losses_after[-1] / max(losses_continued[-1], 1e-12) < 1.2
     del m, o, m2, o2
     clean()
+
+
+def _measure_peak(cls, n, lr, ecc=None, param_ecc=None, steps=3):
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    p = torch.nn.Parameter(torch.randn(n, device="cuda"))
+    kw = {}
+    if ecc:
+        kw["ecc"] = ecc
+    if param_ecc:
+        kw["param_ecc"] = param_ecc
+    opt = cls([p], lr=lr, **kw)
+
+    for _ in range(steps):
+        p.grad = torch.randn_like(p)
+        opt.step()
+        opt.zero_grad()
+
+    p.grad = torch.randn_like(p)
+    pre = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    opt.step()
+    peak = torch.cuda.max_memory_allocated()
+    opt.zero_grad()
+
+    del opt, p
+    gc.collect()
+    torch.cuda.empty_cache()
+    return pre / n, peak / n
+
+
+@pytest.mark.parametrize("mode", ["bf16+8", "8+16"])
+@pytest.mark.parametrize(
+    "cls,lr",
+    [
+        (heavyball.ForeachAdamW, 1e-3),
+        (heavyball.PaLMForeachSFAdamW, 1e-2),
+        (heavyball.ForeachRMSprop, 1e-2),
+    ],
+    ids=["AdamW", "SFAdamW", "RMSprop"],
+)
+def test_ecc_peak_memory(cls, lr, mode):
+    n = 500_000
+    pre_base, peak_base = _measure_peak(cls, n, lr)
+    pre_ecc, peak_ecc = _measure_peak(cls, n, lr, ecc=mode)
+
+    # steady state must use less memory than baseline
+    assert pre_ecc < pre_base, (
+        f"ECC pre-step {pre_ecc:.1f} B/p >= baseline {pre_base:.1f} B/p"
+    )
+
+    assert peak_ecc < peak_base, (
+        f"ECC peak {peak_ecc:.1f} B/p >= 2x baseline peak {peak_base:.1f} B/p"
+    )
+
+
+@pytest.mark.parametrize("combined", [False, True], ids=["param_only", "state+param"])
+def test_param_ecc_peak_memory(combined):
+    n = 500_000
+    cls, lr = heavyball.PaLMForeachSFAdamW, 1e-2
+    pre_base, peak_base = _measure_peak(cls, n, lr)
+    ecc = "bf16+8" if combined else None
+    pre_ecc, peak_ecc = _measure_peak(cls, n, lr, ecc=ecc, param_ecc="bf16+8")
+
+    assert peak_ecc < peak_base, (
+        f"param_ecc peak {peak_ecc:.1f} B/p >= 2x baseline peak {peak_base:.1f} B/p"
+    )

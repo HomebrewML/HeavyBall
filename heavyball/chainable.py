@@ -188,35 +188,16 @@ class ZeroGuard(FunctionTransform):
         states = [state(p) for p in param]
         names = [self.val_name(n) for n in self.names]
 
-        if ecc.is_int8:
-            fp32_vars = []
-            for vn in names:
-                fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
-                ecc.decode([st[vn] for st in states], states, vn, fp32)
-                fp32_vars.append(fp32)
-            try:
-                return self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
-            finally:
-                for vn, fp32 in zip(names, fp32_vars):
-                    ecc.encode(fp32, [st[vn] for st in states], states, vn)
-
-        primary_lists = [[st[vn] for st in states] for vn in names]
-        ecc_lists = [[st[vn + "::ecc"] for st in states] for vn in names]
-        fp32_vars = [[torch.empty_like(p, dtype=torch.float32) for p in param] for _ in names]
-        smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc_lists[0][0].dtype]
-        smax = utils.scalar_guard(smax, fp32_vars[0][0])
-        if isinstance(group.get("step"), int):
-            group["step"] = utils.scalar_guard(group["step"], fp32_vars[0][0])
-
+        fp32_vars = []
+        for vn in names:
+            fp32 = [torch.empty_like(p, dtype=torch.float32) for p in param]
+            ecc.decode([st[vn] for st in states], states, vn, fp32)
+            fp32_vars.append(fp32)
         try:
-            result = _ecc_fused_decode_compute(
-                self.fn, primary_lists, ecc_lists, fp32_vars, smax, state, group, update, grad, param, *args, **kwargs
-            )
+            return self.fn(state, group, update, grad, param, *args, *fp32_vars, **kwargs)
         finally:
-            for primaries, fp32, eccs in zip(primary_lists, fp32_vars, ecc_lists):
-                utils.compute_ecc(fp32, primaries, eccs)
-
-        return result
+            for vn, fp32 in zip(names, fp32_vars):
+                ecc.encode(fp32, [st[vn] for st in states], states, vn)
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -1301,18 +1282,18 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
             mapping[fp32_key] = mapping[bf16_key]
             fp32_to_bf16[fp32_key] = bf16_key
 
-    update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
-
-    if not skip_update and update is not None:
-        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
-
-    fp32 = [p.data for p in param]
-    for p, b in zip(param, bf16_data):
-        p.data = b
-    for fp32_key, bf16_key in fp32_to_bf16.items():
-        if fp32_key in mapping:
-            mapping[bf16_key] = mapping.pop(fp32_key)
-    ecc.encode(fp32, [p.data for p in param], states, "param")
+    try:
+        update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+        if not skip_update and update is not None:
+            utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+    finally:
+        fp32 = [p.data for p in param]
+        for p, b in zip(param, bf16_data):
+            p.data = b
+        for fp32_key, bf16_key in fp32_to_bf16.items():
+            if fp32_key in mapping:
+                mapping[bf16_key] = mapping.pop(fp32_key)
+        ecc.encode(fp32, [p.data for p in param], states, "param")
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
@@ -1360,6 +1341,35 @@ class ChainOpt(utils.StatefulOptimizer):
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, foreach)
         self.fns = fns
+        self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
+
+    @staticmethod
+    def _restore_ecc_dtypes(optimizer, *args):
+        for group in optimizer.param_groups:
+            ecc = ECCConfig.from_group(group, key="ecc")
+            param_ecc = ECCConfig.from_group(group, key="param_ecc")
+            if ecc is None and param_ecc is None:
+                continue
+            for p in group["params"]:
+                if p not in optimizer.state:
+                    continue
+                for idx_state in optimizer.state[p].values():
+                    if not isinstance(idx_state, dict):
+                        continue
+                    for k in list(idx_state.keys()):
+                        v = idx_state[k]
+                        if not isinstance(v, torch.Tensor):
+                            continue
+                        is_param_key = k == "param" or k.startswith("param::")
+                        cfg = param_ecc if is_param_key else ecc
+                        if cfg is None:
+                            continue
+                        if k.endswith("::scales"):
+                            idx_state[k] = v.to(torch.bfloat16)
+                        elif k.endswith("::ecc"):
+                            idx_state[k] = v.to(cfg.corr_dtype)
+                        elif (k + "::ecc") in idx_state:
+                            idx_state[k] = v.to(cfg.primary_dtype)
 
     @property
     def fns(self):
@@ -1437,32 +1447,6 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
 
 def default(a, b):
     return b if a is use_default else a
-
-
-_ecc_fused_cache = {}
-
-
-def _ecc_fused_decode_compute(
-    fn, primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
-):
-    key = id(fn)
-    if key not in _ecc_fused_cache:
-
-        def _impl(p_ls, e_ls, f_ls, s, _st, _gr, _up, _gd, _pa, *a, **kw):
-            for p_l, e_l, f_l in zip(p_ls, e_ls, f_ls):
-                utils._compilable_apply_ecc_(p_l, e_l, f_l, s)
-            try:
-                result = fn(_st, _gr, _up, _gd, _pa, *a, *f_ls, **kw)
-            finally:
-                for p_l, f_l in zip(p_ls, f_ls):
-                    for p, f in zip(p_l, f_l):
-                        p.copy_(f)
-            return result
-
-        _ecc_fused_cache[key] = utils.decorator_knowngood(_impl)
-    return _ecc_fused_cache[key](
-        primary_lists, ecc_lists, fp32_lists, smax, state, group, update, grad, param, *args, **kwargs
-    )
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
