@@ -1,0 +1,51 @@
+name: Publish release
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/heavyball
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Verify tag matches project version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version = "/ { print $2; exit }' pyproject.toml)
+          if [ -z "$VERSION" ]; then
+            echo "Unable to read version from pyproject.toml"
+            exit 1
+          fi
+          TAG="${RELEASE_TAG#refs/tags/}"
+          TAG_STRIPPED="${TAG#v}"
+          if [ "$TAG_STRIPPED" != "$VERSION" ]; then
+            echo "Release tag $RELEASE_TAG does not match project version $VERSION"
+            exit 1
+          fi
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

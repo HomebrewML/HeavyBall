@@ -1118,6 +1118,7 @@ def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
 
 class _ULPState:
     __slots__ = ('correction', 'smax')
+    _SMAX = {torch.int8: 127.0, torch.int16: 32767.0}
 
     def __init__(self, correction, smax):
         self.correction = correction
@@ -1127,32 +1128,21 @@ class _ULPState:
         ls = (_log_ulp(x) - 1).float()
         return x.float() + _scale_by_exp2(self.correction.float() / self.smax, ls)
 
+    def compute_correction(self, fp32, narrow):
+        e = fp32 - narrow.float()
+        ls = (_log_ulp(narrow) - 1).float()
+        e_norm = _scale_by_exp2(e, -ls)
+        scaled = e_norm.clamp(-1.0, 1.0) * self.smax
+        self.correction.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(self.correction.dtype))
+
     def encode(self, fp32, target):
         if target.dtype == torch.bfloat16 and fp32.dtype in (torch.float16, torch.float32, torch.float64):
             rounded = stochastic_round_(target, fp32)
         else:
             rounded = fp32.to(target.dtype)
         set_(target, rounded)
-        e = fp32 - target.float()
-        ls = (_log_ulp(target) - 1).float()
-        e_norm = _scale_by_exp2(e, -ls)
-        scaled = e_norm.clamp(-1.0, 1.0) * self.smax
-        self.correction.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(self.correction.dtype))
+        self.compute_correction(fp32, target)
 
-
-class _Int8State:
-    __slots__ = ('correction', 'scales', 'group_size')
-
-    def __init__(self, correction, scales, group_size):
-        self.correction = correction
-        self.scales = scales
-        self.group_size = group_size
-
-    def decode(self, x):
-        return _int8_decode_single(x, self.correction, self.scales, self.group_size)
-
-    def encode(self, fp32, target):
-        _int8_encode_single(fp32, target, self.correction, self.scales, self.group_size)
 
 
 @tree_apply
@@ -1299,7 +1289,14 @@ class StatefulOptimizer(torch.optim.Optimizer):
     _fallback_enabled: bool = False
     hvp_interval: int = 1  # grad is faster initially, hvp later
 
+    _INSTANCE_ATTRS = ("compile_step", "finite_differences", "fallback_to_finite_differences", "hvp_interval", "hessian_approx")
+
     def __init__(self, params, defaults, foreach: bool = True, use_ema: bool = False):
+        for attr in self._INSTANCE_ATTRS:
+            if attr in defaults:
+                val = defaults.pop(attr)
+                if val is not use_default:
+                    setattr(self, attr, val)
         super().__init__(params, {**defaults, "foreach": foreach})
         self.use_ema = use_ema
         self.mapping = {}
@@ -1621,43 +1618,6 @@ def copy_stochastic_list_(target: List[Tensor], source: List[Tensor]):
         copy_stochastic_(t, s)
 
 
-
-def _int8_decode_single(q, bf16_corr, scales, group_size):
-    groups, n = _pad_groups(q.reshape(-1).float(), group_size)
-    deq = groups / 127.0
-    result = deq * scales.reshape(-1, 1).float()
-    return (result.reshape(-1)[:n] + bf16_corr.reshape(-1).float()).view_as(q)
-
-
-def _int8_encode_single(fp32, q, bf16_corr, scales, group_size):
-    groups, n = _pad_groups(fp32.reshape(-1), group_size)
-    s = scales.reshape(-1, 1).float().clamp(min=1e-12)
-    normed = groups / s
-    quantized = (normed * 127.0).round().clamp(-127, 127)
-    deq = quantized / 127.0 * s
-    residual = groups - deq
-    q.copy_(quantized.reshape(-1)[:n].to(torch.int8).view_as(q))
-    bf16_corr.copy_(residual.reshape(-1)[:n].bfloat16().view_as(bf16_corr))
-
-
-@decorator_knowngood
-def _compilable_refresh_int8_scales_(q_list, scales_list, corr_list, group_size):
-    for q, scales, corr in zip(q_list, scales_list, corr_list):
-        groups_q, n = _pad_groups(q.reshape(-1).float(), group_size)
-        groups_c, _ = _pad_groups(corr.reshape(-1).float(), group_size)
-        decoded = groups_q / 127.0 * scales.reshape(-1, 1).float() + groups_c
-        new_scales = decoded.abs().amax(dim=1).clamp(min=1e-12).bfloat16()
-        normed = decoded / new_scales.reshape(-1, 1).float().clamp(min=1e-12)
-        new_q = (normed * 127.0).round().clamp(-127, 127)
-        new_corr = decoded - new_q / 127.0 * new_scales.reshape(-1, 1).float()
-        q.copy_(new_q.reshape(-1)[:n].to(torch.int8).view_as(q))
-        scales.copy_(new_scales.view_as(scales))
-        corr.copy_(new_corr.reshape(-1)[:n].bfloat16().view_as(corr))
-
-
-def refresh_int8_scales_(q_list, scales_list, corr_list, group_size):
-    q_list, scales_list, corr_list = list_guard(q_list, scales_list, corr_list)
-    _compilable_refresh_int8_scales_(q_list, scales_list, corr_list, group_size)
 
 
 @decorator_knowngood
@@ -2149,10 +2109,9 @@ def stochastic_round_(ref: Tensor, source: Tensor | None = None):
     if source.dtype in (torch.float16, torch.float32, torch.float64):
         source = source.to(torch.float32)
         noise = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
-        bits = source.view(dtype=torch.int32)
-        bits.add_(noise)
-        bits.bitwise_and_(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
-        return bits.view(dtype=torch.float32).bfloat16()
+        noise.add_(source.view(dtype=torch.int32))
+        noise.bitwise_and_(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
+        return noise.view(dtype=torch.float32).bfloat16()
     return source.to(ref.dtype)
 
 
@@ -3348,93 +3307,9 @@ def _scale_by_exp2(x, log_scale):
     return (x * torch.exp2(h)) * torch.exp2(log_scale - h)
 
 
-def _inv_softsign(x):
-    xa = x.abs()
-    return x.sign() * xa / (2.0 - xa)
 
 
-def _pad_groups(flat, group_size):
-    n = flat.numel()
-    pad = (-n) % group_size
-    if pad:
-        flat = torch.nn.functional.pad(flat, (0, pad))
-    return flat.reshape(-1, group_size), n
 
-
-@decorator_knowngood
-def _compilable_compute_ecc_(x32_list, xn_list, ecc_list, smax):
-    for x32, xn, ecc in zip(x32_list, xn_list, ecc_list):
-        e = x32 - xn.float()
-        ls = (_log_ulp(xn) - 1).float()
-        e_norm = _scale_by_exp2(e, -ls)
-        scaled = e_norm.clamp(-1.0, 1.0) * smax
-        ecc.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(ecc.dtype))
-
-
-@decorator_knowngood
-def _compilable_apply_ecc_(xn_list, ecc_list, out_list, smax):
-    for xn, ecc, out in zip(xn_list, ecc_list, out_list):
-        ls = (_log_ulp(xn) - 1).float()
-        out.copy_(xn.float() + _scale_by_exp2(ecc.float() / smax, ls))
-
-
-def compute_ecc(x_fp32, x_narrow, ecc_out):
-    x_fp32, x_narrow, ecc_out = list_guard(x_fp32, x_narrow, ecc_out)
-    smax = scalar_guard({torch.int8: 127.0, torch.int16: 32767.0}[ecc_out[0].dtype], x_fp32[0])
-    _compilable_compute_ecc_(x_fp32, x_narrow, ecc_out, smax)
-
-
-def apply_ecc(x_narrow, ecc, out):
-    x_narrow, ecc, out = list_guard(x_narrow, ecc, out)
-    smax = scalar_guard({torch.int8: 127.0, torch.int16: 32767.0}[ecc[0].dtype], out[0])
-    _compilable_apply_ecc_(x_narrow, ecc, out, smax)
-
-
-def encode_ecc(fp32, primaries, ecc_out):
-    fp32, primaries, ecc_out = list_guard(fp32, primaries, ecc_out)
-    for p, f in zip(primaries, fp32):
-        p.copy_(f)
-    compute_ecc(fp32, primaries, ecc_out)
-
-
-@decorator_knowngood
-def _compilable_quantize_int8_ecc_(x_list, q_list, s_list, c_list, group_size, compand):
-    for x, q, s, c in zip(x_list, q_list, s_list, c_list):
-        groups, n = _pad_groups(x.reshape(-1), group_size)
-        absmax = groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-        normed = groups / absmax
-        if compand:
-            normed = 2.0 * normed / (1.0 + normed.abs())
-        quantized = (normed * 127.0).round().clamp(-127, 127)
-        s_bf16 = absmax.squeeze(1).bfloat16()
-        deq = quantized / 127.0
-        if compand:
-            deq = _inv_softsign(deq)
-        residual = groups - deq * s_bf16.unsqueeze(1).float()
-        q.copy_(quantized.reshape(-1)[:n].to(torch.int8).view_as(q))
-        s.copy_(s_bf16.view_as(s))
-        c.copy_(residual.reshape(-1)[:n].bfloat16().view_as(c))
-
-
-@decorator_knowngood
-def _compilable_dequantize_int8_ecc_(q_list, s_list, c_list, out_list, group_size, compand):
-    for q, s, c, out in zip(q_list, s_list, c_list, out_list):
-        groups, n = _pad_groups(q.reshape(-1).float(), group_size)
-        deq = groups / 127.0
-        if compand:
-            deq = _inv_softsign(deq)
-        result = deq * s.reshape(-1, 1).float()
-        out.copy_((result.reshape(-1)[:n] + c.reshape(-1).float()).view_as(out))
-
-
-def quantize_int8_ecc(x, q_out, scales_out, corr_out, group_size=32, compand=False):
-    x, q_out, scales_out, corr_out = list_guard(x, q_out, scales_out, corr_out)
-    _compilable_quantize_int8_ecc_(x, q_out, scales_out, corr_out, group_size, compand)
-
-
-def dequantize_int8_ecc(q, scales, corr, out, group_size=32, compand=False):
-    q, scales, corr, out = list_guard(q, scales, corr, out)
-    _compilable_dequantize_int8_ecc_(q, scales, corr, out, group_size, compand)
 
 
 def identity(x):

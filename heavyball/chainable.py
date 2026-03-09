@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import functools
 import math
@@ -109,28 +110,43 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+def _build_defaults(locals_dict):
+    d = locals_dict.copy()
+    d.pop("self")
+    params = d.pop("params")
+    kwargs = d.pop("kwargs")
+    d.update(kwargs)
+    if kwargs:
+        utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+    return params, d
+
+
 class ECCConfig:
-    __slots__ = ("primary_dtype", "corr_dtype", "is_int8", "group_size", "compand")
+    __slots__ = ("primary_dtype", "corr_dtype")
 
     _MODES = {
-        "bf16+8": (torch.bfloat16, torch.int8, False),
-        "bf16+16": (torch.bfloat16, torch.int16, False),
-        "fp16+8": (torch.float16, torch.int8, False),
-        "fp16+16": (torch.float16, torch.int16, False),
-        "8+16": (torch.int8, torch.bfloat16, True),
+        "bf16+8": (torch.bfloat16, torch.int8),
+        "bf16+16": (torch.bfloat16, torch.int16),
+        "fp16+8": (torch.float16, torch.int8),
+        "fp16+16": (torch.float16, torch.int16),
     }
 
-    def __init__(self, mode, group_size=32, compand=False):
-        self.primary_dtype, self.corr_dtype, self.is_int8 = self._MODES[mode]
-        self.group_size = group_size
-        self.compand = compand
+    def __init__(self, mode):
+        self.primary_dtype, self.corr_dtype = self._MODES[mode]
+
+    @property
+    def smax(self):
+        return utils._ULPState._SMAX[self.corr_dtype]
+
+    def init_correction(self, correction, fp32, narrow):
+        utils._ULPState(correction, self.smax).compute_correction(fp32, narrow)
 
     @classmethod
     def from_group(cls, group, key="ecc"):
         mode = group.get(key)
         if not mode:
             return None
-        return cls(mode, group.get("ecc_group_size", 32), group.get("ecc_compand", False))
+        return cls(mode)
 
     def init_state(self, state, key, ref):
         _guard_in_state(
@@ -141,25 +157,17 @@ class ECCConfig:
             key + "::ecc",
             lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format),
         )
-        if self.is_int8:
-            ns = (ref.numel() + self.group_size - 1) // self.group_size
-            _guard_in_state(state, key + "::scales", lambda: torch.zeros(ns, dtype=torch.bfloat16, device=ref.device))
 
-    def decode(self, primaries, states, key, out):
-        corrections = [st[key + "::ecc"] for st in states]
-        if self.is_int8:
-            scales = [st[key + "::scales"] for st in states]
-            utils.dequantize_int8_ecc(primaries, scales, corrections, out, self.group_size, self.compand)
-        else:
-            utils.apply_ecc(primaries, corrections, out)
-
-    def encode(self, fp32, primaries, states, key):
-        corrections = [st[key + "::ecc"] for st in states]
-        if self.is_int8:
-            scales = [st[key + "::scales"] for st in states]
-            utils.quantize_int8_ecc(fp32, primaries, scales, corrections, self.group_size, self.compand)
-        else:
-            utils.encode_ecc(fp32, primaries, corrections)
+    @contextlib.contextmanager
+    def attached(self, tensors, corrections):
+        smax = self.smax
+        for t, c in zip(tensors, corrections):
+            t._ecc = utils._ULPState(c, smax)
+        try:
+            yield
+        finally:
+            for t in tensors:
+                t.__dict__.pop('_ecc', None)
 
 
 def _init_mu_product(state, group, update, grad, param, **kwargs):
@@ -187,30 +195,12 @@ class ZeroGuard(FunctionTransform):
 
         states = [state(p) for p in param]
         names = [self.val_name(n) for n in self.names]
-
         primary_vars = [[st[vn] for st in states] for vn in names]
-        for vn, plist in zip(names, primary_vars):
-            for st, p in zip(states, plist):
-                if ecc.is_int8:
-                    p._ecc = utils._Int8State(st[vn + "::ecc"], st[vn + "::scales"], ecc.group_size)
-                else:
-                    smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc.corr_dtype]
-                    p._ecc = utils._ULPState(st[vn + "::ecc"], smax)
-        try:
+        with contextlib.ExitStack() as stack:
+            for vn, plist in zip(names, primary_vars):
+                corrs = [st[vn + "::ecc"] for st in states]
+                stack.enter_context(ecc.attached(plist, corrs))
             return self.fn(state, group, update, grad, param, *args, *primary_vars, **kwargs)
-        finally:
-            for plist in primary_vars:
-                for p in plist:
-                    if hasattr(p, '_ecc'):
-                        del p._ecc
-            if ecc.is_int8:
-                for vn in names:
-                    utils.refresh_int8_scales_(
-                        [st[vn] for st in states],
-                        [st[vn + "::scales"] for st in states],
-                        [st[vn + "::ecc"] for st in states],
-                        ecc.group_size,
-                    )
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -1277,47 +1267,13 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
         return
 
-    mapping = state.__self__.mapping_inverse
     states = [state(p) for p in param]
-    orig_keys = [utils._tensor_key(p) for p in param]
-    for st, p, orig_key in zip(states, param, orig_keys):
-        if "param::ecc" not in st:
-            _guard_in_state(
-                st, "param::ecc",
-                lambda: torch.zeros_like(p, dtype=ecc.corr_dtype, memory_format=torch.preserve_format),
-            )
-            if ecc.is_int8:
-                ns = (p.numel() + ecc.group_size - 1) // ecc.group_size
-                _guard_in_state(st, "param::scales", lambda: torch.zeros(ns, dtype=torch.bfloat16, device=p.device))
-            fp32_backup = [p.data.float()]
-            p.data = p.data.to(ecc.primary_dtype)
-            ecc.encode(fp32_backup, [p.data], [st], "param")
-            bf16_key = utils._tensor_key(p)
-            if bf16_key != orig_key and orig_key in mapping:
-                mapping[bf16_key] = mapping.pop(orig_key)
-
-    for st, p in zip(states, param):
-        if ecc.is_int8:
-            p._ecc = utils._Int8State(st["param::ecc"], st["param::scales"], ecc.group_size)
-        else:
-            smax = {torch.int8: 127.0, torch.int16: 32767.0}[ecc.corr_dtype]
-            p._ecc = utils._ULPState(st["param::ecc"], smax)
-    try:
+    corrs = [st["param::ecc"] for st in states]
+    with ecc.attached(param, corrs):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
             utils.update_param_(param, update, group["lr"], group["weight_decay"],
                                 caution=group["caution"], grad=grad)
-    finally:
-        for p in param:
-            if hasattr(p, '_ecc'):
-                del p._ecc
-        if ecc.is_int8:
-            utils.refresh_int8_scales_(
-                list(param),
-                [st["param::scales"] for st in states],
-                [st["param::ecc"] for st in states],
-                ecc.group_size,
-            )
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
@@ -1366,6 +1322,42 @@ class ChainOpt(utils.StatefulOptimizer):
         super().__init__(params, base, foreach)
         self.fns = fns
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
+        self._init_param_ecc()
+
+    def _init_param_ecc(self):
+        for group in self.param_groups:
+            self._init_param_ecc_group(group)
+
+    def _init_param_ecc_group(self, group):
+        ecc = ECCConfig.from_group(group, key="param_ecc")
+        if ecc is None:
+            return
+        for p in group["params"]:
+            fp32 = None
+            if p.dtype != ecc.primary_dtype:
+                fp32 = p.data.float()
+                p.data = p.data.to(ecc.primary_dtype)
+                old_views = self.mapping.pop(p, ())
+                for ov in old_views:
+                    self.mapping_inverse.pop(utils._tensor_key(ov), None)
+            if p not in self.mapping:
+                self.mapping[p] = p_views = utils.merge_group(group, p)
+                for i, pv in enumerate(p_views):
+                    self.mapping_inverse[utils._tensor_key(pv)] = (p, i)
+            fp32_views = None if fp32 is None else utils.merge_group(group, fp32)
+            for i, pv in enumerate(self.mapping[p]):
+                st = self.state_(pv)
+                if "param::ecc" in st:
+                    continue
+                st["param::ecc"] = torch.zeros_like(pv, dtype=ecc.corr_dtype)
+                if fp32_views is not None:
+                    ecc.init_correction(st["param::ecc"], fp32_views[i], pv.data)
+
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        if not hasattr(self, "mapping"):
+            return
+        self._init_param_ecc_group(self.param_groups[-1])
 
     @staticmethod
     def _restore_ecc_dtypes(optimizer, *args):
@@ -1388,12 +1380,18 @@ class ChainOpt(utils.StatefulOptimizer):
                         cfg = param_ecc if is_param_key else ecc
                         if cfg is None:
                             continue
-                        if k.endswith("::scales"):
-                            idx_state[k] = v.to(torch.bfloat16)
-                        elif k.endswith("::ecc"):
+                        if k.endswith("::ecc"):
                             idx_state[k] = v.to(cfg.corr_dtype)
                         elif (k + "::ecc") in idx_state:
                             idx_state[k] = v.to(cfg.primary_dtype)
+                if param_ecc is not None and p.dtype != param_ecc.primary_dtype:
+                    orig_key = utils._tensor_key(p)
+                    p.data = p.data.to(param_ecc.primary_dtype)
+                    bf16_key = utils._tensor_key(p)
+                    if orig_key in optimizer.mapping_inverse:
+                        optimizer.mapping_inverse[bf16_key] = optimizer.mapping_inverse.pop(orig_key)
+            if param_ecc is not None:
+                optimizer._init_param_ecc_group(group)
 
     @property
     def fns(self):
@@ -1568,8 +1566,8 @@ class BaseOpt(ChainOpt):
                 fn = functools.partial(fn, *args, **kwargs)
             fns = tuple(fns)[:-1] + (fn,)
 
-        self.compile_step = default(compile_step, self.compile_step)
-        self.promote = default(promote, self.promote)
+        self.compile_step = default(default(compile_step, defaults.pop("compile_step", use_default)), self.compile_step)
+        self.promote = default(default(promote, defaults.pop("promote", use_default)), self.promote)
         if default(palm, self.palm):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
