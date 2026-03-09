@@ -400,7 +400,11 @@ def eps_sqrt(item, eps):
 
 @decorator_knowngood
 def _compilable_exp_avg_sq_(
-    state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor, out: None | List[None | Tensor],
+    state: List[Tensor],
+    grad: List[Tensor],
+    beta2: Tensor,
+    eps: Tensor,
+    out: None | List[None | Tensor],
 ):
     g32 = promote(grad)
     s32 = _lerp(state, [g_ * g_ for g_ in g32], beta2)
@@ -1117,7 +1121,7 @@ def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
 
 
 class _ULPState:
-    __slots__ = ('correction', 'smax')
+    __slots__ = ("correction", "smax")
     _SMAX = {torch.int8: 127.0, torch.int16: 32767.0}
 
     def __init__(self, correction, smax):
@@ -1144,13 +1148,12 @@ class _ULPState:
         self.compute_correction(fp32, target)
 
 
-
 @tree_apply
 def promote(x):
     if isinstance(x, torch.dtype) and x in (torch.bfloat16, torch.float16, torch.int8):
         return torch.float32
     if isinstance(x, Tensor):
-        ecc = getattr(x, '_ecc', None)
+        ecc = getattr(x, "_ecc", None)
         if ecc is not None:
             return ecc.decode(x)
         if x.dtype in (torch.bfloat16, torch.float16):
@@ -1289,7 +1292,13 @@ class StatefulOptimizer(torch.optim.Optimizer):
     _fallback_enabled: bool = False
     hvp_interval: int = 1  # grad is faster initially, hvp later
 
-    _INSTANCE_ATTRS = ("compile_step", "finite_differences", "fallback_to_finite_differences", "hvp_interval", "hessian_approx")
+    _INSTANCE_ATTRS = (
+        "compile_step",
+        "finite_differences",
+        "fallback_to_finite_differences",
+        "hvp_interval",
+        "hessian_approx",
+    )
 
     def __init__(self, params, defaults, foreach: bool = True, use_ema: bool = False):
         for attr in self._INSTANCE_ATTRS:
@@ -1616,8 +1625,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
 def copy_stochastic_list_(target: List[Tensor], source: List[Tensor]):
     for t, s in zip(target, source):
         copy_stochastic_(t, s)
-
-
 
 
 @decorator_knowngood
@@ -2121,7 +2128,7 @@ def _compilable_copy_stochastic_(target: Tensor, source: Tensor):
 
 
 def copy_stochastic_(target: Tensor, source: Tensor):
-    ecc = getattr(target, '_ecc', None)
+    ecc = getattr(target, "_ecc", None)
     if ecc is not None:
         ecc.encode(source, target)
         return
@@ -2132,7 +2139,12 @@ def copy_stochastic_(target: Tensor, source: Tensor):
 
 @decorator_knowngood
 def _compilable_update_(
-    p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Tensor, caution: bool, g: List[Optional[Tensor]],
+    p: List[Tensor],
+    u: List[Tensor],
+    decay: Tensor,
+    lr: Tensor,
+    caution: bool,
+    g: List[Optional[Tensor]],
 ):
     for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a foreach
         u_ = promote(u_.view_as(p_))
@@ -2144,7 +2156,12 @@ def _compilable_update_(
 
 
 def update_param_(
-    param: List[Tensor], update: List[Tensor], lr: float, decay: float, caution: bool = False, grad: List[Tensor] = None,
+    param: List[Tensor],
+    update: List[Tensor],
+    lr: float,
+    decay: float,
+    caution: bool = False,
+    grad: List[Tensor] = None,
 ):
     param, update, grad = list_guard(param, update, grad)
     lr = scalar_guard(lr, param[0])
@@ -3305,11 +3322,6 @@ def _scale_by_exp2(x, log_scale):
     # Split to avoid intermediate overflow when log_scale is large
     h = (log_scale / 2.0).floor()
     return (x * torch.exp2(h)) * torch.exp2(log_scale - h)
-
-
-
-
-
 
 
 def identity(x):

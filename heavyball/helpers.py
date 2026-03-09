@@ -370,22 +370,22 @@ class BoTorchSampler(SimpleAPIBaseSampler):
 
 
 class _Param:
-    __slots__ = ('lb', 'name', 'ptype', 'ub')
+    __slots__ = ("lb", "name", "ptype", "ub")
 
     def __init__(self, name, ptype, lb, ub):
         self.name, self.ptype, self.lb, self.ub = name, ptype, float(lb), float(ub)
 
     @property
     def is_log(self):
-        return self.ptype in ('pow', 'pow_int')
+        return self.ptype in ("pow", "pow_int")
 
     @property
     def is_int(self):
-        return self.ptype in ('int', 'pow_int')
+        return self.ptype in ("int", "pow_int")
 
     @property
     def is_discrete_after_transform(self):
-        return self.ptype == 'int'
+        return self.ptype == "int"
 
     @property
     def opt_lb(self):
@@ -412,7 +412,7 @@ class DesignSpace:
         self.paras = {}
         self.para_names = []
         for c in configs:
-            p = _Param(c['name'], c['type'], c['lb'], c['ub'])
+            p = _Param(c["name"], c["type"], c["lb"], c["ub"])
             self.paras[p.name] = p
             self.para_names.append(p.name)
         return self
@@ -421,13 +421,13 @@ class DesignSpace:
     def num_paras(self):
         return len(self.para_names)
 
-    def opt_lb(self, device='cpu'):
+    def opt_lb(self, device="cpu"):
         return torch.tensor([self.paras[n].opt_lb for n in self.para_names], device=device)
 
-    def opt_ub(self, device='cpu'):
+    def opt_ub(self, device="cpu"):
         return torch.tensor([self.paras[n].opt_ub for n in self.para_names], device=device)
 
-    def transform(self, df, device='cpu'):
+    def transform(self, df, device="cpu"):
         cols = [self.paras[n].transform(df[n].values.astype(float)) for n in self.para_names]
         data = np.column_stack(cols) if cols else np.zeros((len(df), 0))
         return torch.as_tensor(data, dtype=torch.float32, device=device)
@@ -493,12 +493,12 @@ class _Surrogate:
         with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(float_value=1e-3):
             pred = self.gp(self._scale_x(X))
         mu = pred.mean * self._y_std + self._y_mu
-        var = pred.variance * self._y_std ** 2
+        var = pred.variance * self._y_std**2
         return mu, var.clamp(min=1e-8)
 
 
 class HEBO:
-    def __init__(self, space, scramble_seed=None, rand_sample=None, device='cpu'):
+    def __init__(self, space, scramble_seed=None, rand_sample=None, device="cpu"):
         self.space = space
         self.device = torch.device(device)
         self.X = pd.DataFrame(columns=space.para_names)
@@ -520,11 +520,11 @@ class HEBO:
         ys = self.y / max(self.y.std(), 1e-8)
         try:
             if self.y.min() <= 0:
-                y = power_transform(ys, method='yeo-johnson')
+                y = power_transform(ys, method="yeo-johnson")
             else:
-                y = power_transform(ys, method='box-cox')
+                y = power_transform(ys, method="box-cox")
                 if y.std() < 0.5:
-                    y = power_transform(ys, method='yeo-johnson')
+                    y = power_transform(ys, method="yeo-johnson")
             if y.std() < 0.5:
                 raise RuntimeError()
             return torch.as_tensor(y, dtype=torch.float32, device=self.device)

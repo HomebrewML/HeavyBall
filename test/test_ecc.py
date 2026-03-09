@@ -7,7 +7,7 @@ from heavyball import utils
 from heavyball.chainable import ECCConfig
 from heavyball.utils import clean, set_torch
 
-heavyball.utils.compile_mode = 'default'
+heavyball.utils.compile_mode = "default"
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -333,31 +333,25 @@ def _measure_peak(cls, n, lr, ecc=None, param_ecc=None, steps=3):
     ids=["AdamW", "SFAdamW", "RMSprop"],
 )
 def test_ecc_peak_memory(cls, lr, mode):
-    n = 500_000
+    n = 2**24
     pre_base, peak_base = _measure_peak(cls, n, lr)
     pre_ecc, peak_ecc = _measure_peak(cls, n, lr, ecc=mode)
 
     # steady state must use less memory than baseline
-    assert pre_ecc < pre_base, (
-        f"ECC pre-step {pre_ecc:.1f} B/p >= baseline {pre_base:.1f} B/p"
-    )
+    assert pre_ecc < pre_base, f"ECC pre-step {pre_ecc:.1f} B/p >= baseline {pre_base:.1f} B/p"
 
-    assert peak_ecc < peak_base, (
-        f"ECC peak {peak_ecc:.1f} B/p >= 2x baseline peak {peak_base:.1f} B/p"
-    )
+    assert peak_ecc < peak_base, f"ECC peak {peak_ecc:.1f} B/p >= baseline peak {peak_base:.1f} B/p"
 
 
 @pytest.mark.parametrize("combined", [False, True], ids=["param_only", "state+param"])
 def test_param_ecc_peak_memory(combined):
-    n = 500_000
+    n = 2**24
     cls, lr = heavyball.PaLMForeachSFAdamW, 1e-2
     pre_base, peak_base = _measure_peak(cls, n, lr)
     ecc = "bf16+8" if combined else None
     pre_ecc, peak_ecc = _measure_peak(cls, n, lr, ecc=ecc, param_ecc="bf16+8")
 
-    assert peak_ecc < peak_base, (
-        f"param_ecc peak {peak_ecc:.1f} B/p >= 2x baseline peak {peak_base:.1f} B/p"
-    )
+    assert peak_ecc < peak_base, f"param_ecc peak {peak_ecc:.1f} B/p >= baseline peak {peak_base:.1f} B/p"
 
 
 def test_ecc_live_path_nonzero_correction():
@@ -595,12 +589,7 @@ def test_param_ecc_load_order_model_before_optimizer():
 
 
 def test_param_ecc_load_order_optimizer_before_model():
-    """Optimizer-first with stripped param::ecc: correction computed from stale params.
-
-    Documents that model-first is the intended order. Optimizer-first produces
-    a zero correction that becomes stale when model state is loaded after, but
-    training still converges because ECC self-corrects.
-    """
+    """Optimizer-first with stripped param::ecc: correction computed from stale params."""
     from copy import deepcopy
 
     set_torch()

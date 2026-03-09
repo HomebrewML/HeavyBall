@@ -167,7 +167,7 @@ class ECCConfig:
             yield
         finally:
             for t in tensors:
-                t.__dict__.pop('_ecc', None)
+                t.__dict__.pop("_ecc", None)
 
 
 def _init_mu_product(state, group, update, grad, param, **kwargs):
@@ -313,7 +313,7 @@ class NoStateNoForeach(FunctionTransform):
 
 def _view_preserve_ecc(src, target):
     v = src.view_as(target)
-    ecc = getattr(src, '_ecc', None)
+    ecc = getattr(src, "_ecc", None)
     if ecc is not None:
         v._ecc = ecc
     return v
@@ -338,7 +338,6 @@ class SqueezeGrad(FunctionTransform):
 
 def zero_guard(*names):
     return functools.partial(ZeroGuard, names=names)
-
 
 
 def copy_guard(index, *names):
@@ -420,7 +419,10 @@ def l1_weight_decay_to_ema(group, update, grad, param, exp_avg):
 @no_state
 def scale_by_exp_avg_sq(group, update, grad, param, exp_avg_sq):
     return utils.scale_by_exp_avg_sq_(
-        exp_avg_sq, update, utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"],
+        exp_avg_sq,
+        update,
+        utils.beta_debias(utils.get_beta2(group), group["step"]),
+        group["eps"],
     )
 
 
@@ -642,7 +644,10 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [
+            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
+            for ea, u, easq_ in zip(exp_avg, update, easq)
+        ]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -716,7 +721,10 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [
+            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
+            for ea, u, easq_ in zip(exp_avg, update, easq)
+        ]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -1272,8 +1280,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
     with ecc.attached(param, corrs):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
-            utils.update_param_(param, update, group["lr"], group["weight_decay"],
-                                caution=group["caution"], grad=grad)
+            utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):

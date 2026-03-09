@@ -111,11 +111,13 @@ def test_hebo_sampler_observe_and_sample(monkeypatch):
 
 
 def test_hebo_suggest_observe_roundtrip():
-    space = DesignSpace().parse([
-        {"name": "lr", "type": "pow", "lb": 1e-5, "ub": 1.0},
-        {"name": "wd", "type": "num", "lb": 0.0, "ub": 0.1},
-        {"name": "layers", "type": "int", "lb": 1, "ub": 8},
-    ])
+    space = DesignSpace().parse(
+        [
+            {"name": "lr", "type": "pow", "lb": 1e-5, "ub": 1.0},
+            {"name": "wd", "type": "num", "lb": 0.0, "ub": 0.1},
+            {"name": "layers", "type": "int", "lb": 1, "ub": 8},
+        ]
+    )
     opt = HEBO(space, scramble_seed=42)
 
     for i in range(space.num_paras + 5):
@@ -143,7 +145,7 @@ def test_hebo_discrete_explores_all_values():
         sug = opt.suggest()
         val = int(sug["x"].iloc[0])
         seen.add(val)
-        opt.observe(sug, np.array([[val ** 2]]))
+        opt.observe(sug, np.array([[val**2]]))
     assert seen == {0, 1, 2, 3}
 
 
@@ -167,9 +169,9 @@ _HEBO_BASELINE = {"sphere": 0.03, "branin": 0.40, "mixed": 0.01}
 
 
 def _branin(x1, x2):
-    a, b, c = 1, 5.1 / (4 * math.pi ** 2), 5 / math.pi
+    a, b, c = 1, 5.1 / (4 * math.pi**2), 5 / math.pi
     r, s, t = 6, 10, 1 / (8 * math.pi)
-    return a * (x2 - b * x1 ** 2 + c * x1 - r) ** 2 + s * (1 - t) * math.cos(x1) + s
+    return a * (x2 - b * x1**2 + c * x1 - r) ** 2 + s * (1 - t) * math.cos(x1) + s
 
 
 def _run_hebo(space_cfg, objective, n_iter, seed=42):
@@ -183,8 +185,7 @@ def _run_hebo(space_cfg, objective, n_iter, seed=42):
 
 def test_hebo_perf_sphere():
     opt = _run_hebo(
-        [{"name": "x1", "type": "num", "lb": -5, "ub": 5},
-         {"name": "x2", "type": "num", "lb": -5, "ub": 5}],
+        [{"name": "x1", "type": "num", "lb": -5, "ub": 5}, {"name": "x2", "type": "num", "lb": -5, "ub": 5}],
         lambda sug: sug["x1"].iloc[0] ** 2 + sug["x2"].iloc[0] ** 2,
         n_iter=15,
     )
@@ -193,8 +194,7 @@ def test_hebo_perf_sphere():
 
 def test_hebo_perf_branin():
     opt = _run_hebo(
-        [{"name": "x1", "type": "num", "lb": -5, "ub": 10},
-         {"name": "x2", "type": "num", "lb": 0, "ub": 15}],
+        [{"name": "x1", "type": "num", "lb": -5, "ub": 10}, {"name": "x2", "type": "num", "lb": 0, "ub": 15}],
         lambda sug: _branin(sug["x1"].iloc[0], sug["x2"].iloc[0]),
         n_iter=20,
     )
@@ -207,9 +207,11 @@ def test_hebo_perf_mixed():
         return (np.log10(lr) + 0.5) ** 2 + 100 * (wd - 0.09) ** 2 + (layers - 7) ** 2
 
     opt = _run_hebo(
-        [{"name": "lr", "type": "pow", "lb": 1e-5, "ub": 1.0},
-         {"name": "wd", "type": "num", "lb": 0.0, "ub": 0.1},
-         {"name": "layers", "type": "int", "lb": 1, "ub": 8}],
+        [
+            {"name": "lr", "type": "pow", "lb": 1e-5, "ub": 1.0},
+            {"name": "wd", "type": "num", "lb": 0.0, "ub": 0.1},
+            {"name": "layers", "type": "int", "lb": 1, "ub": 8},
+        ],
         objective,
         n_iter=15,
     )
