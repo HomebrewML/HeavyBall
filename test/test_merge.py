@@ -19,12 +19,10 @@ class Param(nn.Module):
 
 
 @pytest.mark.parametrize("opt", ["ForeachPSGDKron"])
-@pytest.mark.parametrize("method", ["qr", "newtonschulz2", "svd", "eigh"])
 @pytest.mark.parametrize("size", [(16, 16, 16, 16), (4, 4, 4, 4), (512, 1, 128), (32128, 768)])
 @pytest.mark.parametrize("merge,split", [(False, False), (True, False), (True, True)])
 def test_merge(
     opt,
-    method,
     size: List[int],
     merge,
     split,
@@ -32,13 +30,11 @@ def test_merge(
     iterations: int = 5,
     outer_iterations: int = 3,
 ):
-    if "soap" not in opt.lower() and method != "qr":
-        raise pytest.skip("Only SOAP supports `method` argument")
     clean()
     set_torch()
 
     opt = getattr(heavyball, opt)
-    heavyball.utils.zeroth_power_mode = method
+    heavyball.utils.zeroth_power_mode = "qr"
 
     for _ in range(outer_iterations):
         clean()
@@ -55,7 +51,8 @@ def test_merge(
         )
 
         for i in range(iterations):
-            model(torch.randn((1, size[0]), device="cuda")).sum().backward()
+            for p in model.parameters():
+                p.grad = torch.randn_like(p, requires_grad=False)
             o.step()
             o.zero_grad()
             print(o.state_size())

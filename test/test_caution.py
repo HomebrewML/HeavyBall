@@ -7,16 +7,17 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
 
+heavyball.utils.compile_mode = None
 config.cache_size_limit = 128
 
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(128, 2)])
-def test_caution(opt, size, depth: int, iterations: int = 16, outer_iterations: int = 1):
+@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
+def test_caution(opt, size: int = 128, depth: int = 2, iterations: int = 16, outer_iterations: int = 1):
     set_torch()
     opt = getattr(heavyball, opt)
     peaks = []

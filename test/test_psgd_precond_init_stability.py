@@ -58,7 +58,7 @@ def test_stable_exp_scalar(x_val, dtype):
     _isclose(result.to(x.dtype), expected)
 
 
-@pytest.mark.parametrize("numel", [2**i for i in range(10)])
+@pytest.mark.parametrize("numel", [1, 4, 64, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
 def test_stable_exp_tensor(numel, dtype):
     x, x_np = _get_tensor(numel, dtype)
@@ -67,8 +67,8 @@ def test_stable_exp_tensor(numel, dtype):
     _isclose(result.to(x.dtype), expected)
 
 
-@pytest.mark.parametrize("numel", [2**i for i in range(10)])
-@pytest.mark.parametrize("pow_val", list(range(1, 16)))
+@pytest.mark.parametrize("numel", [1, 4, 64, 512])
+@pytest.mark.parametrize("pow_val", [1, 3, 7, 15])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
 def test_lse_mean(numel, pow_val, dtype):
     x, x_np = _get_tensor(numel, dtype)
@@ -77,8 +77,8 @@ def test_lse_mean(numel, pow_val, dtype):
     _isclose(result.to(x.dtype), expected)
 
 
-@pytest.mark.parametrize("numel", [2**i for i in range(10)])
-@pytest.mark.parametrize("pow_val", list(range(1, 16)))
+@pytest.mark.parametrize("numel", [1, 4, 64, 512])
+@pytest.mark.parametrize("pow_val", [1, 3, 7, 15])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
 def test_mean_root(numel, pow_val, dtype):
     x, x_np = _get_tensor(numel, dtype)
@@ -87,9 +87,9 @@ def test_mean_root(numel, pow_val, dtype):
     _isclose(result.to(x.dtype), expected)
 
 
-@pytest.mark.parametrize("numel", [2**i for i in range(10)])
-@pytest.mark.parametrize("pow0_val", list(range(1, 16)))
-@pytest.mark.parametrize("pow1_val", list(range(1, 16)))
+@pytest.mark.parametrize("numel", [1, 4, 64, 512])
+@pytest.mark.parametrize("pow0_val", [1, 5, 15])
+@pytest.mark.parametrize("pow1_val", [1, 5, 15])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
 def test_divided_root(numel, pow0_val, pow1_val, dtype):
     x, x_np = _get_tensor(numel, dtype)

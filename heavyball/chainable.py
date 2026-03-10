@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import functools
 import math
@@ -109,6 +110,66 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+def _build_defaults(locals_dict):
+    d = locals_dict.copy()
+    d.pop("self")
+    params = d.pop("params")
+    kwargs = d.pop("kwargs")
+    d.update(kwargs)
+    if kwargs:
+        utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+    return params, d
+
+
+class ECCConfig:
+    __slots__ = ("primary_dtype", "corr_dtype")
+
+    _MODES = {
+        "bf16+8": (torch.bfloat16, torch.int8),
+        "bf16+16": (torch.bfloat16, torch.int16),
+        "fp16+8": (torch.float16, torch.int8),
+        "fp16+16": (torch.float16, torch.int16),
+    }
+
+    def __init__(self, mode):
+        self.primary_dtype, self.corr_dtype = self._MODES[mode]
+
+    @property
+    def smax(self):
+        return utils._ULPState._SMAX[self.corr_dtype]
+
+    def init_correction(self, correction, fp32, narrow):
+        utils._ULPState(correction, self.smax).compute_correction(fp32, narrow)
+
+    @classmethod
+    def from_group(cls, group, key="ecc"):
+        mode = group.get(key)
+        if not mode:
+            return None
+        return cls(mode)
+
+    def init_state(self, state, key, ref):
+        _guard_in_state(
+            state, key, lambda: torch.zeros_like(ref, dtype=self.primary_dtype, memory_format=torch.preserve_format)
+        )
+        _guard_in_state(
+            state,
+            key + "::ecc",
+            lambda: torch.zeros_like(ref, dtype=self.corr_dtype, memory_format=torch.preserve_format),
+        )
+
+    @contextlib.contextmanager
+    def attached(self, tensors, corrections):
+        smax = self.smax
+        for t, c in zip(tensors, corrections):
+            t._ecc = utils._ULPState(c, smax)
+        try:
+            yield
+        finally:
+            for t in tensors:
+                t.__dict__.pop("_ecc", None)
+
+
 def _init_mu_product(state, group, update, grad, param, **kwargs):
     dtype = _storage_dtype(group)
     state["mu_product"] = torch.ones((), dtype=dtype, device=param.device)
@@ -119,11 +180,27 @@ class ZeroGuard(FunctionTransform):
         super().__init__(fn, names)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
+        ecc = ECCConfig.from_group(group)
         for name in self.names:
-            _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
+            vn = self.val_name(name)
+            if ecc is None:
+                _zero_guard(state, vn, param, _storage_dtype(group))
+            else:
+                ecc.init_state(state, vn, param)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
-        return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+        ecc = ECCConfig.from_group(group)
+        if ecc is None:
+            return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
+
+        states = [state(p) for p in param]
+        names = [self.val_name(n) for n in self.names]
+        primary_vars = [[st[vn] for st in states] for vn in names]
+        with contextlib.ExitStack() as stack:
+            for vn, plist in zip(names, primary_vars):
+                corrs = [st[vn + "::ecc"] for st in states]
+                stack.enter_context(ecc.attached(plist, corrs))
+            return self.fn(state, group, update, grad, param, *args, *primary_vars, **kwargs)
 
 
 class PrecondGradAccumGuard(FunctionTransform):
@@ -234,19 +311,27 @@ class NoStateNoForeach(FunctionTransform):
         return updates
 
 
+def _view_preserve_ecc(src, target):
+    v = src.view_as(target)
+    ecc = getattr(src, "_ecc", None)
+    if ecc is not None:
+        v._ecc = ecc
+    return v
+
+
 class SqueezeGrad(FunctionTransform):
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         original_shapes = [u.shape for u in update]
         update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
-        grad = [x.view_as(u) for x, u in zip(grad, update)]
-        param = [x.view_as(u) for x, u in zip(param, update)]
+        grad = [_view_preserve_ecc(x, u) for x, u in zip(grad, update)]
+        param = [_view_preserve_ecc(x, u) for x, u in zip(param, update)]
         args = list(args)
         for i, a in enumerate(args):
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
-                args[i] = [x.view_as(u) for x, u in zip(a, update)]
+                args[i] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         for k, a in kwargs.items():
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
-                kwargs[k] = [x.view_as(u) for x, u in zip(a, update)]
+                kwargs[k] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         out = self.fn(state, group, update, grad, param, *args, **kwargs)
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
@@ -273,6 +358,14 @@ def no_state_no_foreach(fn):
 
 class SkipUpdate(ValueError):
     pass
+
+
+@zero_guard("mars_old_grad")
+@no_state
+def mars(group, update, grad, param, mars_old_grad):
+    utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
+    utils.copy_stochastic_list_(grad, update)
+    return update
 
 
 @zero_guard("exp_avg")
@@ -326,7 +419,10 @@ def l1_weight_decay_to_ema(group, update, grad, param, exp_avg):
 @no_state
 def scale_by_exp_avg_sq(group, update, grad, param, exp_avg_sq):
     return utils.scale_by_exp_avg_sq_(
-        exp_avg_sq, update, utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"]
+        exp_avg_sq,
+        update,
+        utils.beta_debias(utils.get_beta2(group), group["step"]),
+        group["eps"],
     )
 
 
@@ -548,7 +644,10 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.set_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [
+            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
+            for ea, u, easq_ in zip(exp_avg, update, easq)
+        ]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -622,7 +721,10 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     if group["step"] == 2:
         update = utils.promote(update)
         easq = utils.promote(exp_avg_sq)
-        [utils.set_(ea, u / easq_.sqrt().clamp_(min=group["eps"])) for ea, u, easq_ in zip(exp_avg, update, easq)]
+        [
+            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
+            for ea, u, easq_ in zip(exp_avg, update, easq)
+        ]
         utils.scale_by_exp_avg_sq_(
             exp_avg_sq,
             update,
@@ -924,9 +1026,7 @@ def _update_psgd_precond(
     if isinstance(prob, float):
         float_prob = prob
     else:
-        prob_step = group.get(f"cumulative_prob_{id(Q)}_prob_step", 1)
-        float_prob = prob(prob_step)
-        group[f"cumulative_prob_{id(Q)}_prob_step"] = prob_step + 1
+        float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if precond is not None:
@@ -1147,6 +1247,7 @@ def apply_to_idx(fn, idx):
         args = [state, group, update, grad, param]
         return fn(args[idx])
 
+    _fn.__name__ = _fn.__qualname__ = f"apply_{getattr(fn, '__name__', repr(fn))}_to_{idx}"
     return _fn
 
 
@@ -1165,9 +1266,21 @@ def _inner_chain(state, group, update, grad, param, *fns):
 
 def chain(state: Union[callable, dict], group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
-    update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
-    if not skip_update and update is not None:
+
+    ecc = ECCConfig.from_group(group, key="param_ecc")
+    if ecc is None:
+        update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+        if skip_update or update is None:
+            return
         utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+        return
+
+    states = [state(p) for p in param]
+    corrs = [st["param::ecc"] for st in states]
+    with ecc.attached(param, corrs):
+        update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
+        if not skip_update and update is not None:
+            utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
@@ -1215,6 +1328,77 @@ class ChainOpt(utils.StatefulOptimizer):
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, foreach)
         self.fns = fns
+        self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
+        self._init_param_ecc()
+
+    def _init_param_ecc(self):
+        for group in self.param_groups:
+            self._init_param_ecc_group(group)
+
+    def _init_param_ecc_group(self, group):
+        ecc = ECCConfig.from_group(group, key="param_ecc")
+        if ecc is None:
+            return
+        for p in group["params"]:
+            fp32 = None
+            if p.dtype != ecc.primary_dtype:
+                fp32 = p.data.float()
+                p.data = p.data.to(ecc.primary_dtype)
+                old_views = self.mapping.pop(p, ())
+                for ov in old_views:
+                    self.mapping_inverse.pop(utils._tensor_key(ov), None)
+            if p not in self.mapping:
+                self.mapping[p] = p_views = utils.merge_group(group, p)
+                for i, pv in enumerate(p_views):
+                    self.mapping_inverse[utils._tensor_key(pv)] = (p, i)
+            fp32_views = None if fp32 is None else utils.merge_group(group, fp32)
+            for i, pv in enumerate(self.mapping[p]):
+                st = self.state_(pv)
+                if "param::ecc" in st:
+                    continue
+                st["param::ecc"] = torch.zeros_like(pv, dtype=ecc.corr_dtype)
+                if fp32_views is not None:
+                    ecc.init_correction(st["param::ecc"], fp32_views[i], pv.data)
+
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        if not hasattr(self, "mapping"):
+            return
+        self._init_param_ecc_group(self.param_groups[-1])
+
+    @staticmethod
+    def _restore_ecc_dtypes(optimizer, *args):
+        for group in optimizer.param_groups:
+            ecc = ECCConfig.from_group(group, key="ecc")
+            param_ecc = ECCConfig.from_group(group, key="param_ecc")
+            if ecc is None and param_ecc is None:
+                continue
+            for p in group["params"]:
+                if p not in optimizer.state:
+                    continue
+                for idx_state in optimizer.state[p].values():
+                    if not isinstance(idx_state, dict):
+                        continue
+                    for k in list(idx_state.keys()):
+                        v = idx_state[k]
+                        if not isinstance(v, torch.Tensor):
+                            continue
+                        is_param_key = k == "param" or k.startswith("param::")
+                        cfg = param_ecc if is_param_key else ecc
+                        if cfg is None:
+                            continue
+                        if k.endswith("::ecc"):
+                            idx_state[k] = v.to(cfg.corr_dtype)
+                        elif (k + "::ecc") in idx_state:
+                            idx_state[k] = v.to(cfg.primary_dtype)
+                if param_ecc is not None and p.dtype != param_ecc.primary_dtype:
+                    orig_key = utils._tensor_key(p)
+                    p.data = p.data.to(param_ecc.primary_dtype)
+                    bf16_key = utils._tensor_key(p)
+                    if orig_key in optimizer.mapping_inverse:
+                        optimizer.mapping_inverse[bf16_key] = optimizer.mapping_inverse.pop(orig_key)
+            if param_ecc is not None:
+                optimizer._init_param_ecc_group(group)
 
     @property
     def fns(self):
@@ -1240,7 +1424,7 @@ class ChainOpt(utils.StatefulOptimizer):
 
         caution = group["caution"]
 
-        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote, beta1=utils.get_beta1(group)))
+        vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
 
         if not vals:
             return
@@ -1284,6 +1468,7 @@ def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
         "trust_region_clip_",
         "a_law_compress",
         "mu_law_compress",
+        "softsign_compress",
     ):
         raise ValueError(f"Clipping function {name} not found")
     return getattr(utils, name)
@@ -1388,12 +1573,14 @@ class BaseOpt(ChainOpt):
                 fn = functools.partial(fn, *args, **kwargs)
             fns = tuple(fns)[:-1] + (fn,)
 
-        self.compile_step = default(compile_step, self.compile_step)
-        self.promote = default(promote, self.promote)
+        self.compile_step = default(default(compile_step, defaults.pop("compile_step", use_default)), self.compile_step)
+        self.promote = default(default(promote, defaults.pop("promote", use_default)), self.promote)
         if default(palm, self.palm):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
             fns = (apply_to_idx(gradient_clipping, 2),) + fns
+        if defaults.get("mars", False):
+            fns = (mars,) + fns
         if default(update_clipping, self.update_clipping) is not None:
             fns = fns + (apply_to_idx(update_clipping, 2),)
 

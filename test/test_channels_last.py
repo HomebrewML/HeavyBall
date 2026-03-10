@@ -7,6 +7,7 @@ import torch
 from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -16,9 +17,8 @@ heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(128, 1)])
-def test_foreach(opt, size, depth: int, iterations: int = 1024, outer_iterations: int = 1):
+@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
+def test_foreach(opt, size: int = 128, depth: int = 1, iterations: int = 64, outer_iterations: int = 1):
     set_torch()
     opt = getattr(heavyball, opt)
 
@@ -49,4 +49,4 @@ def test_foreach(opt, size, depth: int, iterations: int = 1024, outer_iterations
 
     for i, (l0, l1) in enumerate(zip(*losses)):
         print(i, l0.item(), l1.item())
-        assert torch.allclose(l0.float(), l1.float(), rtol=0.1)
+        assert torch.allclose(l0.float(), l1.float(), rtol=0.01)

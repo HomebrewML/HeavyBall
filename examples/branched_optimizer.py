@@ -48,10 +48,12 @@ def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),
+        ]
+    )
 
     train_data = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
     test_data = datasets.FashionMNIST(root="./data", train=False, download=True, transform=transform)
