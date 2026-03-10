@@ -16,21 +16,37 @@ STEPS, LR, BETAS, EPS = 10000, 3e-3, (0.9, 0.999), 1e-8
 N_TRAIN = 2048
 LOG_EVERY = 500
 
-CONFIGS = {"naive_fp32": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
-           "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
-           "heavyball_fp32": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
-           "heavyball_bf16": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0,
-                                                              storage_dtype="bfloat16"),
-           "ecc_bf16+8": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0,
-                                                          ecc="bf16+8"), }
+CONFIGS = {
+    "naive_fp32": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
+    "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
+    "heavyball_fp32": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
+    "heavyball_bf16": lambda p: heavyball.ForeachAdamW(
+        p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, storage_dtype="bfloat16"
+    ),
+    "ecc_bf16+8": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, ecc="bf16+8"),
+}
 
-COLORS = {"naive_fp32": "#888888", "naive_bf16": "#d62728", "heavyball_fp32": "#2d2d2d", "heavyball_bf16": "#1f77b4",
-          "ecc_bf16+8": "#2ca02c", }
-LABELS = {"naive_fp32": "naive fp32", "naive_bf16": "naive bf16", "heavyball_fp32": "heavyball fp32",
-          "heavyball_bf16": "heavyball bf16 (stochastic rounding)", "ecc_bf16+8": "ECC bf16+8 (correction tensor)", }
-STYLES = {"naive_fp32": dict(linewidth=2, linestyle="--", alpha=0.7), "naive_bf16": dict(linewidth=2.5, linestyle="-"),
-          "heavyball_fp32": dict(linewidth=2.5, linestyle="-"), "heavyball_bf16": dict(linewidth=1.8, linestyle="--"),
-          "ecc_bf16+8": dict(linewidth=1.8, linestyle="--"), }
+COLORS = {
+    "naive_fp32": "#888888",
+    "naive_bf16": "#d62728",
+    "heavyball_fp32": "#2d2d2d",
+    "heavyball_bf16": "#1f77b4",
+    "ecc_bf16+8": "#2ca02c",
+}
+LABELS = {
+    "naive_fp32": "naive fp32",
+    "naive_bf16": "naive bf16",
+    "heavyball_fp32": "heavyball fp32",
+    "heavyball_bf16": "heavyball bf16 (stochastic rounding)",
+    "ecc_bf16+8": "ECC bf16+8 (correction tensor)",
+}
+STYLES = {
+    "naive_fp32": dict(linewidth=2, linestyle="--", alpha=0.7),
+    "naive_bf16": dict(linewidth=2.5, linestyle="-"),
+    "heavyball_fp32": dict(linewidth=2.5, linestyle="-"),
+    "heavyball_bf16": dict(linewidth=1.8, linestyle="--"),
+    "ecc_bf16+8": dict(linewidth=1.8, linestyle="--"),
+}
 
 
 class MLP(nn.Sequential):
@@ -66,16 +82,18 @@ class NaiveAdamW:
                 continue
             g = p.grad.float()
             if p not in self.state:
-                self.state[p] = {"m": torch.zeros_like(g, dtype=self.state_dtype),
-                                 "v": torch.zeros_like(g, dtype=self.state_dtype), }
+                self.state[p] = {
+                    "m": torch.zeros_like(g, dtype=self.state_dtype),
+                    "v": torch.zeros_like(g, dtype=self.state_dtype),
+                }
             s = self.state[p]
             m, v = s["m"].float(), s["v"].float()
             if self.wd:
                 p.data.mul_(1 - lr * self.wd)
             m.lerp_(g, 1 - self.beta1)
             v.lerp_(g * g, 1 - self.beta2)
-            bc1 = 1 - self.beta1 ** self.t
-            bc2 = 1 - self.beta2 ** self.t
+            bc1 = 1 - self.beta1**self.t
+            bc2 = 1 - self.beta2**self.t
             p.data.addcdiv_(m / bc1, (v / bc2).sqrt().add_(self.eps), value=-lr)
             s["m"].copy_(m)
             s["v"].copy_(v)
