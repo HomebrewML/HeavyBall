@@ -1,23 +1,12 @@
-"""Plot precision_toy results. Run precision_toy.py first, then this."""
-
-import warnings
-
-import matplotlib.pyplot as plt
-
-import heavyball.utils
-
-heavyball.utils.set_torch()
-warnings.filterwarnings("ignore", message="Learning rate changed")
-
 import math
 import warnings
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import heavyball
-import heavyball.utils
 
 heavyball.utils.set_torch()
 warnings.filterwarnings("ignore", message="Learning rate changed")
@@ -28,12 +17,12 @@ N_TRAIN = 2048
 LOG_EVERY = 500
 
 CONFIGS = {"naive_fp32": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
-    "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
-
-    "heavyball_fp32": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
-    "heavyball_bf16": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0,
-                                                       storage_dtype="bfloat16"),
-    "ecc_bf16+8": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, ecc="bf16+8"), }
+           "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
+           "heavyball_fp32": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
+           "heavyball_bf16": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0,
+                                                              storage_dtype="bfloat16"),
+           "ecc_bf16+8": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0,
+                                                          ecc="bf16+8"), }
 
 COLORS = {"naive_fp32": "#888888", "naive_bf16": "#d62728", "heavyball_fp32": "#2d2d2d", "heavyball_bf16": "#1f77b4",
           "ecc_bf16+8": "#2ca02c", }
@@ -78,7 +67,7 @@ class NaiveAdamW:
             g = p.grad.float()
             if p not in self.state:
                 self.state[p] = {"m": torch.zeros_like(g, dtype=self.state_dtype),
-                                 "v": torch.zeros_like(g, dtype=self.state_dtype)}
+                                 "v": torch.zeros_like(g, dtype=self.state_dtype), }
             s = self.state[p]
             m, v = s["m"].float(), s["v"].float()
             if self.wd:
@@ -162,7 +151,7 @@ def main():
 
     fig.tight_layout()
     fig.savefig("precision_toy.png", dpi=180)
-    print(f"\nSaved precision_toy.png")
+    print("\nSaved precision_toy.png")
 
 
 if __name__ == "__main__":
