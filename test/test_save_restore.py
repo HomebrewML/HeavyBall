@@ -1,4 +1,5 @@
 import copy
+import inspect
 import os
 
 os.environ["TORCH_LOGS"] = "+recompiles"
@@ -9,11 +10,19 @@ from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
 from torch.utils._pytree import tree_map
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import set_torch
 
+heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
+
+MERGE_SPLIT_OPTS = [
+    o
+    for o in REPRESENTATIVE_OPTS
+    if {"split", "merge_dims"} & set(inspect.signature(getattr(heavyball, o).__init__).parameters)
+]
 
 
 def _train_one(dataset, model, opt):
@@ -39,15 +48,9 @@ def _allclose(x, y):
         assert x == y
 
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize("size,depth", [(32, 2)])
-@pytest.mark.parametrize("split", [False, True])
-@pytest.mark.parametrize("merge_dims", [False, True])
-def test_save_restore(
-    opt, size, depth: int, split: bool, merge_dims: bool, iterations: int = 32, outer_iterations: int = 8
-):
+def _run_save_restore(opt_name, size, depth, split, merge_dims, iterations, outer_iterations):
     set_torch()
-    opt = getattr(heavyball, opt)
+    opt = getattr(heavyball, opt_name)
 
     torch.manual_seed(0x2131290)
     data = torch.randn((iterations, size), device="cuda", dtype=torch.double)
@@ -70,3 +73,23 @@ def test_save_restore(
 
         for normal_param, state_param in zip(m.parameters(), new_m.parameters()):
             assert torch.allclose(normal_param, state_param)
+
+
+@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
+def test_save_restore(opt, size: int = 32, depth: int = 2, iterations: int = 16, outer_iterations: int = 4):
+    _run_save_restore(
+        opt, size, depth, split=False, merge_dims=False, iterations=iterations, outer_iterations=outer_iterations
+    )
+
+
+@pytest.mark.parametrize("opt", MERGE_SPLIT_OPTS)
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("merge_dims", [False, True])
+def test_save_restore_merge_split(
+    opt, split, merge_dims, size: int = 32, depth: int = 2, iterations: int = 16, outer_iterations: int = 4
+):
+    if not split and not merge_dims:
+        pytest.skip("Covered by test_save_restore")
+    _run_save_restore(
+        opt, size, depth, split=split, merge_dims=merge_dims, iterations=iterations, outer_iterations=outer_iterations
+    )

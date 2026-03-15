@@ -23,16 +23,13 @@ class SGD(C.BaseOpt):
         mars_gamma: float = 0.0025,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.heavyball_momentum,))
 
 
@@ -54,16 +51,13 @@ class ForeachAdamW(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adam,))
 
 
@@ -87,16 +81,13 @@ class ForeachNAdam(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_nadam,))
 
 
@@ -119,19 +110,16 @@ class ForeachAdEMAMix(C.BaseOpt):
         mars_gamma: float = 0.0025,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         if len(betas) != 3:
             raise ValueError("AdEMAMix expects betas with three coefficients.")
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
 
 
@@ -153,16 +141,13 @@ class UnscaledAdamW(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
         )
@@ -187,16 +172,13 @@ class SUDSAdamW(C.BaseOpt):
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
         precond_lr: float = 1e-2,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
 
 
@@ -218,6 +200,10 @@ class Scion(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         scale: float = 1.0,
         momentum: Optional[float] = None,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         if lr < 0:
@@ -230,14 +216,7 @@ class Scion(C.BaseOpt):
             raise ValueError(f"Invalid momentum value: {beta1}")
         beta2 = betas[1] if len(betas) > 1 else beta1
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         defaults["betas"] = (beta1, beta2)
         defaults["scale"] = scale
         defaults.pop("momentum", None)
@@ -266,6 +245,10 @@ class ForeachAdamC(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         if max_lr is None:
@@ -274,14 +257,7 @@ class ForeachAdamC(C.BaseOpt):
             )
             max_lr = lr
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
 
 
@@ -309,16 +285,13 @@ class ForeachRMSprop(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -350,16 +323,13 @@ class ForeachSFAdamW(C.ScheduleFree):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -392,16 +362,13 @@ class MSAMLaProp(C.MSAM):
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
         sam_step_size: float = 0.1,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -435,16 +402,13 @@ class ForeachADOPT(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adopt,))
 
 
@@ -468,21 +432,16 @@ class ForeachMuon(C.BaseOpt):
         beta2_scale: float = 0.8,
         nesterov: bool = True,
         heavyball_momentum: bool = False,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         if heavyball_momentum:
-            if nesterov:
-                ema = C.nesterov_momentum
-            else:
-                ema = C.heavyball_momentum
+            ema = C.nesterov_momentum if nesterov else C.heavyball_momentum
         elif nesterov:
             ema = C.nesterov_ema
         else:
@@ -517,16 +476,13 @@ class ForeachLaProp(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_laprop,))
 
 
@@ -548,16 +504,13 @@ class MuonLaProp(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -612,17 +565,15 @@ class ForeachSOAP(C.BaseOpt):
         storage_dtype: str = "float32",
         stochastic_schedule: bool = False,
         precond_grad_accum: bool = False,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         if use_precond_schedule:
             del defaults["precondition_frequency"]
@@ -675,17 +626,15 @@ class ForeachSOAPNAdam(C.BaseOpt):
         precond_grad_accum: bool = False,
         momentum_decay: float = 4e-3,
         decoupled_weight_decay: bool = False,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         if use_precond_schedule:
             del defaults["precondition_frequency"]
@@ -739,17 +688,15 @@ class ForeachSOAPAdEMAMix(C.BaseOpt):
         alpha: float = 2.0,
         beta3_warmup: int | None = None,
         alpha_warmup: int | None = None,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         if use_precond_schedule:
             del defaults["precondition_frequency"]
@@ -786,16 +733,13 @@ class ForeachSignLaProp(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
-
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -849,17 +793,15 @@ class ForeachSOLP(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
         stochastic_schedule: bool = False,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
 
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         if use_precond_schedule:
             del defaults["precondition_frequency"]
@@ -910,15 +852,13 @@ class OrthoLaProp(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -948,15 +888,13 @@ class LaPropOrtho(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         palm: bool = C.use_default,
         beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
-        defaults = locals()
-        defaults.pop("self")
-        params = defaults.pop("params")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
@@ -1020,6 +958,14 @@ class ForeachPSGDKron(C.BaseOpt):
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,
         precond_lr: float = 0.1,
+        finite_differences: bool = C.use_default,
+        fallback_to_finite_differences: bool = C.use_default,
+        hvp_interval: int = C.use_default,
+        hessian_approx: bool = C.use_default,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         delayed = C.default(delayed, self.delayed)
@@ -1032,17 +978,11 @@ class ForeachPSGDKron(C.BaseOpt):
                 "inverse_free (i.e., PSGD-QUAD) is not supported at the moment. Consider using https://github.com/evanatyourservice/quad_torch"
             )
 
-        defaults = locals()
-        defaults.pop("self")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         self.precond_schedule = C.default(
             defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
         )
-        params = defaults.pop("params")
 
         super().__init__(
             params,
@@ -1120,30 +1060,32 @@ class ForeachPSGDLRA(C.BaseOpt):
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,
         precond_lr: float = 0.1,
+        finite_differences: bool = C.use_default,
+        fallback_to_finite_differences: bool = C.use_default,
+        hvp_interval: int = C.use_default,
+        hessian_approx: bool = C.use_default,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
         **kwargs,
     ):
         delayed = C.default(delayed, self.delayed)
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
         update_clipping = C.default(update_clipping, utils.trust_region_clip_)
 
-        defaults = locals()
-        defaults.pop("self")
-        defaults.update(defaults.pop("kwargs"))
-
-        if kwargs:
-            utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+        params, defaults = C._build_defaults(locals())
 
         self.precond_schedule = C.default(
             defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
         )
-        params = defaults.pop("params")
 
         if rank is None:
             utils.warn_once(
                 f"{rank=}. It will be set to log2(param_count). This requires `params` to be of type list. Currently, {type(params)=}"
             )
             params = list(params)
-            defaults["rank"] = round(math.log2(sum(p.numel() for p in params)))
+            defaults["rank"] = max(1, round(math.log2(sum(p.numel() for p in params))))
             utils.warn_once(f"rank was set to {defaults['rank']}")
 
         super().__init__(

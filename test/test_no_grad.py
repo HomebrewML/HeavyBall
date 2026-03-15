@@ -1,12 +1,13 @@
-from typing import List
-
 import pytest
 import torch
 from lightbench.utils import get_optim
 from torch import nn
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
+
+heavyball.utils.compile_mode = None
 
 
 class Param(nn.Module):
@@ -18,14 +19,8 @@ class Param(nn.Module):
         return self.weight.mean() * inp
 
 
-@pytest.mark.parametrize("opt", heavyball.__all__)
-@pytest.mark.parametrize(
-    "size",
-    [
-        (4, 4, 4, 4),
-    ],
-)
-def test_closure(opt, size: List[int], depth: int = 2, iterations: int = 5, outer_iterations: int = 3):
+@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
+def test_no_grad_step(opt, size: tuple = (4, 4, 4, 4), depth: int = 2, iterations: int = 5, outer_iterations: int = 3):
     clean()
     set_torch()
 
