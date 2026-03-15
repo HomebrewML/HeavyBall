@@ -1132,18 +1132,23 @@ class _ULPState:
         ls = (_log_ulp(x) - 1).float()
         return x.float() + _scale_by_exp2(self.correction.float() / self.smax, ls)
 
+    @staticmethod
+    def _bf16_to_f32(x):
+        # Go through integer bits to prevent Inductor from folding
+        # the f32->bf16->f32 roundtrip into an identity.
+        return x.view(dtype=torch.int16).to(torch.int32).bitwise_left_shift(16).view(dtype=torch.float32)
+
     def compute_correction(self, fp32, narrow):
-        e = fp32 - narrow.float()
+        narrow_f32 = self._bf16_to_f32(narrow) if narrow.dtype == torch.bfloat16 else narrow.float()
+        e = fp32 - narrow_f32
         ls = (_log_ulp(narrow) - 1).float()
         e_norm = _scale_by_exp2(e, -ls)
         scaled = e_norm.clamp(-1.0, 1.0) * self.smax
         self.correction.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(self.correction.dtype))
 
     def encode(self, fp32, target):
-        if target.dtype == torch.bfloat16 and fp32.dtype in (torch.float16, torch.float32, torch.float64):
-            rounded = stochastic_round_(target, fp32)
-        else:
-            rounded = fp32.to(target.dtype)
+        # RNE, not stochastic: the correction range assumes |error| ≤ ULP/2.
+        rounded = fp32.to(target.dtype)
         set_(target, rounded)
         self.compute_correction(fp32, target)
 
