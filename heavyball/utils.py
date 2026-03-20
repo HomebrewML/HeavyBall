@@ -481,6 +481,27 @@ def set_(dst: Tensor, src: Tensor):
     dst.copy_(src)
 
 
+def _prod(shape):
+    r = 1
+    for s in shape:
+        r *= s
+    return r
+
+
+def capture_param_shapes(params):
+    """Snapshot param shapes before FSDP/DeepSpeed reshapes them. Pass as ``orig_shapes=`` to any optimizer.
+
+    Usage::
+
+        shapes = heavyball.capture_param_shapes(model)
+        model = FSDP(model, use_orig_params=True)
+        opt = heavyball.ForeachSOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
+    """
+    if hasattr(params, 'parameters'):
+        params = params.parameters()
+    return {id(p): tuple(p.shape) for p in params}
+
+
 def clean():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -692,29 +713,30 @@ def scion_auto_lmo_(update: List[Tensor] | Tensor, scale: Union[float, Tensor]):
     return update
 
 
-def scion_auto_init_param_(param: Tensor, scale: Union[float, Tensor]):
+def scion_auto_init_param_(param: Tensor, scale: Union[float, Tensor], seed: int = 0):
     scale_tensor = scalar_guard(scale, param)
     promoted = promote(param)
 
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+
     if param.ndim in (3, 4):
-        init = promoted.clone()
-        init_fp64 = init.double()
+        init_fp64 = promoted.clone().cpu().double()
         spatial_dims = [range(size) for size in init_fp64.shape[2:]]
         for idx in itertools.product(*spatial_dims):
-            torch.nn.init.orthogonal_(init_fp64[(slice(None), slice(None), *idx)])
+            torch.nn.init.orthogonal_(init_fp64[(slice(None), slice(None), *idx)], generator=gen)
         out_channels, in_channels = init_fp64.shape[:2]
         spatial = math.prod(init_fp64.shape[2:]) if init_fp64.ndim > 2 else 1
         scale_val = math.sqrt(out_channels / max(in_channels, 1)) / max(spatial, 1)
         init_fp64.mul_(scale_val)
-        init = init_fp64.to(dtype=init.dtype)
+        init = init_fp64.to(dtype=promoted.dtype, device=promoted.device)
     elif param.ndim == 2:
-        init = promoted.clone()
-        init_fp64 = init.double()
-        torch.nn.init.orthogonal_(init_fp64)
+        init_fp64 = promoted.clone().cpu().double()
+        torch.nn.init.orthogonal_(init_fp64, generator=gen)
         out_dim, in_dim = init_fp64.shape
         scale_val = math.sqrt(out_dim / max(in_dim, 1))
         init_fp64.mul_(scale_val)
-        init = init_fp64.to(dtype=init.dtype)
+        init = init_fp64.to(dtype=promoted.dtype, device=promoted.device)
     else:
         init = promoted.clone()
         torch.nn.init.zeros_(init)
@@ -2527,6 +2549,26 @@ def lra_precond(U: Tensor, V: Tensor, d: Tensor, g: Tensor):
 def dampen_grad(g: Tensor, damp: float = 2**-13):
     # https://github.com/lixilinx/psgd_torch/blob/1943e66596111e78157ca1b72b31c1dfdf0653ef/preconditioned_stochastic_gradient_descent.py#L50
     v = torch.randn_like(g)
+    return v, g + damp * g.abs().mean() * v
+
+
+def _param_dampen_seed(param):
+    with torch.no_grad():
+        flat = param.detach().to(torch.float32).flatten()
+        n = min(8, flat.numel())
+        bits = flat[:n].contiguous().view(torch.int32)
+        h = 0x811C9DC5
+        for s in param.shape:
+            h = ((h ^ (s & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
+        for b in bits.tolist():
+            h = ((h ^ (b & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
+        return h
+
+
+def _seeded_dampen_grad(g, damp, seed):
+    gen = torch.Generator(device=g.device)
+    gen.manual_seed(seed)
+    v = torch.randn(g.shape, device=g.device, dtype=g.dtype, generator=gen)
     return v, g + damp * g.abs().mean() * v
 
 

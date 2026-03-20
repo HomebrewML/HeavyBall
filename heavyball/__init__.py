@@ -1232,4 +1232,5 @@ PSGDLRA = ForeachPSGDLRA
 NewtonPSGDLRA = ForeachNewtonPSGDLRA
 NewtonPSGDKron = ForeachCachedNewtonPSGD
 
+capture_param_shapes = utils.capture_param_shapes
 __all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer)]

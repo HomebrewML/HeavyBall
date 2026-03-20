@@ -110,14 +110,18 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+_PASSTHROUGH_KWARGS = {"orig_shapes"}
+
+
 def _build_defaults(locals_dict):
     d = locals_dict.copy()
     d.pop("self")
     params = d.pop("params")
     kwargs = d.pop("kwargs")
     d.update(kwargs)
-    if kwargs:
-        utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+    unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
+    if unknown:
+        utils.warn_once(f"Working with uncaptured keyword arguments: {unknown}")
     return params, d
 
 
@@ -759,6 +763,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
     state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)  # torch casts int to float in ckpt load
+    state["dampen_seed"] = torch.tensor(utils._param_dampen_seed(param), dtype=torch.long, device=param.device)
     if group["adaptive"]:
         state["velocity"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
     if not cached:
@@ -881,9 +886,10 @@ def _init_scion_state(state, group, update, grad, param):
 @no_state
 def scion_auto_norm(group, update, grad, param, scion_state):
     scale = group.get("scale", 1.0)
+    param_ids = {id(p): i for i, p in enumerate(group["params"])}
     for ctx, p in zip(scion_state, param):
         if not ctx["initialized"]:
-            utils.scion_auto_init_param_(p, scale)
+            utils.scion_auto_init_param_(p, scale, seed=param_ids.get(id(p), 0))
             ctx["initialized"] = True
     return utils.scion_auto_lmo_(update, scale)
 
@@ -991,7 +997,8 @@ def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slo
 
 
 def _update_psgd_precond(
-    cached, Q_cache, group, param, grad, Q, velocity, running_lower_bound, step, prob: Optional[callable] = None
+    cached, Q_cache, group, param, grad, Q, velocity, running_lower_bound, step,
+    dampen_seed=None, prob: Optional[callable] = None,
 ) -> Optional[Tensor]:
     if prob is None:
         prob = utils.precond_update_prob_schedule()
@@ -1005,6 +1012,9 @@ def _update_psgd_precond(
         del param.hessian_vector
     elif group["inverse_free"]:
         vector, hessian_vector = None, grad
+    elif dampen_seed is not None:
+        seed = (int(dampen_seed.item()) * 0x9E3779B9 + int(group["step"])) & 0x7FFFFFFFFFFFFFFF
+        vector, hessian_vector = utils._seeded_dampen_grad(grad, group["dampening"], seed)
     else:
         vector, hessian_vector = utils.dampen_grad(grad, group["dampening"])
 
@@ -1131,7 +1141,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
 
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", "dampen_seed", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def scale_by_psgd(
     group,
@@ -1144,16 +1154,17 @@ def scale_by_psgd(
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
+    dampen_seed: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, dampen_seed, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", "dampen_seed", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def scale_by_delayed_psgd(
     group,
@@ -1166,6 +1177,7 @@ def scale_by_delayed_psgd(
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
+    dampen_seed: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
@@ -1174,14 +1186,14 @@ def scale_by_delayed_psgd(
     else:
         precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
     new = _update_psgd_precond(
-        cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob
+        cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, dampen_seed, prob
     )
     return new if precond is None else precond
 
 
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", "dampen_seed", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def update_by_psgd(
     group,
@@ -1194,10 +1206,11 @@ def update_by_psgd(
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
+    dampen_seed: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, dampen_seed, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     raise SkipUpdate from None
 
@@ -1215,7 +1228,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", "dampen_seed", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def update_by_delayed_psgd(
     group,
@@ -1228,11 +1241,12 @@ def update_by_delayed_psgd(
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
+    dampen_seed: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, dampen_seed, prob)
     raise SkipUpdate from None
 
 
@@ -1249,6 +1263,110 @@ def apply_to_idx(fn, idx):
 
     _fn.__name__ = _fn.__qualname__ = f"apply_{getattr(fn, '__name__', repr(fn))}_to_{idx}"
     return _fn
+
+
+class _ShapeInfo:
+    __slots__ = ("orig_shape", "param_offset", "total_numel")
+
+    def __init__(self, orig_shape, param_offset, total_numel):
+        self.orig_shape = orig_shape
+        self.param_offset = param_offset
+        self.total_numel = total_numel
+
+
+def _detect_orig_shapes(params):
+    fsdp_ids = {id(p) for p in params if getattr(p, '_fsdp_flattened', False) and p.numel() > 0}
+    if not fsdp_ids:
+        return {}
+    try:
+        from torch.distributed.fsdp._flat_param import FlatParameter
+    except ImportError:
+        return {}
+
+    import gc
+    result = {}
+    for obj in gc.get_objects():
+        if not isinstance(obj, FlatParameter):
+            continue
+        if not hasattr(obj, '_shard_param_infos') or obj._params is None:
+            continue
+        for param, spi, shape in zip(obj._params, obj._shard_param_infos, obj._shapes):
+            pid = id(param)
+            if pid not in fsdp_ids or not spi.in_shard:
+                continue
+            orig_shape = tuple(shape)
+            result[pid] = _ShapeInfo(orig_shape, spi.intra_param_start_idx, utils._prod(orig_shape))
+    return result
+
+
+def _gather_tensor(shard, offset, total, pg=None):
+    full = shard.new_zeros(total)
+    full[offset:offset + shard.numel()] = shard
+    torch.distributed.all_reduce(full, group=pg)
+    return full
+
+
+def _reshape_params(params, orig_shapes):
+    if not orig_shapes:
+        return []
+    _dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+    reshaped = []
+    split_idx = 0
+
+    for p in params:
+        info = orig_shapes.get(id(p))
+        if info is None:
+            continue
+        if isinstance(info, tuple):
+            orig, offset = info, 0
+        else:
+            orig, offset = info.orig_shape, info.param_offset
+
+        if p.data.shape == orig:
+            continue
+
+        numel = p.data.numel()
+        total = utils._prod(orig)
+        flat = p.data.shape
+
+        if numel == total:
+            p.data = p.data.view(orig)
+            if p.grad is not None:
+                p.grad = p.grad.view(orig)
+            reshaped.append((p, flat, None, None, None))
+        elif numel > 0 and len(orig) >= 2 and _dist and isinstance(info, _ShapeInfo):
+            owner = split_idx % torch.distributed.get_world_size()
+            split_idx += 1
+            orig_shard = p.data
+            p.data = _gather_tensor(p.data, offset, total).view(orig)
+            if p.grad is not None:
+                p.grad = _gather_tensor(p.grad, offset, total).view(orig)
+                if torch.distributed.get_rank() != owner:
+                    p.grad = None
+            reshaped.append((p, flat, info, orig_shard, owner))
+        elif numel > 0 and len(orig) >= 2:
+            inner = utils._prod(orig[1:])
+            if numel % inner == 0:
+                target = (numel // inner, *orig[1:])
+                p.data = p.data.view(target)
+                if p.grad is not None:
+                    p.grad = p.grad.view(target)
+                reshaped.append((p, flat, None, None, None))
+    return reshaped
+
+
+def _restore_params(reshaped):
+    for p, flat, gather_info, orig_shard, owner in reshaped:
+        if owner is not None:
+            torch.distributed.broadcast(p.data, src=owner)
+            updated = p.data.flatten()[gather_info.param_offset:gather_info.param_offset + orig_shard.numel()]
+            orig_shard.copy_(updated)
+            p.data = orig_shard
+            p.grad = None
+        else:
+            p.data = p.data.view(flat)
+            if p.grad is not None:
+                p.grad = p.grad.view(flat)
 
 
 def _inner_chain(state, group, update, grad, param, *fns):
@@ -1324,6 +1442,7 @@ class ChainOpt(utils.StatefulOptimizer):
     }
 
     def __init__(self, params, defaults, foreach: bool, *fns):
+        self._orig_shapes = defaults.pop("orig_shapes", None)
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, foreach)
@@ -1422,6 +1541,17 @@ class ChainOpt(utils.StatefulOptimizer):
             )
             group["base_lr"] = group["lr"]
 
+        if self._orig_shapes is None:
+            all_params = [p for g in self.param_groups for p in g["params"]]
+            self._orig_shapes = _detect_orig_shapes(all_params)
+
+        reshaped = _reshape_params(group["params"], self._orig_shapes)
+        try:
+            self._step_inner(group)
+        finally:
+            _restore_params(reshaped)
+
+    def _step_inner(self, group):
         caution = group["caution"]
 
         vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
