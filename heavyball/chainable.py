@@ -763,7 +763,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
     state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)  # torch casts int to float in ckpt load
-    state["dampen_seed"] = torch.tensor(utils._param_dampen_seed(param), dtype=torch.long, device=param.device)
+    state["dampen_seed"] = torch.tensor(utils._param_dampen_seed(param, group), dtype=torch.long, device=param.device)
     if group["adaptive"]:
         state["velocity"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
     if not cached:
@@ -1014,7 +1014,10 @@ def _update_psgd_precond(
         vector, hessian_vector = None, grad
     elif dampen_seed is not None:
         seed = (int(dampen_seed.item()) * 0x9E3779B9 + int(group["step"])) & 0x7FFFFFFFFFFFFFFF
-        vector, hessian_vector = utils._seeded_dampen_grad(grad, group["dampening"], seed)
+        gen = torch.Generator(device=grad.device)
+        gen.manual_seed(seed)
+        vector = torch.randn(grad.shape, device=grad.device, dtype=grad.dtype, generator=gen)
+        hessian_vector = utils._apply_dampening(grad, group["dampening"], vector)
     else:
         vector, hessian_vector = utils.dampen_grad(grad, group["dampening"])
 
@@ -1266,16 +1269,18 @@ def apply_to_idx(fn, idx):
 
 
 class _ShapeInfo:
-    __slots__ = ("orig_shape", "param_offset", "total_numel")
+    __slots__ = ('orig_shape', 'offset', 'total', 'group', 'owner')
 
-    def __init__(self, orig_shape, param_offset, total_numel):
+    def __init__(self, orig_shape, offset=0, total=None, group=None, owner=None):
         self.orig_shape = orig_shape
-        self.param_offset = param_offset
-        self.total_numel = total_numel
+        self.offset = offset
+        self.total = total if total is not None else math.prod(orig_shape)
+        self.group = group
+        self.owner = owner
 
 
 def _detect_orig_shapes(params):
-    fsdp_ids = {id(p) for p in params if getattr(p, '_fsdp_flattened', False) and p.numel() > 0}
+    fsdp_ids = {id(p) for p in params if getattr(p, '_fsdp_flattened', False)}
     if not fsdp_ids:
         return {}
     try:
@@ -1284,18 +1289,51 @@ def _detect_orig_shapes(params):
         return {}
 
     import gc
-    result = {}
+    lookup = {}
     for obj in gc.get_objects():
         if not isinstance(obj, FlatParameter):
             continue
         if not hasattr(obj, '_shard_param_infos') or obj._params is None:
             continue
         for param, spi, shape in zip(obj._params, obj._shard_param_infos, obj._shapes):
-            pid = id(param)
-            if pid not in fsdp_ids or not spi.in_shard:
-                continue
-            orig_shape = tuple(shape)
-            result[pid] = _ShapeInfo(orig_shape, spi.intra_param_start_idx, utils._prod(orig_shape))
+            lookup[id(param)] = (tuple(shape), spi)
+
+    _dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+    # optimizer param order is stable across ranks
+    fsdp_entries = [(p, s, math.prod(s), spi)
+                    for p in params for s, spi in [lookup.get(id(p), (None, None))]
+                    if id(p) in fsdp_ids and s is not None]
+
+    groups = {}
+    if _dist and fsdp_entries:
+        rank = torch.distributed.get_rank()
+        ws = torch.distributed.get_world_size()
+        n = len(fsdp_entries)
+        flags = torch.zeros(n, ws, dtype=torch.int32, device=fsdp_entries[0][0].device)
+        for i, (p, orig, total, spi) in enumerate(fsdp_entries):
+            if (spi.in_shard and spi.numel_in_shard is not None
+                    and spi.numel_in_shard < total and len(orig) >= 2):
+                flags[i, rank] = 1
+        torch.distributed.all_reduce(flags)
+        for i in range(n):
+            ranks = flags[i].nonzero().squeeze(-1).tolist()
+            if len(ranks) >= 2:
+                groups[i] = (torch.distributed.new_group(ranks), ranks)
+
+    # owner must be precomputed here — different ranks see different subsets in _reshape_params
+    result = {}
+    split_idx = 0
+    for i, (p, orig, total, spi) in enumerate(fsdp_entries):
+        sg = groups.get(i)
+        if sg:
+            pg, ranks = sg
+            owner = ranks[split_idx % len(ranks)]
+            split_idx += 1
+            if spi.in_shard:
+                result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total, pg, owner)
+        elif spi.in_shard:
+            result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total)
     return result
 
 
@@ -1306,67 +1344,55 @@ def _gather_tensor(shard, offset, total, pg=None):
     return full
 
 
+def _view_param(p, shape):
+    p.data = p.data.view(shape)
+    if p.grad is not None:
+        p.grad = p.grad.view(shape)
+
+
 def _reshape_params(params, orig_shapes):
     if not orig_shapes:
-        return []
-    _dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-    reshaped = []
-    split_idx = 0
+        return [], []
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    views, gathers = [], []
 
     for p in params:
         info = orig_shapes.get(id(p))
-        if info is None:
-            continue
-        if isinstance(info, tuple):
-            orig, offset = info, 0
-        else:
-            orig, offset = info.orig_shape, info.param_offset
-
-        if p.data.shape == orig:
+        if info is None or p.data.shape == info.orig_shape:
             continue
 
-        numel = p.data.numel()
-        total = utils._prod(orig)
-        flat = p.data.shape
-
-        if numel == total:
-            p.data = p.data.view(orig)
+        if info.group is not None:
+            shard = p.data
+            p.data = _gather_tensor(shard, info.offset, info.total, info.group).view(info.orig_shape)
             if p.grad is not None:
-                p.grad = p.grad.view(orig)
-            reshaped.append((p, flat, None, None, None))
-        elif numel > 0 and len(orig) >= 2 and _dist and isinstance(info, _ShapeInfo):
-            owner = split_idx % torch.distributed.get_world_size()
-            split_idx += 1
-            orig_shard = p.data
-            p.data = _gather_tensor(p.data, offset, total).view(orig)
-            if p.grad is not None:
-                p.grad = _gather_tensor(p.grad, offset, total).view(orig)
-                if torch.distributed.get_rank() != owner:
-                    p.grad = None
-            reshaped.append((p, flat, info, orig_shard, owner))
-        elif numel > 0 and len(orig) >= 2:
-            inner = utils._prod(orig[1:])
-            if numel % inner == 0:
-                target = (numel // inner, *orig[1:])
-                p.data = p.data.view(target)
-                if p.grad is not None:
-                    p.grad = p.grad.view(target)
-                reshaped.append((p, flat, None, None, None))
-    return reshaped
-
-
-def _restore_params(reshaped):
-    for p, flat, gather_info, orig_shard, owner in reshaped:
-        if owner is not None:
-            torch.distributed.broadcast(p.data, src=owner)
-            updated = p.data.flatten()[gather_info.param_offset:gather_info.param_offset + orig_shard.numel()]
-            orig_shard.copy_(updated)
-            p.data = orig_shard
-            p.grad = None
+                full_grad = _gather_tensor(p.grad, info.offset, info.total, info.group).view(info.orig_shape)
+                p.grad = full_grad if rank == info.owner else None
+            gathers.append((p, info, shard))
         else:
-            p.data = p.data.view(flat)
-            if p.grad is not None:
-                p.grad = p.grad.view(flat)
+            orig, numel = info.orig_shape, p.data.numel()
+            if numel == info.total:
+                target = orig
+            elif numel > 0 and len(orig) >= 2:
+                inner = math.prod(orig[1:])
+                target = (numel // inner, *orig[1:]) if numel % inner == 0 else None
+            else:
+                continue
+            if target is not None:
+                flat = p.data.shape
+                _view_param(p, target)
+                views.append((p, flat))
+
+    return views, gathers
+
+
+def _restore_params(views, gathers):
+    for p, info, shard in gathers:
+        torch.distributed.broadcast(p.data, src=info.owner, group=info.group)
+        shard.copy_(p.data.flatten()[info.offset:info.offset + shard.numel()])
+        p.data = shard
+        p.grad = None
+    for p, flat in views:
+        _view_param(p, flat)
 
 
 def _inner_chain(state, group, update, grad, param, *fns):
@@ -1442,7 +1468,9 @@ class ChainOpt(utils.StatefulOptimizer):
     }
 
     def __init__(self, params, defaults, foreach: bool, *fns):
-        self._orig_shapes = defaults.pop("orig_shapes", None)
+        orig = defaults.pop("orig_shapes", None)
+        self._orig_shapes = {k: _ShapeInfo(v) if isinstance(v, tuple) else v
+                             for k, v in orig.items()} if orig is not None else None
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, foreach)
@@ -1545,11 +1573,11 @@ class ChainOpt(utils.StatefulOptimizer):
             all_params = [p for g in self.param_groups for p in g["params"]]
             self._orig_shapes = _detect_orig_shapes(all_params)
 
-        reshaped = _reshape_params(group["params"], self._orig_shapes)
+        views, gathers = _reshape_params(group["params"], self._orig_shapes)
         try:
             self._step_inner(group)
         finally:
-            _restore_params(reshaped)
+            _restore_params(views, gathers)
 
     def _step_inner(self, group):
         caution = group["caution"]

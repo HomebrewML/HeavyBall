@@ -38,6 +38,7 @@ _fd_error = (
 )
 default_division_backend = "eps_clamp"
 atan2_scale = 16.0
+dither_steps = 1
 
 
 class ZerothPowerMode(enum.Enum):
@@ -481,22 +482,8 @@ def set_(dst: Tensor, src: Tensor):
     dst.copy_(src)
 
 
-def _prod(shape):
-    r = 1
-    for s in shape:
-        r *= s
-    return r
-
-
 def capture_param_shapes(params):
-    """Snapshot param shapes before FSDP/DeepSpeed reshapes them. Pass as ``orig_shapes=`` to any optimizer.
-
-    Usage::
-
-        shapes = heavyball.capture_param_shapes(model)
-        model = FSDP(model, use_orig_params=True)
-        opt = heavyball.ForeachSOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
-    """
+    """Capture param shapes before FSDP/sharding. Pass as ``orig_shapes=`` to any optimizer."""
     if hasattr(params, 'parameters'):
         params = params.parameters()
     return {id(p): tuple(p.shape) for p in params}
@@ -720,22 +707,13 @@ def scion_auto_init_param_(param: Tensor, scale: Union[float, Tensor], seed: int
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
 
-    if param.ndim in (3, 4):
+    if param.ndim >= 2:
         init_fp64 = promoted.clone().cpu().double()
-        spatial_dims = [range(size) for size in init_fp64.shape[2:]]
-        for idx in itertools.product(*spatial_dims):
+        for idx in itertools.product(*(range(s) for s in init_fp64.shape[2:])):
             torch.nn.init.orthogonal_(init_fp64[(slice(None), slice(None), *idx)], generator=gen)
-        out_channels, in_channels = init_fp64.shape[:2]
-        spatial = math.prod(init_fp64.shape[2:]) if init_fp64.ndim > 2 else 1
-        scale_val = math.sqrt(out_channels / max(in_channels, 1)) / max(spatial, 1)
-        init_fp64.mul_(scale_val)
-        init = init_fp64.to(dtype=promoted.dtype, device=promoted.device)
-    elif param.ndim == 2:
-        init_fp64 = promoted.clone().cpu().double()
-        torch.nn.init.orthogonal_(init_fp64, generator=gen)
-        out_dim, in_dim = init_fp64.shape
-        scale_val = math.sqrt(out_dim / max(in_dim, 1))
-        init_fp64.mul_(scale_val)
+        fan_out, fan_in = init_fp64.shape[:2]
+        spatial = math.prod(init_fp64.shape[2:])
+        init_fp64.mul_(math.sqrt(fan_out / max(fan_in, 1)) / max(spatial, 1))
         init = init_fp64.to(dtype=promoted.dtype, device=promoted.device)
     else:
         init = promoted.clone()
@@ -2141,10 +2119,10 @@ def stochastic_round_(ref: Tensor, source: Tensor | None = None):
     if source.dtype == torch.bfloat16:
         return source
     if source.dtype in (torch.float16, torch.float32, torch.float64):
-        source = source.to(torch.float32)
-        noise = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
-        noise.add_(source.view(dtype=torch.int32))
-        noise.bitwise_and_(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
+        source = source.to(torch.float32).view(dtype=torch.int32)
+        noise = sum(torch.randint_like(source, low=0, high=(1 << 16)) for _ in range(dither_steps))
+        noise = noise + source - (dither_steps - 1) * (1 << 15) # center | x - (N-1)*delta/2
+        noise = noise.bitwise_and(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
         return noise.view(dtype=torch.float32).bfloat16()
     return source.to(ref.dtype)
 
@@ -2552,24 +2530,17 @@ def dampen_grad(g: Tensor, damp: float = 2**-13):
     return v, g + damp * g.abs().mean() * v
 
 
-def _param_dampen_seed(param):
-    with torch.no_grad():
-        flat = param.detach().to(torch.float32).flatten()
-        n = min(8, flat.numel())
-        bits = flat[:n].contiguous().view(torch.int32)
-        h = 0x811C9DC5
-        for s in param.shape:
-            h = ((h ^ (s & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
-        for b in bits.tolist():
-            h = ((h ^ (b & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
-        return h
+def _param_dampen_seed(param, group):
+    idx = next((i for i, p in enumerate(group["params"]) if p is param), 0)
+    h = 0x811C9DC5
+    for s in (*param.shape, idx):
+        h = ((h ^ (s & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
+    return h
 
 
-def _seeded_dampen_grad(g, damp, seed):
-    gen = torch.Generator(device=g.device)
-    gen.manual_seed(seed)
-    v = torch.randn(g.shape, device=g.device, dtype=g.dtype, generator=gen)
-    return v, g + damp * g.abs().mean() * v
+@decorator_knowngood
+def _apply_dampening(g: Tensor, damp: float, v: Tensor):
+    return g + damp * g.abs().mean() * v
 
 
 @decorator_knowngood

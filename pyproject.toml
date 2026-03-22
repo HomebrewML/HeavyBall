@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heavyball"
-description = "Efficient Optimizers"
+description = "Compile-first PyTorch optimizer library — AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more with torch.compile fusion and composable features"
 version = "2.3.0"
 authors = [{ name = "HeavyBall Authors", email = "github.heavyball@nestler.sh" }]
 classifiers = ["Intended Audience :: Developers",
@@ -13,16 +13,44 @@ classifiers = ["Intended Audience :: Developers",
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = ["opt-einsum>=3.4.0",
     "torch>=2.2,<3.0",
     "numpy>=2.3.4",
 ]
-keywords = ["torch",
+keywords = [
+    "pytorch",
+    "torch",
     "optimizer",
-    "muon",
+    "adam",
+    "adamw",
+    "sgd",
+    "deep-learning",
+    "machine-learning",
+    "torch-compile",
+    "triton",
+    "second-order",
+    "mixed-precision",
+    "memory-efficient",
     "soap",
+    "muon",
     "psgd",
+    "adopt",
+    "shampoo",
+    "schedule-free",
+    "laprop",
+    "ademamix",
+    "nadam",
+    "rmsprop",
+    "sam",
+    "preconditioning",
+    "kronecker",
+    "mars",
+    "llm-training",
+    "distributed",
+    "fsdp",
+    "ddp",
 ]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +59,7 @@ requires-python = ">=3.9"
 dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "lightbench"]
 
 [project.urls]
+Homepage = "https://github.com/HomebrewML/HeavyBall"
 source = "https://github.com/HomebrewML/HeavyBall"
 tracker = "https://github.com/HomebrewML/HeavyBall/issues"
 
