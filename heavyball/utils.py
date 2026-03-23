@@ -2530,19 +2530,6 @@ def dampen_grad(g: Tensor, damp: float = 2**-13):
     return v, g + damp * g.abs().mean() * v
 
 
-def _param_dampen_seed(param, group):
-    idx = next((i for i, p in enumerate(group["params"]) if p is param), 0)
-    h = 0x811C9DC5
-    for s in (*param.shape, idx):
-        h = ((h ^ (s & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
-    return h
-
-
-@decorator_knowngood
-def _apply_dampening(g: Tensor, damp: float, v: Tensor):
-    return g + damp * g.abs().mean() * v
-
-
 @decorator_knowngood
 def _compilable_lra_update_(
     params: List[Tensor],
