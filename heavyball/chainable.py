@@ -1326,10 +1326,10 @@ def _detect_orig_shapes(params):
     return result
 
 
-def _gather_tensor(shard, offset, total, pg=None):
+def _reduce_gather(shard, offset, total, pg, dst):
     full = shard.new_zeros(total)
     full[offset:offset + shard.numel()] = shard
-    torch.distributed.all_reduce(full, group=pg)
+    torch.distributed.reduce(full, dst=dst, group=pg)
     return full
 
 
@@ -1352,10 +1352,16 @@ def _reshape_params(params, orig_shapes):
 
         if info.group is not None:
             shard = p.data
-            p.data = _gather_tensor(shard, info.offset, info.total, info.group).view(info.orig_shape)
-            if p.grad is not None:
-                full_grad = _gather_tensor(p.grad, info.offset, info.total, info.group).view(info.orig_shape)
-                p.grad = full_grad if rank == info.owner else None
+            full = _reduce_gather(shard, info.offset, info.total, info.group, info.owner)
+            if rank == info.owner:
+                p.data = full.view(info.orig_shape)
+                if p.grad is not None:
+                    p.grad = _reduce_gather(p.grad, info.offset, info.total, info.group, info.owner).view(info.orig_shape)
+            else:
+                del full
+                if p.grad is not None:
+                    _reduce_gather(p.grad, info.offset, info.total, info.group, info.owner)
+                p.grad = None
             gathers.append((p, info, shard))
         else:
             orig, numel = info.orig_shape, p.data.numel()
@@ -1375,9 +1381,14 @@ def _reshape_params(params, orig_shapes):
 
 
 def _restore_params(views, gathers):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     for p, info, shard in gathers:
-        torch.distributed.broadcast(p.data, src=info.owner, group=info.group)
-        shard.copy_(p.data.flatten()[info.offset:info.offset + shard.numel()])
+        if rank == info.owner:
+            full = p.data.flatten()
+        else:
+            full = shard.new_empty(info.total)
+        torch.distributed.broadcast(full, src=info.owner, group=info.group)
+        shard.copy_(full[info.offset:info.offset + shard.numel()])
         p.data = shard
         p.grad = None
     for p, flat in views:
