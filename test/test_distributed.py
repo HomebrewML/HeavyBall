@@ -76,6 +76,14 @@ def _make_split_model():
     )
 
 
+def _make_misaligned_model():
+    return nn.Sequential(
+        nn.Linear(63, 63, bias=False), nn.ReLU(),
+        nn.Linear(63, 63, bias=False), nn.ReLU(),
+        nn.Linear(63, 63, bias=False),
+    )
+
+
 def _make_integration_model():
     return nn.Sequential(
         nn.LayerNorm(64), nn.Linear(64, 64, bias=False), nn.ReLU(),
@@ -92,6 +100,10 @@ def _make_data(dim=32, n=4):
 
 def _make_split_data():
     return _make_data(64)
+
+
+def _make_misaligned_data():
+    return _make_data(63)
 
 
 def _make_integration_data():
@@ -285,6 +297,11 @@ def test_fsdp2(opt_name, reference_params, tmp_path):
 @pytest.mark.parametrize("opt_name", _SPLIT_OPTS)
 def test_fsdp_split(opt_name, tmp_path):
     _run_fsdp_test(opt_name, tmp_path, _make_split_model, _make_split_data, "FSDP-split")
+
+
+@pytest.mark.parametrize("opt_name", _SPLIT_OPTS)
+def test_fsdp_misaligned(opt_name, tmp_path):
+    _run_fsdp_test(opt_name, tmp_path, _make_misaligned_model, _make_misaligned_data, "FSDP-misalign")
 
 
 @pytest.mark.parametrize("opt_name", _INTEGRATION_OPTS)

@@ -340,6 +340,22 @@ class SqueezeGrad(FunctionTransform):
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
 
+class TagGuard(FunctionTransform):
+    def __init__(self, fn, **tags):
+        super().__init__(fn)
+        for k, v in tags.items():
+            setattr(self, k, v)
+
+    def _init(self, *args, **kwargs):
+        pass
+
+    def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
+        return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+
+needs_full_param = functools.partial(TagGuard, needs_full_param=True)
+
+
 def zero_guard(*names):
     return functools.partial(ZeroGuard, names=names)
 
@@ -594,6 +610,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @no_state
 def orthogonalize_grad_to_param(group, update, grad, param):
     return utils.orthogonalize_grad_to_param(param, update, group["eps"])
@@ -619,6 +636,7 @@ def update_by_schedule_free(group, update, grad, param, z):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @copy_guard(2, "z")
 @zero_guard("exp_avg")
 @no_state
@@ -677,6 +695,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq", "fisher_approx")
 @no_state_no_foreach
 def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
@@ -801,6 +820,7 @@ def precond_schedule(group, prob: Union[callable, float, None] = None, name: str
     raise ValueError("No preconditioner update schedule specified.")
 
 
+@needs_full_param
 @no_state_no_foreach
 def orthogonalize_update(group, update, grad, param, scale_mode: str = "scale"):  # explore scale_mode="graft"
     if update.dim() < 2:
@@ -828,6 +848,7 @@ def _store_std(state, group, update, grad, param):
     state["init_std"] = torch.std(param)
 
 
+@needs_full_param
 @general_guard("init_std", init_fn=_store_std, skip_first=False)
 @no_state
 def mup_approx(group, updates, grads, params, init_std):
@@ -847,6 +868,7 @@ def _init_full_delta(state, group, update, grad, param, log_space: bool):
     state["delta"] = torch.full_like(param, math.log(val) if log_space else val)
 
 
+@needs_full_param
 @zero_guard("state")
 @general_guard("delta", init_fn=functools.partial(_init_delta, log_space=False), skip_first=False)
 @no_state
@@ -855,6 +877,7 @@ def scale_by_d_adaptation(group, update, grad, param, state, delta):
     return update
 
 
+@needs_full_param
 @zero_guard("state")
 @general_guard("delta", init_fn=functools.partial(_init_delta, log_space=True), skip_first=False)
 @no_state
@@ -881,6 +904,7 @@ def _init_scion_state(state, group, update, grad, param):
     state["scion_state"] = {"initialized": False}
 
 
+@needs_full_param
 @general_guard("scion_state", init_fn=_init_scion_state, skip_first=False)
 @no_state
 def scion_auto_norm(group, update, grad, param, scion_state):
@@ -911,6 +935,7 @@ def _apply_soap_preconditioner(group, update, Q, GG, *references):
         )
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -930,6 +955,7 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @general_guard("Q", "GG", init_fn=_init_soap)
@@ -955,6 +981,7 @@ def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_prod
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -973,6 +1000,7 @@ def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG)
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1097,6 +1125,7 @@ def _update_lra(
     )
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1106,6 +1135,7 @@ def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1116,6 +1146,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1125,6 +1156,7 @@ def scale_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, 
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1135,6 +1167,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
     raise SkipUpdate from None
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1157,6 +1190,7 @@ def scale_by_psgd(
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1185,6 +1219,7 @@ def scale_by_delayed_psgd(
     return new if precond is None else precond
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1208,6 +1243,7 @@ def update_by_psgd(
     raise SkipUpdate from None
 
 
+@needs_full_param
 @no_state
 def sign(group, update, grad, param, graft: bool = True):
     return utils.sign_(update, graft)
@@ -1219,6 +1255,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
     return clip_fn(update)
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1339,7 +1376,7 @@ def _view_param(p, shape):
         p.grad = p.grad.view(shape)
 
 
-def _reshape_params(params, orig_shapes):
+def _reshape_params(params, orig_shapes, gather=True):
     if not orig_shapes:
         return [], []
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -1350,7 +1387,7 @@ def _reshape_params(params, orig_shapes):
         if info is None or p.data.shape == info.orig_shape:
             continue
 
-        if info.group is not None:
+        if info.group is not None and gather:
             shard = p.data
             full = _reduce_gather(shard, info.offset, info.total, info.group, info.owner)
             if rank == info.owner:
@@ -1427,30 +1464,31 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
             utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
 
 
+def _walk_fns(obj):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, FunctionTransform):
+            yield cur
+            stack.append(cur.fn)
+        elif isinstance(cur, functools.partial):
+            stack.append(cur.func)
+        elif isinstance(cur, Branch):
+            for branch in cur.branches:
+                stack.extend(branch)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend(cur)
+
+
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
     if retain and offset:
         raise ValueError("offset cannot be retained")
 
-    def _walk(obj):
-        stack = [obj]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, FunctionTransform):
-                yield cur
-                stack.append(cur.fn)
-            elif isinstance(cur, functools.partial):
-                stack.append(cur.func)
-            elif isinstance(cur, Branch):
-                for branch in cur.branches:
-                    stack.extend(branch)
-            elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
-                stack.extend(cur)
-
     if retain:
-        offset = max((ft.transform_idx for ft in _walk(fns) if ft.transform_idx is not None), default=-1) + 1
+        offset = max((ft.transform_idx for ft in _walk_fns(fns) if ft.transform_idx is not None), default=-1) + 1
 
     new_fns = [copy.deepcopy(fn) for fn in fns]
-    for ft in _walk(new_fns):
+    for ft in _walk_fns(new_fns):
         if not retain or ft.transform_idx is None:
             ft.transform_idx, offset = offset, offset + 1
 
@@ -1555,6 +1593,7 @@ class ChainOpt(utils.StatefulOptimizer):
     def fns(self, value):
         self._fns = value
         self._set_indices(retain=True)
+        self._needs_gather = any(getattr(ft, 'needs_full_param', False) for ft in _walk_fns(self._fns))
 
     def _set_indices(self, retain=True):
         self._fns = set_indices(self.fns, retain)
@@ -1573,7 +1612,7 @@ class ChainOpt(utils.StatefulOptimizer):
             all_params = [p for g in self.param_groups for p in g["params"]]
             self._orig_shapes = _detect_orig_shapes(all_params)
 
-        views, gathers = _reshape_params(group["params"], self._orig_shapes)
+        views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
         try:
             self._step_inner(group)
         finally:
