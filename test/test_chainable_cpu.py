@@ -68,15 +68,49 @@ def test_set_indices_assigns_transform_ids():
 
 
 # Optimizers whose chains are purely elementwise must NOT need gather
-_EXPECT_NO_GATHER = {"SGD", "ForeachAdamW", "ForeachNAdam", "ForeachAdEMAMix", "UnscaledAdamW", "ForeachAdamC",
-    "ForeachRMSprop", "ForeachSFAdamW", "ForeachADOPT", "ForeachLaProp", "PaLMForeachSFAdamW", }
+_EXPECT_NO_GATHER = {
+    "SGD",
+    "ForeachAdamW",
+    "ForeachNAdam",
+    "ForeachAdEMAMix",
+    "UnscaledAdamW",
+    "ForeachAdamC",
+    "ForeachRMSprop",
+    "ForeachSFAdamW",
+    "ForeachADOPT",
+    "ForeachLaProp",
+    "PaLMForeachSFAdamW",
+}
 
 # Optimizers whose chains use shape-dependent or global-reduction ops must need gather
-_EXPECT_GATHER = {"ForeachSOAP", "ForeachSOAPNAdam", "ForeachSOAPAdEMAMix", "ForeachSOLP", "ForeachMuon", "MuonLaProp",
-    "OrthoLaProp", "LaPropOrtho", "ForeachPSGDKron", "ForeachPurePSGD", "ForeachCachedPSGDKron", "ForeachDelayedPSGD",
-    "ForeachCachedDelayedPSGDKron", "ForeachCachedNewtonPSGD", "NewtonHybrid2PSGDKron", "ForeachPSGDLRA",
-    "ForeachDelayedPSGDLRA", "ForeachNewtonPSGDLRA", "NewtonHybrid2PSGDLRA", "SUDSAdamW", "Scion", "ForeachSignLaProp",
-    "MSAMLaProp", "PaLMForeachSOAP", "PrecondScheduleForeachSOAP", "PrecondSchedulePaLMForeachSOAP", }
+_EXPECT_GATHER = {
+    "ForeachSOAP",
+    "ForeachSOAPNAdam",
+    "ForeachSOAPAdEMAMix",
+    "ForeachSOLP",
+    "ForeachMuon",
+    "MuonLaProp",
+    "OrthoLaProp",
+    "LaPropOrtho",
+    "ForeachPSGDKron",
+    "ForeachPurePSGD",
+    "ForeachCachedPSGDKron",
+    "ForeachDelayedPSGD",
+    "ForeachCachedDelayedPSGDKron",
+    "ForeachCachedNewtonPSGD",
+    "NewtonHybrid2PSGDKron",
+    "ForeachPSGDLRA",
+    "ForeachDelayedPSGDLRA",
+    "ForeachNewtonPSGDLRA",
+    "NewtonHybrid2PSGDLRA",
+    "SUDSAdamW",
+    "Scion",
+    "ForeachSignLaProp",
+    "MSAMLaProp",
+    "PaLMForeachSOAP",
+    "PrecondScheduleForeachSOAP",
+    "PrecondSchedulePaLMForeachSOAP",
+}
 
 _SKIP_INSTANTIATE = {"SplitOpt", "SAMWrapper"}
 
