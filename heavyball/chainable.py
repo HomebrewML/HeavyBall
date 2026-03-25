@@ -1350,15 +1350,19 @@ def _detect_orig_shapes(params):
         n = len(fsdp_entries)
         flags = torch.zeros(n, ws, dtype=torch.int32, device=fsdp_entries[0][0].device)
         for i, (p, orig, total, spi) in enumerate(fsdp_entries):
-            if spi.in_shard and spi.numel_in_shard is not None and spi.numel_in_shard < total and len(orig) >= 2:
+            if spi.in_shard and spi.numel_in_shard is not None and spi.numel_in_shard < total:
                 flags[i, rank] = 1
         torch.distributed.all_reduce(flags)
+        pg_cache = {}
         for i in range(n):
             ranks = flags[i].nonzero().squeeze(-1).tolist()
             if len(ranks) >= 2:
-                groups[i] = (torch.distributed.new_group(ranks), ranks)
+                key = tuple(ranks)
+                if key not in pg_cache:
+                    pg_cache[key] = torch.distributed.new_group(ranks)
+                groups[i] = (pg_cache[key], ranks)
 
-    # owner must be precomputed here — different ranks see different subsets in _reshape_params
+    # owner must be precomputed (different ranks see different subsets in _reshape_params)
     result = {}
     split_idx = 0
     for i, (p, orig, total, spi) in enumerate(fsdp_entries):
