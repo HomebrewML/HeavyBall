@@ -484,7 +484,7 @@ def set_(dst: Tensor, src: Tensor):
 
 def capture_param_shapes(params):
     """Capture param shapes before FSDP/sharding. Pass as ``orig_shapes=`` to any optimizer."""
-    if hasattr(params, 'parameters'):
+    if hasattr(params, "parameters"):
         params = params.parameters()
     return {id(p): tuple(p.shape) for p in params}
 
@@ -2121,7 +2121,7 @@ def stochastic_round_(ref: Tensor, source: Tensor | None = None):
     if source.dtype in (torch.float16, torch.float32, torch.float64):
         source = source.to(torch.float32).view(dtype=torch.int32)
         noise = sum(torch.randint_like(source, low=0, high=(1 << 16)) for _ in range(dither_steps))
-        noise = noise + source - (dither_steps - 1) * (1 << 15) # center | x - (N-1)*delta/2
+        noise = noise + source - (dither_steps - 1) * (1 << 15)  # center | x - (N-1)*delta/2
         noise = noise.bitwise_and(-65536)  # FFFF0000 mask, preserves sign+exp+7 mantissa bits
         return noise.view(dtype=torch.float32).bfloat16()
     return source.to(ref.dtype)

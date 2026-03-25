@@ -13,21 +13,18 @@ import torch
 import heavyball
 from heavyball import utils
 from heavyball.utils import (
-    _ULPState,
     _compilable_update_,
+    _ULPState,
     clean,
-    copy_stochastic_,
-    promote,
     scalar_guard,
     set_torch,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 # ------------------------------------------------------------------ helpers
+
 
 def _reset_dynamo():
     torch._dynamo.reset()
@@ -66,6 +63,7 @@ def _get_param_ecc(opt, p):
 def _train_linear(compile_mode, rne=False, steps=50):
     torch.manual_seed(0)
     import heavyball.utils as _u
+
     old_mode = _u.compile_mode
     _u.compile_mode = compile_mode
     ctx = _rne_mode() if rne else contextlib.nullcontext()
@@ -90,6 +88,7 @@ def _train_linear(compile_mode, rne=False, steps=50):
 
 # --------------------------------- corrections populated (stochastic rounding)
 
+
 def test_ecc_populated_stochastic():
     set_torch()
     _reset_dynamo()
@@ -102,19 +101,20 @@ def test_ecc_populated_stochastic():
 # --------------------------------- corrections populated (RNE rounding)
 # This is the case Inductor could fold. It was broken before the _bf16_to_f32 fix.
 
+
 def test_ecc_populated_rne():
     set_torch()
     _reset_dynamo()
     p, ecc, _ = _train_linear("max-autotune-no-cudagraphs", rne=True)
     assert ecc is not None, "param::ecc not found in optimizer state"
     assert ecc.any(), (
-        "param::ecc all zeros with RNE rounding under compile — "
-        "Inductor likely folded the f32->bf16->f32 roundtrip"
+        "param::ecc all zeros with RNE rounding under compile — Inductor likely folded the f32->bf16->f32 roundtrip"
     )
     clean()
 
 
 # --------------------------------- compiled ECC matches eager quality
+
 
 @pytest.mark.parametrize("rne", [False, True], ids=["stochastic", "rne"])
 def test_ecc_compiled_vs_eager(rne):
@@ -128,14 +128,12 @@ def test_ecc_compiled_vs_eager(rne):
     assert ecc_e.any(), f"eager corrections all zeros (rne={rne})"
 
     ratio = loss_c / max(loss_e, 1e-30)
-    assert ratio < 5.0, (
-        f"compiled loss {loss_c:.2e} is {ratio:.1f}x worse than "
-        f"eager loss {loss_e:.2e} (rne={rne})"
-    )
+    assert ratio < 5.0, f"compiled loss {loss_c:.2e} is {ratio:.1f}x worse than eager loss {loss_e:.2e} (rne={rne})"
     clean()
 
 
 # --------------------------------- unit: _compilable_update_ with RNE
+
 
 def test_compilable_update_rne():
     set_torch()
