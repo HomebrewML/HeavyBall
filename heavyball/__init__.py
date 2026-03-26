@@ -1028,6 +1028,10 @@ class ForeachPSGDLRA(C.BaseOpt):
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
     Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
+
+    Note: `foreach=True` (default) uses a single global low-rank approximation shared across all
+    parameters, while `foreach=False` fits an independent per-parameter LRA. These are different
+    algorithms and will produce different results.
     """
 
     delayed: bool = False
@@ -1043,7 +1047,7 @@ class ForeachPSGDLRA(C.BaseOpt):
         momentum_into_precond_update=True,
         rank: Optional[int] = None,
         warmup_steps: int = 0,
-        foreach: bool = True,
+        foreach: bool = True,  # True: global LRA across all params. False: independent per-param LRA.
         q_dtype="float32",
         stochastic_schedule: bool = False,
         storage_dtype: str = "float32",

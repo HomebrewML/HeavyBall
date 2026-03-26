@@ -619,20 +619,22 @@ def orthogonalize_grad_to_param(group, update, grad, param):
 @copy_guard(2, "z")
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
-    group["weight_sum"] = utils.schedule_free_(
-        group["lr"],
-        group["weight_lr_power"],
-        group.get("weight_sum", 0),
-        utils.get_beta1(group),
-        param,
-        z,
-        update,
-        grad,
-        group["caution"],
-        group["r"],
-        group["step"],
-        group["weight_decay"],
-    )
+    # Compute weight_sum once per step, not per param in no-foreach mode.
+    if group.get("_sf_step") != group["step"]:
+        weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
+        group["weight_sum"] = group.get("weight_sum", 0) + weight
+        group["_sf_step"] = group["step"]
+
+    weight_sum = group["weight_sum"]
+    weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
+    try:
+        ckp1 = weight / weight_sum
+    except ZeroDivisionError:
+        ckp1 = 0
+
+    update, param, z, grad = utils.list_guard(update, param, z, grad)
+    lr, ckp1, beta1 = utils.scalar_guard(group["lr"], ckp1, utils.get_beta1(group), grad[0])
+    utils._compilable_schedule_free_(param, z, ckp1, update, lr, beta1, group["weight_decay"], grad, group["caution"])
     raise SkipUpdate from None
 
 
@@ -1076,7 +1078,15 @@ def _update_psgd_precond(
     if not should_use_cache or not cached:
         return None  # caching adds extra ops and is not worth the overhead when we precondition at every step
 
-    for c_, q_ in zip(Q_cache, utils.line_to_triu(Q, group["inverse_free"]) if group["store_triu_as_line"] else Q):
+    Q_resolved = utils.line_to_triu(Q, group["inverse_free"]) if group["store_triu_as_line"] else Q
+    for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
+        if c_ is None:
+            c_ = (
+                torch.empty_like(q_)
+                if q_.ndim == 1
+                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
+            )
+            Q_cache[i] = c_
         if q_.ndim == 2:
             torch.matmul(q_.T, q_, out=c_)
         else:
@@ -1086,7 +1096,7 @@ def _update_psgd_precond(
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
     kwargs = {"ea": update, "caution": group["caution"], "grad": grad}
-    if group.get("is_cached", False):
+    if group.get("is_cached", False) and Q_cache[0] is not None:
         out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         out = utils.psgd_precond_grad(
@@ -1105,7 +1115,7 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
         "lr": group["lr"],
         "decay": group["weight_decay"],
     }
-    if group.get("is_cached", False):
+    if group.get("is_cached", False) and Q_cache[0] is not None:
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         utils.fused_psgd_precond_grad(
@@ -1533,6 +1543,15 @@ class ChainOpt(utils.StatefulOptimizer):
         self.fns = fns
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
+
+    def state_dict(self):
+        sd = super().state_dict()
+        for param_state in sd["state"].values():
+            for group_state in param_state.values():
+                if isinstance(group_state, dict):
+                    for key in [k for k in group_state if isinstance(k, str) and "Q_cache" in k]:
+                        del group_state[key]
+        return sd
 
     def _init_param_ecc(self):
         for group in self.param_groups:
