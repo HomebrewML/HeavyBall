@@ -92,6 +92,8 @@ python -m pytest {test} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 sleep 3
 curl -s -X PUT "https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/?api_key=${{CONTAINER_API_KEY}}" \
   -H "Content-Type: application/json" -d '{{"state": "stopped"}}' || true
+sleep 2
+kill 1 2>/dev/null || true
 """
 
 
