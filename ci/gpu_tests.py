@@ -83,8 +83,10 @@ SELF_DESTRUCT_TIMEOUT = 1800
 ONSTART_TEMPLATE = """#!/bin/bash
 timeout {timeout} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
+if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends g++; fi &&
 cd / && git clone --depth 1 -b {branch} {repo} /w &&
-cd /w && pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
+cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
+pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
 python -m pytest {test} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
 """
