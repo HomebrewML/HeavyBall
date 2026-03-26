@@ -190,6 +190,7 @@ def parse_exit_code(log):
             return int(line.split("=")[1])
     return None
 
+
 _ICONS = {"pass": "+", "fail": "-", "error": "!", "timeout": "?"}
 
 
