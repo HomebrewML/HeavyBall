@@ -1,7 +1,9 @@
 import os
 
+import pytest
 import torch
 
+import heavyball
 import heavyball.chainable as C
 import heavyball.utils
 
@@ -63,3 +65,64 @@ def test_set_indices_assigns_transform_ids():
     param = [torch.nn.Parameter(torch.ones(1))]
 
     assigned(state_fn, group, update, grad, param)
+
+
+# Optimizers whose chains are purely elementwise must NOT need gather
+_EXPECT_NO_GATHER = {
+    "SGD",
+    "ForeachAdamW",
+    "ForeachNAdam",
+    "ForeachAdEMAMix",
+    "UnscaledAdamW",
+    "ForeachAdamC",
+    "ForeachRMSprop",
+    "ForeachSFAdamW",
+    "ForeachADOPT",
+    "ForeachLaProp",
+    "PaLMForeachSFAdamW",
+}
+
+# Optimizers whose chains use shape-dependent or global-reduction ops must need gather
+_EXPECT_GATHER = {
+    "ForeachSOAP",
+    "ForeachSOAPNAdam",
+    "ForeachSOAPAdEMAMix",
+    "ForeachSOLP",
+    "ForeachMuon",
+    "MuonLaProp",
+    "OrthoLaProp",
+    "LaPropOrtho",
+    "ForeachPSGDKron",
+    "ForeachPurePSGD",
+    "ForeachCachedPSGDKron",
+    "ForeachDelayedPSGD",
+    "ForeachCachedDelayedPSGDKron",
+    "ForeachCachedNewtonPSGD",
+    "NewtonHybrid2PSGDKron",
+    "ForeachPSGDLRA",
+    "ForeachDelayedPSGDLRA",
+    "ForeachNewtonPSGDLRA",
+    "NewtonHybrid2PSGDLRA",
+    "SUDSAdamW",
+    "Scion",
+    "ForeachSignLaProp",
+    "MSAMLaProp",
+    "PaLMForeachSOAP",
+    "PrecondScheduleForeachSOAP",
+    "PrecondSchedulePaLMForeachSOAP",
+}
+
+_SKIP_INSTANTIATE = {"SplitOpt", "SAMWrapper"}
+
+_ALL_OPTS = [n for n in heavyball.__all__ if n not in _SKIP_INSTANTIATE and n in (_EXPECT_NO_GATHER | _EXPECT_GATHER)]
+
+
+@pytest.mark.parametrize("opt_name", _ALL_OPTS)
+def test_needs_gather_flag(opt_name):
+    params = [torch.nn.Parameter(torch.randn(4, 4))]
+    extra = {"max_lr": 0.0025} if opt_name == "ForeachAdamC" else {}
+    opt = getattr(heavyball, opt_name)(params, lr=1e-3, **extra)
+    if opt_name in _EXPECT_NO_GATHER:
+        assert not opt._needs_gather, f"{opt_name} should be elementwise (no gather needed)"
+    elif opt_name in _EXPECT_GATHER:
+        assert opt._needs_gather, f"{opt_name} should require full param gather"

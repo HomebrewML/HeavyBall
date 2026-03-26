@@ -110,14 +110,18 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
+_PASSTHROUGH_KWARGS = {"orig_shapes"}
+
+
 def _build_defaults(locals_dict):
     d = locals_dict.copy()
     d.pop("self")
     params = d.pop("params")
     kwargs = d.pop("kwargs")
     d.update(kwargs)
-    if kwargs:
-        utils.warn_once(f"Working with uncaptured keyword arguments: {kwargs}")
+    unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
+    if unknown:
+        utils.warn_once(f"Working with uncaptured keyword arguments: {unknown}")
     return params, d
 
 
@@ -334,6 +338,22 @@ class SqueezeGrad(FunctionTransform):
                 kwargs[k] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         out = self.fn(state, group, update, grad, param, *args, **kwargs)
         return [o.view(s) for o, s in zip(out, original_shapes)]
+
+
+class TagGuard(FunctionTransform):
+    def __init__(self, fn, **tags):
+        super().__init__(fn)
+        for k, v in tags.items():
+            setattr(self, k, v)
+
+    def _init(self, *args, **kwargs):
+        pass
+
+    def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
+        return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+
+needs_full_param = functools.partial(TagGuard, needs_full_param=True)
 
 
 def zero_guard(*names):
@@ -590,6 +610,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @no_state
 def orthogonalize_grad_to_param(group, update, grad, param):
     return utils.orthogonalize_grad_to_param(param, update, group["eps"])
@@ -598,23 +619,26 @@ def orthogonalize_grad_to_param(group, update, grad, param):
 @copy_guard(2, "z")
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
-    group["weight_sum"] = utils.schedule_free_(
-        group["lr"],
-        group["weight_lr_power"],
-        group.get("weight_sum", 0),
-        utils.get_beta1(group),
-        param,
-        z,
-        update,
-        grad,
-        group["caution"],
-        group["r"],
-        group["step"],
-        group["weight_decay"],
-    )
+    # Compute weight_sum once per step, not per param in no-foreach mode.
+    if group.get("_sf_step") != group["step"]:
+        weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
+        group["weight_sum"] = group.get("weight_sum", 0) + weight
+        group["_sf_step"] = group["step"]
+
+    weight_sum = group["weight_sum"]
+    weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
+    try:
+        ckp1 = weight / weight_sum
+    except ZeroDivisionError:
+        ckp1 = 0
+
+    update, param, z, grad = utils.list_guard(update, param, z, grad)
+    lr, ckp1, beta1 = utils.scalar_guard(group["lr"], ckp1, utils.get_beta1(group), grad[0])
+    utils._compilable_schedule_free_(param, z, ckp1, update, lr, beta1, group["weight_decay"], grad, group["caution"])
     raise SkipUpdate from None
 
 
+@needs_full_param
 @copy_guard(2, "z")
 @zero_guard("exp_avg")
 @no_state
@@ -673,6 +697,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq", "fisher_approx")
 @no_state_no_foreach
 def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
@@ -797,6 +822,7 @@ def precond_schedule(group, prob: Union[callable, float, None] = None, name: str
     raise ValueError("No preconditioner update schedule specified.")
 
 
+@needs_full_param
 @no_state_no_foreach
 def orthogonalize_update(group, update, grad, param, scale_mode: str = "scale"):  # explore scale_mode="graft"
     if update.dim() < 2:
@@ -824,6 +850,7 @@ def _store_std(state, group, update, grad, param):
     state["init_std"] = torch.std(param)
 
 
+@needs_full_param
 @general_guard("init_std", init_fn=_store_std, skip_first=False)
 @no_state
 def mup_approx(group, updates, grads, params, init_std):
@@ -843,6 +870,7 @@ def _init_full_delta(state, group, update, grad, param, log_space: bool):
     state["delta"] = torch.full_like(param, math.log(val) if log_space else val)
 
 
+@needs_full_param
 @zero_guard("state")
 @general_guard("delta", init_fn=functools.partial(_init_delta, log_space=False), skip_first=False)
 @no_state
@@ -851,6 +879,7 @@ def scale_by_d_adaptation(group, update, grad, param, state, delta):
     return update
 
 
+@needs_full_param
 @zero_guard("state")
 @general_guard("delta", init_fn=functools.partial(_init_delta, log_space=True), skip_first=False)
 @no_state
@@ -877,13 +906,15 @@ def _init_scion_state(state, group, update, grad, param):
     state["scion_state"] = {"initialized": False}
 
 
+@needs_full_param
 @general_guard("scion_state", init_fn=_init_scion_state, skip_first=False)
 @no_state
 def scion_auto_norm(group, update, grad, param, scion_state):
     scale = group.get("scale", 1.0)
+    param_ids = {id(p): i for i, p in enumerate(group["params"])}
     for ctx, p in zip(scion_state, param):
         if not ctx["initialized"]:
-            utils.scion_auto_init_param_(p, scale)
+            utils.scion_auto_init_param_(p, scale, seed=param_ids.get(id(p), 0))
             ctx["initialized"] = True
     return utils.scion_auto_lmo_(update, scale)
 
@@ -906,6 +937,7 @@ def _apply_soap_preconditioner(group, update, Q, GG, *references):
         )
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -925,6 +957,7 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @general_guard("Q", "GG", init_fn=_init_soap)
@@ -950,6 +983,7 @@ def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_prod
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -968,6 +1002,7 @@ def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG)
     return precond
 
 
+@needs_full_param
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -991,7 +1026,16 @@ def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slo
 
 
 def _update_psgd_precond(
-    cached, Q_cache, group, param, grad, Q, velocity, running_lower_bound, step, prob: Optional[callable] = None
+    cached,
+    Q_cache,
+    group,
+    param,
+    grad,
+    Q,
+    velocity,
+    running_lower_bound,
+    step,
+    prob: Optional[callable] = None,
 ) -> Optional[Tensor]:
     if prob is None:
         prob = utils.precond_update_prob_schedule()
@@ -1034,7 +1078,15 @@ def _update_psgd_precond(
     if not should_use_cache or not cached:
         return None  # caching adds extra ops and is not worth the overhead when we precondition at every step
 
-    for c_, q_ in zip(Q_cache, utils.line_to_triu(Q, group["inverse_free"]) if group["store_triu_as_line"] else Q):
+    Q_resolved = utils.line_to_triu(Q, group["inverse_free"]) if group["store_triu_as_line"] else Q
+    for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
+        if c_ is None:
+            c_ = (
+                torch.empty_like(q_)
+                if q_.ndim == 1
+                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
+            )
+            Q_cache[i] = c_
         if q_.ndim == 2:
             torch.matmul(q_.T, q_, out=c_)
         else:
@@ -1044,7 +1096,7 @@ def _update_psgd_precond(
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
     kwargs = {"ea": update, "caution": group["caution"], "grad": grad}
-    if group.get("is_cached", False):
+    if group.get("is_cached", False) and Q_cache[0] is not None:
         out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         out = utils.psgd_precond_grad(
@@ -1063,7 +1115,7 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
         "lr": group["lr"],
         "decay": group["weight_decay"],
     }
-    if group.get("is_cached", False):
+    if group.get("is_cached", False) and Q_cache[0] is not None:
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         utils.fused_psgd_precond_grad(
@@ -1091,6 +1143,7 @@ def _update_lra(
     )
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1100,6 +1153,7 @@ def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1110,6 +1164,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     raise SkipUpdate from None
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1119,6 +1174,7 @@ def scale_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, 
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
@@ -1129,6 +1185,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
     raise SkipUpdate from None
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1151,6 +1208,7 @@ def scale_by_psgd(
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1179,6 +1237,7 @@ def scale_by_delayed_psgd(
     return new if precond is None else precond
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1202,6 +1261,7 @@ def update_by_psgd(
     raise SkipUpdate from None
 
 
+@needs_full_param
 @no_state
 def sign(group, update, grad, param, graft: bool = True):
     return utils.sign_(update, graft)
@@ -1213,6 +1273,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
     return clip_fn(update)
 
 
+@needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1251,6 +1312,153 @@ def apply_to_idx(fn, idx):
     return _fn
 
 
+class _ShapeInfo:
+    __slots__ = ("orig_shape", "offset", "total", "group", "owner")
+
+    def __init__(self, orig_shape, offset=0, total=None, group=None, owner=None):
+        self.orig_shape = orig_shape
+        self.offset = offset
+        self.total = total if total is not None else math.prod(orig_shape)
+        self.group = group
+        self.owner = owner
+
+
+def _detect_orig_shapes(params):
+    fsdp_ids = {id(p) for p in params if getattr(p, "_fsdp_flattened", False)}
+    if not fsdp_ids:
+        return {}
+    try:
+        from torch.distributed.fsdp._flat_param import FlatParameter
+    except ImportError:
+        return {}
+
+    import gc
+
+    lookup = {}
+    for obj in gc.get_objects():
+        if not isinstance(obj, FlatParameter):
+            continue
+        if not hasattr(obj, "_shard_param_infos") or obj._params is None:
+            continue
+        for param, spi, shape in zip(obj._params, obj._shard_param_infos, obj._shapes):
+            lookup[id(param)] = (tuple(shape), spi)
+
+    _dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+    # optimizer param order is stable across ranks
+    fsdp_entries = [
+        (p, s, math.prod(s), spi)
+        for p in params
+        for s, spi in [lookup.get(id(p), (None, None))]
+        if id(p) in fsdp_ids and s is not None
+    ]
+
+    groups = {}
+    if _dist and fsdp_entries:
+        rank = torch.distributed.get_rank()
+        ws = torch.distributed.get_world_size()
+        n = len(fsdp_entries)
+        flags = torch.zeros(n, ws, dtype=torch.int32, device=fsdp_entries[0][0].device)
+        for i, (p, orig, total, spi) in enumerate(fsdp_entries):
+            if spi.in_shard and spi.numel_in_shard is not None and spi.numel_in_shard < total:
+                flags[i, rank] = 1
+        torch.distributed.all_reduce(flags)
+        pg_cache = {}
+        for i in range(n):
+            ranks = flags[i].nonzero().squeeze(-1).tolist()
+            if len(ranks) >= 2:
+                key = tuple(ranks)
+                if key not in pg_cache:
+                    pg_cache[key] = torch.distributed.new_group(ranks)
+                groups[i] = (pg_cache[key], ranks)
+
+    # owner must be precomputed (different ranks see different subsets in _reshape_params)
+    result = {}
+    split_idx = 0
+    for i, (p, orig, total, spi) in enumerate(fsdp_entries):
+        sg = groups.get(i)
+        if sg:
+            pg, ranks = sg
+            owner = ranks[split_idx % len(ranks)]
+            split_idx += 1
+            if spi.in_shard:
+                result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total, pg, owner)
+        elif spi.in_shard:
+            result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total)
+    return result
+
+
+def _reduce_gather(shard, offset, total, pg, dst):
+    full = shard.new_zeros(total)
+    full[offset : offset + shard.numel()] = shard
+    torch.distributed.reduce(full, dst=dst, group=pg)
+    return full
+
+
+def _view_param(p, shape):
+    p.data = p.data.view(shape)
+    if p.grad is not None:
+        p.grad = p.grad.view(shape)
+
+
+def _reshape_params(params, orig_shapes, gather=True):
+    if not orig_shapes:
+        return [], []
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    views, gathers = [], []
+
+    for p in params:
+        info = orig_shapes.get(id(p))
+        if info is None or p.data.shape == info.orig_shape:
+            continue
+
+        if info.group is not None and gather:
+            shard = p.data
+            full = _reduce_gather(shard, info.offset, info.total, info.group, info.owner)
+            if rank == info.owner:
+                p.data = full.view(info.orig_shape)
+                if p.grad is not None:
+                    p.grad = _reduce_gather(p.grad, info.offset, info.total, info.group, info.owner).view(
+                        info.orig_shape
+                    )
+            else:
+                del full
+                if p.grad is not None:
+                    _reduce_gather(p.grad, info.offset, info.total, info.group, info.owner)
+                p.grad = None
+            gathers.append((p, info, shard))
+        else:
+            orig, numel = info.orig_shape, p.data.numel()
+            if numel == info.total:
+                target = orig
+            elif numel > 0 and len(orig) >= 2:
+                inner = math.prod(orig[1:])
+                target = (numel // inner, *orig[1:]) if numel % inner == 0 else None
+            else:
+                continue
+            if target is not None:
+                flat = p.data.shape
+                _view_param(p, target)
+                views.append((p, flat))
+
+    return views, gathers
+
+
+def _restore_params(views, gathers):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    for p, info, shard in gathers:
+        if rank == info.owner:
+            full = p.data.flatten()
+        else:
+            full = shard.new_empty(info.total)
+        torch.distributed.broadcast(full, src=info.owner, group=info.group)
+        shard.copy_(full[info.offset : info.offset + shard.numel()])
+        p.data = shard
+        p.grad = None
+    for p, flat in views:
+        _view_param(p, flat)
+
+
 def _inner_chain(state, group, update, grad, param, *fns):
     skip_update = False
     for fn in fns:
@@ -1283,30 +1491,31 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
             utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
 
 
+def _walk_fns(obj):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, FunctionTransform):
+            yield cur
+            stack.append(cur.fn)
+        elif isinstance(cur, functools.partial):
+            stack.append(cur.func)
+        elif isinstance(cur, Branch):
+            for branch in cur.branches:
+                stack.extend(branch)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend(cur)
+
+
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
     if retain and offset:
         raise ValueError("offset cannot be retained")
 
-    def _walk(obj):
-        stack = [obj]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, FunctionTransform):
-                yield cur
-                stack.append(cur.fn)
-            elif isinstance(cur, functools.partial):
-                stack.append(cur.func)
-            elif isinstance(cur, Branch):
-                for branch in cur.branches:
-                    stack.extend(branch)
-            elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
-                stack.extend(cur)
-
     if retain:
-        offset = max((ft.transform_idx for ft in _walk(fns) if ft.transform_idx is not None), default=-1) + 1
+        offset = max((ft.transform_idx for ft in _walk_fns(fns) if ft.transform_idx is not None), default=-1) + 1
 
     new_fns = [copy.deepcopy(fn) for fn in fns]
-    for ft in _walk(new_fns):
+    for ft in _walk_fns(new_fns):
         if not retain or ft.transform_idx is None:
             ft.transform_idx, offset = offset, offset + 1
 
@@ -1324,12 +1533,25 @@ class ChainOpt(utils.StatefulOptimizer):
     }
 
     def __init__(self, params, defaults, foreach: bool, *fns):
+        orig = defaults.pop("orig_shapes", None)
+        self._orig_shapes = (
+            {k: _ShapeInfo(v) if isinstance(v, tuple) else v for k, v in orig.items()} if orig is not None else None
+        )
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, foreach)
         self.fns = fns
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
+
+    def state_dict(self):
+        sd = super().state_dict()
+        for param_state in sd["state"].values():
+            for group_state in param_state.values():
+                if isinstance(group_state, dict):
+                    for key in [k for k in group_state if isinstance(k, str) and "Q_cache" in k]:
+                        del group_state[key]
+        return sd
 
     def _init_param_ecc(self):
         for group in self.param_groups:
@@ -1408,6 +1630,7 @@ class ChainOpt(utils.StatefulOptimizer):
     def fns(self, value):
         self._fns = value
         self._set_indices(retain=True)
+        self._needs_gather = any(getattr(ft, "needs_full_param", False) for ft in _walk_fns(self._fns))
 
     def _set_indices(self, retain=True):
         self._fns = set_indices(self.fns, retain)
@@ -1422,6 +1645,17 @@ class ChainOpt(utils.StatefulOptimizer):
             )
             group["base_lr"] = group["lr"]
 
+        if self._orig_shapes is None:
+            all_params = [p for g in self.param_groups for p in g["params"]]
+            self._orig_shapes = _detect_orig_shapes(all_params)
+
+        views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
+        try:
+            self._step_inner(group)
+        finally:
+            _restore_params(views, gathers)
+
+    def _step_inner(self, group):
         caution = group["caution"]
 
         vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))

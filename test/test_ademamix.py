@@ -1,6 +1,7 @@
 import math
 import os
 
+import pytest
 import torch
 import torch.testing
 
@@ -8,7 +9,15 @@ import heavyball
 
 # Ensure Torch dynamo stays disabled on CI runners without GPU support.
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+_SAVED_COMPILE_MODE = heavyball.utils.compile_mode
 heavyball.utils.compile_mode = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compile_mode():
+    heavyball.utils.compile_mode = None
+    yield
+    heavyball.utils.compile_mode = _SAVED_COMPILE_MODE
 
 
 def _alpha_schedule(step: int, alpha: float, warmup: int | None) -> float:
@@ -128,6 +137,14 @@ def test_ademamix_matches_reference_math():
     torch.testing.assert_close(state["update_by_ademamix_exp_avg_sq_0"], expected_sq, atol=1e-6, rtol=1e-5)
 
 
+def _state_value(state, fn_name: str, label: str):
+    prefix = f"{fn_name}_{label}_"
+    for key, value in state.items():
+        if key.startswith(prefix):
+            return value
+    raise KeyError(prefix)
+
+
 def test_soap_ademamix_projects_gradients_into_eigenbasis():
     torch.manual_seed(7)
 
@@ -139,7 +156,7 @@ def test_soap_ademamix_projects_gradients_into_eigenbasis():
     optimizer.step()
 
     state = optimizer.state[param][0]
-    Q = [q.clone() if q is not None else None for q in state["scale_by_soap_ademamix_Q_1"]]
+    Q = [q.clone() if q is not None else None for q in _state_value(state, "scale_by_soap_ademamix", "Q")]
 
     captured: dict[str, list[torch.Tensor] | tuple] = {}
     original = heavyball.utils.ademamix_

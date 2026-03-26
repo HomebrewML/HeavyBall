@@ -40,7 +40,15 @@ from heavyball.utils import (
 
 # Ensure Torch dynamo stays disabled on CI runners without GPU support.
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+_SAVED_COMPILE_MODE = heavyball.utils.compile_mode
 heavyball.utils.compile_mode = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compile_mode():
+    heavyball.utils.compile_mode = None
+    yield
+    heavyball.utils.compile_mode = _SAVED_COMPILE_MODE
 
 
 def _make_batch(seed: int = 0, batch: int = 8):

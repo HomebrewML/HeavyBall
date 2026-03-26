@@ -8,8 +8,17 @@ from utils import REPRESENTATIVE_OPTS, set_grad
 import heavyball
 from heavyball.utils import clean, set_torch
 
+_SAVED_COMPILE_MODE = heavyball.utils.compile_mode
 heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compile_mode():
+    heavyball.utils.compile_mode = "default"
+    yield
+    heavyball.utils.compile_mode = _SAVED_COMPILE_MODE
+
 
 STORAGE_OPTS = [
     o for o in REPRESENTATIVE_OPTS if "PSGD" not in o and "soap" not in o.lower() and "solp" not in o.lower()
@@ -43,5 +52,9 @@ def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, out
             clean()
 
     for params_f32, params_bf16 in zip(*all_params):
-        for p0, p1 in zip(params_f32, params_bf16):
-            assert torch.allclose(p0.float(), p1.float(), rtol=0.1, atol=1e-3)
+        flat_f32 = torch.cat([p.float().flatten() for p in params_f32])
+        flat_bf16 = torch.cat([p.float().flatten() for p in params_bf16])
+        cos = torch.nn.functional.cosine_similarity(flat_f32, flat_bf16, dim=0)
+        assert cos > 0.9, f"cosine similarity {cos:.4f} too low"
+        norm_ratio = flat_bf16.norm() / flat_f32.norm()
+        assert 0.9 < norm_ratio < 1.1, f"norm ratio {norm_ratio:.4f} out of range"

@@ -6,7 +6,16 @@ from utils import REPRESENTATIVE_OPTS
 import heavyball
 from heavyball.utils import clean, set_torch
 
+_SAVED_COMPILE_MODE = heavyball.utils.compile_mode
 heavyball.utils.compile_mode = "default"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compile_mode():
+    heavyball.utils.compile_mode = "default"
+    yield
+    heavyball.utils.compile_mode = _SAVED_COMPILE_MODE
+
 
 PSGD_OPTS = [o for o in REPRESENTATIVE_OPTS if "PSGD" in o]
 
@@ -26,7 +35,12 @@ def test_foreach(opt, size: int = 128, depth: int = 1, iterations: int = 512, ou
 
         for i in range(outer_iterations):
             model = nn.Sequential(*[nn.Linear(size, size, bias=False) for _ in range(depth)]).cuda()
-            o = opt(model.parameters(), lr=1e-3, stochastic_schedule=stochastic)
+            o = opt(
+                model.parameters(),
+                lr=1e-3,
+                stochastic_schedule=stochastic,
+                preconditioner_update_probability=lambda step: 0.1,
+            )
 
             for _ in range(iterations):
                 loss = model(torch.randn((128, size), device="cuda")).square().mean()

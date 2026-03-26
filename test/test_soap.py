@@ -2,9 +2,17 @@ import pytest
 import torch
 import torch._dynamo
 
+import heavyball
 import heavyball.chainable as C
 from heavyball import utils
 from heavyball.chainable import SkipUpdate
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compile_mode():
+    saved = heavyball.utils.compile_mode
+    yield
+    heavyball.utils.compile_mode = saved
 
 
 def _assign_transform(fn):

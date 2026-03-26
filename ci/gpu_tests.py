@@ -83,10 +83,17 @@ SELF_DESTRUCT_TIMEOUT = 1800
 ONSTART_TEMPLATE = """#!/bin/bash
 timeout {timeout} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
+if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends g++; fi &&
 cd / && git clone --depth 1 -b {branch} {repo} /w &&
-cd /w && pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
+cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
+pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
 python -m pytest {test} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
+sleep 3
+curl -s -X PUT "https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/?api_key=${{CONTAINER_API_KEY}}" \
+  -H "Content-Type: application/json" -d '{{"state": "stopped"}}' || true
+sleep 2
+kill 1 2>/dev/null || true
 """
 
 
@@ -263,10 +270,10 @@ def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
                 continue
 
             status = inst.get("actual_status", "")
-            done = status in ("exited", "error", "offline")
+            done = status in ("exited", "error", "offline", "stopped")
             age = time.time() - created_at[iid]
 
-            if done or (status == "running" and _instance_elapsed(inst) >= 60):
+            if done or (status == "running" and _instance_elapsed(inst) >= 20):
                 to_fetch[iid] = (inst, done)
             elif age >= STUCK_TIMEOUT:
                 to_fetch[iid] = (inst, False)
