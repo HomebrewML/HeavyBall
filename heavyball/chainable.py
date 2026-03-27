@@ -911,10 +911,13 @@ def _init_scion_state(state, group, update, grad, param):
 @no_state
 def scion_auto_norm(group, update, grad, param, scion_state):
     scale = group.get("scale", 1.0)
-    param_ids = {id(p): i for i, p in enumerate(group["params"])}
+    param_ptrs = {
+        (gp._local_tensor.data_ptr() if hasattr(gp, "_local_tensor") else gp.data_ptr()): i
+        for i, gp in enumerate(group["params"])
+    }
     for ctx, p in zip(scion_state, param):
         if not ctx["initialized"]:
-            utils.scion_auto_init_param_(p, scale, seed=param_ids.get(id(p), 0))
+            utils.scion_auto_init_param_(p, scale, seed=param_ptrs.get(p.data_ptr(), 0))
             ctx["initialized"] = True
     return utils.scion_auto_lmo_(update, scale)
 
@@ -1323,14 +1326,14 @@ class _ShapeInfo:
         self.owner = owner
 
 
-def _detect_orig_shapes(params):
+def _detect_fsdp1(params, result):
     fsdp_ids = {id(p) for p in params if getattr(p, "_fsdp_flattened", False)}
     if not fsdp_ids:
-        return {}
+        return
     try:
         from torch.distributed.fsdp._flat_param import FlatParameter
     except ImportError:
-        return {}
+        return
 
     import gc
 
@@ -1345,7 +1348,6 @@ def _detect_orig_shapes(params):
 
     _dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
 
-    # optimizer param order is stable across ranks
     fsdp_entries = [
         (p, s, math.prod(s), spi)
         for p in params
@@ -1372,8 +1374,6 @@ def _detect_orig_shapes(params):
                     pg_cache[key] = torch.distributed.new_group(ranks)
                 groups[i] = (pg_cache[key], ranks)
 
-    # owner must be precomputed (different ranks see different subsets in _reshape_params)
-    result = {}
     split_idx = 0
     for i, (p, orig, total, spi) in enumerate(fsdp_entries):
         sg = groups.get(i)
@@ -1385,6 +1385,29 @@ def _detect_orig_shapes(params):
                 result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total, pg, owner)
         elif spi.in_shard:
             result[id(p)] = _ShapeInfo(orig, spi.intra_param_start_idx, total)
+
+
+def _validate_fsdp2(params):
+    try:
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor import Shard as _Shard
+    except ImportError:
+        return
+    for p in params:
+        if not isinstance(p.data, DTensor):
+            continue
+        for pl in p.data.placements:
+            if isinstance(pl, _Shard) and pl.dim != 0:
+                raise ValueError(
+                    f"FSDP2 gather only supports Shard(0), got Shard({pl.dim}). "
+                    f"Non-dim-0 shards are strided in the flat buffer."
+                )
+
+
+def _detect_orig_shapes(params):
+    result = {}
+    _detect_fsdp1(params, result)
+    _validate_fsdp2(params)
     return result
 
 
@@ -1409,7 +1432,10 @@ def _reshape_params(params, orig_shapes, gather=True):
 
     for p in params:
         info = orig_shapes.get(id(p))
-        if info is None or p.data.shape == info.orig_shape:
+        if info is None:
+            continue
+
+        if p.data.shape == info.orig_shape:
             continue
 
         if info.group is not None and gather:
@@ -1457,6 +1483,22 @@ def _restore_params(views, gathers):
         p.grad = None
     for p, flat in views:
         _view_param(p, flat)
+
+
+def _restore_fsdp2(restores):
+    for p, full_data in restores:
+        local = p._local_tensor
+        if local.shape == full_data.shape:
+            local.copy_(full_data)
+        else:
+            mesh = p.device_mesh
+            ws = mesh.size()
+            rank = mesh.get_local_rank()
+            dim0 = full_data.shape[0]
+            chunk, rem = divmod(dim0, ws)
+            start = rank * chunk + min(rank, rem)
+            end = start + chunk + (1 if rank < rem else 0)
+            local.copy_(full_data[start:end])
 
 
 def _inner_chain(state, group, update, grad, param, *fns):
@@ -1649,10 +1691,13 @@ class ChainOpt(utils.StatefulOptimizer):
             all_params = [p for g in self.param_groups for p in g["params"]]
             self._orig_shapes = _detect_orig_shapes(all_params)
 
+        self._fsdp2_restores = []
         views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
         try:
             self._step_inner(group)
         finally:
+            _restore_fsdp2(self._fsdp2_restores)
+            self._fsdp2_restores = []
             _restore_params(views, gathers)
 
     def _step_inner(self, group):

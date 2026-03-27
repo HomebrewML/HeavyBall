@@ -132,9 +132,9 @@ def _save(model, path):
     torch.save([p.detach().cpu() for p in model.parameters()], path)
 
 
-def _init_dist(rank, world_size, store_path):
-    dist.init_process_group("gloo", store=dist.FileStore(store_path, world_size), rank=rank, world_size=world_size)
-    torch.cuda.set_device(0)
+def _init_dist(rank, world_size, store_path, backend="gloo"):
+    dist.init_process_group(backend, store=dist.FileStore(store_path, world_size), rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank if backend == "nccl" and torch.cuda.device_count() > 1 else 0)
 
 
 def _ref_worker(
@@ -198,20 +198,30 @@ def _fsdp_worker(
         dist.destroy_process_group()
 
 
-def _fsdp2_worker(rank, world_size, store_path, opt_name, result_path, cache_dir):
-    _set_cache(cache_dir)
-    _init_dist(rank, world_size, store_path)
+def _fsdp2_worker(
+    rank,
+    world_size,
+    store_path,
+    opt_name,
+    result_path,
+    cache_dir,
+    compile_mode="default",
+    model_fn=_make_model,
+    data_fn=_make_data,
+):
+    _set_cache(cache_dir, compile_mode)
+    _init_dist(rank, world_size, store_path, backend="nccl")
     try:
         from torch.distributed._composable.fsdp import fully_shard
 
         torch.manual_seed(_MODEL_SEED)
-        model = _make_model().cuda()
-        for m in model:
-            if isinstance(m, nn.Linear):
+        model = model_fn().cuda()
+        for m in model.modules():
+            if isinstance(m, (nn.Linear, nn.LayerNorm)):
                 fully_shard(m)
         fully_shard(model)
         opt = _make_opt(opt_name, model.parameters())
-        _train(model, opt, _make_data())
+        _train(model, opt, data_fn())
         # all ranks must participate in full_tensor (all-gather)
         params = [p.full_tensor().detach().cpu() for p in model.parameters()]
         if rank == 0:
@@ -282,6 +292,26 @@ def _run_fsdp_test(opt_name, tmp_path, model_fn, data_fn, label):
     _assert_close(ref, torch.load(result_path, weights_only=True), f"{label}/{opt_name}", **tol)
 
 
+_FSDP2_WS = min(2, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+
+
+def _run_fsdp2_test(opt_name, tmp_path, model_fn, data_fn, label, ws=_FSDP2_WS):
+    cm = None  # FSDP2: disable compile (DTensor + gloo/nccl single-GPU constraints)
+    cache_dir = tempfile.mkdtemp(prefix=f"hb_{label}_{opt_name}_")
+    ref_path = str(tmp_path / "ref.pt")
+    mp.spawn(_ref_worker, args=(opt_name, ref_path, cache_dir, cm, model_fn, data_fn), nprocs=1, join=True)
+    ref = torch.load(ref_path, weights_only=True)
+    result_path = str(tmp_path / "result.pt")
+    mp.spawn(
+        _fsdp2_worker,
+        args=(ws, str(tmp_path / "store"), opt_name, result_path, cache_dir, cm, model_fn, data_fn),
+        nprocs=ws,
+        join=True,
+    )
+    tol = dict(rtol=1e-2, atol=1e-4) if opt_name in _FSDP_PSGD else {}
+    _assert_close(ref, torch.load(result_path, weights_only=True), f"{label}/{opt_name}", **tol)
+
+
 @pytest.mark.parametrize("opt_name", REPRESENTATIVE_OPTS)
 def test_ddp(opt_name, reference_params, tmp_path):
     info = reference_params[opt_name]
@@ -312,18 +342,22 @@ def test_fsdp(opt_name, reference_params, tmp_path):
     _assert_close(info["params"], torch.load(result_path, weights_only=True), f"FSDP/{opt_name}", **tol)
 
 
-@pytest.mark.skip(reason="FSDP2 (fully_shard) segfaults with gloo on single GPU")
+@pytest.mark.skipif(not torch.distributed.is_nccl_available(), reason="NCCL required for FSDP2")
 @pytest.mark.parametrize("opt_name", REPRESENTATIVE_OPTS)
 def test_fsdp2(opt_name, reference_params, tmp_path):
-    info = reference_params[opt_name]
+    if opt_name in _FSDP_SKIP:
+        pytest.skip(_FSDP_SKIP[opt_name])
+    cm = None  # FSDP2: disable compile (DTensor + single-GPU NCCL constraints)
+    info = reference_params.get(opt_name, cm)
     result_path = str(tmp_path / "result.pt")
     mp.spawn(
         _fsdp2_worker,
-        args=(2, str(tmp_path / "store"), opt_name, result_path, info["cache_dir"]),
-        nprocs=2,
+        args=(_FSDP2_WS, str(tmp_path / "store"), opt_name, result_path, info["cache_dir"], cm),
+        nprocs=_FSDP2_WS,
         join=True,
     )
-    _assert_close(info["params"], torch.load(result_path, weights_only=True), f"FSDP2/{opt_name}")
+    tol = dict(rtol=1e-2, atol=1e-4) if opt_name in _FSDP_PSGD else {}
+    _assert_close(info["params"], torch.load(result_path, weights_only=True), f"FSDP2/{opt_name}", **tol)
 
 
 @pytest.mark.parametrize("opt_name", _SPLIT_OPTS)
@@ -339,3 +373,21 @@ def test_fsdp_misaligned(opt_name, tmp_path):
 @pytest.mark.parametrize("opt_name", _INTEGRATION_OPTS)
 def test_fsdp_integration(opt_name, tmp_path):
     _run_fsdp_test(opt_name, tmp_path, _make_integration_model, _make_integration_data, "FSDP-integ")
+
+
+@pytest.mark.skipif(not torch.distributed.is_nccl_available(), reason="NCCL required for FSDP2")
+@pytest.mark.parametrize("opt_name", _SPLIT_OPTS)
+def test_fsdp2_split(opt_name, tmp_path):
+    _run_fsdp2_test(opt_name, tmp_path, _make_split_model, _make_split_data, "FSDP2-split")
+
+
+@pytest.mark.skipif(not torch.distributed.is_nccl_available(), reason="NCCL required for FSDP2")
+@pytest.mark.parametrize("opt_name", _SPLIT_OPTS)
+def test_fsdp2_misaligned(opt_name, tmp_path):
+    _run_fsdp2_test(opt_name, tmp_path, _make_misaligned_model, _make_misaligned_data, "FSDP2-misalign")
+
+
+@pytest.mark.skipif(not torch.distributed.is_nccl_available(), reason="NCCL required for FSDP2")
+@pytest.mark.parametrize("opt_name", _INTEGRATION_OPTS)
+def test_fsdp2_integration(opt_name, tmp_path):
+    _run_fsdp2_test(opt_name, tmp_path, _make_integration_model, _make_integration_data, "FSDP2-integ")

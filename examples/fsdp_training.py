@@ -1,12 +1,15 @@
 """FSDP training with HeavyBall optimizers.
 
+Supports both FSDP1 (FullyShardedDataParallel) and FSDP2 (fully_shard).
+
 Launch with torchrun:
     torchrun --nproc_per_node=2 examples/fsdp_training.py
+    torchrun --nproc_per_node=2 examples/fsdp_training.py --fsdp2
     torchrun --nproc_per_node=2 examples/fsdp_training.py --opt ForeachSOAP
     torchrun --nproc_per_node=2 examples/fsdp_training.py --opt ForeachMuon --lr 0.01
 
 Shape-aware optimizers (SOAP, Muon, PSGD, Scion, etc.) auto-detect FSDP-flattened
-params and restore original shapes. No manual intervention needed.
+params (FSDP1) and DTensor params (FSDP2). No manual intervention needed.
 
 For non-FSDP parallelism backends, capture shapes before wrapping:
     shapes = heavyball.capture_param_shapes(model)
@@ -19,7 +22,6 @@ import argparse
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
@@ -42,20 +44,37 @@ def make_model():
     )
 
 
+def wrap_fsdp1(model):
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    return FSDP(model.cuda(), use_orig_params=True)
+
+
+def wrap_fsdp2(model):
+    from torch.distributed._composable.fsdp import fully_shard
+
+    model = model.cuda()
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
+            fully_shard(m)
+    fully_shard(model)
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--opt", default="ForeachAdamW")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--fsdp2", action="store_true", help="Use FSDP2 (fully_shard) instead of FSDP1")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
 
-    # use_orig_params=True is required for HeavyBall's auto shape detection
-    model = FSDP(make_model().cuda(), use_orig_params=True)
+    model = wrap_fsdp2(make_model()) if args.fsdp2 else wrap_fsdp1(make_model())
     opt = getattr(heavyball, args.opt)(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 

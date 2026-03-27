@@ -1385,6 +1385,27 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 for i, pv in enumerate(p_views):
                     self.mapping_inverse[_tensor_key(pv)] = (p, i)
 
+    @staticmethod
+    def _dtensor_local(t):
+        return t._local_tensor if hasattr(t, "_local_tensor") else t
+
+    def _fsdp2_resolve(self, p, grad):
+        """For FSDP2 DTensor params: extract local tensor or all-gather full tensor."""
+        local = p._local_tensor
+        _needs_gather = getattr(self, "_needs_gather", False)
+        if _needs_gather and local.shape != tuple(p.shape):
+            # Sharded and needs full param — all-gather (collective, all ranks participate)
+            p_base = p.full_tensor()
+            if grad is not None and hasattr(grad, "full_tensor"):
+                grad = grad.full_tensor()
+            elif grad is not None:
+                grad = self._dtensor_local(grad)
+            restores = getattr(self, "_fsdp2_restores", None)
+            if restores is not None:
+                restores.append((p, p_base))
+            return p_base, grad
+        return local, (self._dtensor_local(grad) if grad is not None else None)
+
     def split_p_and_g_in_group(
         self,
         group: dict,
@@ -1394,6 +1415,13 @@ class StatefulOptimizer(torch.optim.Optimizer):
     ):
         for p in group["params"]:
             grad = getattr(p, "grad", None)
+
+            # FSDP2: resolve before grad check (full_tensor is collective)
+            if hasattr(p, "_local_tensor"):
+                p_base, grad = self._fsdp2_resolve(p, grad)
+            else:
+                p_base = p
+
             if grad is None and skip_none:
                 continue
 
@@ -1403,14 +1431,18 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 yield p, grad
                 continue
 
-            if group.get("merge_dims", False) and not p.data.is_contiguous():
-                for fmt in (torch.channels_last, torch.channels_last_3d):
-                    if p.data.is_contiguous(memory_format=fmt):
-                        p._restore_memory_format = fmt
-                        break
-                p.data = p.data.contiguous()
+            if group.get("merge_dims", False) and not p_base.is_contiguous():
+                if p_base is p:
+                    for fmt in (torch.channels_last, torch.channels_last_3d):
+                        if p.data.is_contiguous(memory_format=fmt):
+                            p._restore_memory_format = fmt
+                            break
+                    p.data = p.data.contiguous()
+                    p_base = p
+                else:
+                    p_base = p_base.contiguous()
 
-            self.mapping[p] = p_views = merge_group(group, p)
+            self.mapping[p] = p_views = merge_group(group, p_base)
             for i, pv in enumerate(p_views):
                 self.mapping_inverse[_tensor_key(pv)] = (p, i)
 
@@ -1419,8 +1451,9 @@ class StatefulOptimizer(torch.optim.Optimizer):
             p.vector = None
             p.hessian_vector = None
 
+            _local = self._dtensor_local
             grad, vs, hvs = [
-                [None] * len(p_views) if x is None else merge_group(group, x)  #
+                [None] * len(p_views) if x is None else merge_group(group, _local(x))
                 for x in (grad, vector, hessian_vector)
             ]
 
