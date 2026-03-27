@@ -490,6 +490,7 @@ def capture_param_shapes(params):
 
 
 def clean():
+    """Empties CUDA cache and runs garbage collection."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -500,6 +501,7 @@ def _ignore_warning(msg):
 
 
 def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
+    """Configures PyTorch for optimal performance: cudnn benchmark, TF32, and opt_einsum backend."""
     import opt_einsum as _opt_einsum
 
     cudnn.benchmark = True
@@ -1155,6 +1157,7 @@ class _ULPState:
 
 @tree_apply
 def promote(x):
+    """Promotes tensor to fp32, decoding ECC correction if present."""
     if isinstance(x, torch.dtype) and x in (torch.bfloat16, torch.float16, torch.int8):
         return torch.float32
     if isinstance(x, Tensor):
@@ -1280,7 +1283,8 @@ def _tensor_key(x: Tensor):
 
 
 class StatefulOptimizer(torch.optim.Optimizer):
-    """
+    """Base optimizer class with state tracking, FSDP reshaping, ECC, and compiled step dispatch.
+
     finite_differences saves memory, but needs more compute. (Alternative is true HVP)
     Both `True` and `False` have some edge cases they don't support, so experiment with it.
     The previous (heavyball<=1.5.3) default was `True`, which is incompatible with some benchmarks but works better with RevNet
@@ -1628,6 +1632,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
 
 def copy_stochastic_list_(target: List[Tensor], source: List[Tensor]):
+    """Stochastic-rounding copy for lists of tensors."""
     for t, s in zip(target, source):
         copy_stochastic_(t, s)
 
@@ -2133,6 +2138,7 @@ def _compilable_copy_stochastic_(target: Tensor, source: Tensor):
 
 
 def copy_stochastic_(target: Tensor, source: Tensor):
+    """In-place copy with stochastic rounding for low-precision targets."""
     ecc = getattr(target, "_ecc", None)
     if ecc is not None:
         ecc.encode(source, target)
@@ -3043,8 +3049,8 @@ def eigvecs_product_rank1(
 
     Returns:
         (Y, w) where:
-          Y has shape (..., d) and equals G @ eigenvectors(P),
-          w is the Householder vector you can cache & reuse.
+            Y has shape (..., d) and equals G @ eigenvectors(P),
+            w is the Householder vector you can cache & reuse.
     """
     if w is None:
         w = _householder_vec_e1_to_v(v, eps)
@@ -3182,6 +3188,7 @@ def l2_normalization_(x, clip_at: float = 1e-8):
 
 
 def l2_clip_(x, clip_at: float = 1.0):
+    """L2-norm gradient clipping."""
     x = list_guard(x)
     _compilable_l2_clip_(x, clip_at)
     return x
@@ -3194,6 +3201,7 @@ def _compilable_rmsnorm_clip_(xs, clip_at, eps=1e-8):
 
 
 def rmsnorm_clip_(x, clip_at: float = 1.0):
+    """RMS-norm gradient clipping."""
     x = list_guard(x)
     _compilable_rmsnorm_clip_(x, clip_at)
     return x
@@ -3305,6 +3313,7 @@ def _compilable_softsign_compress_(x):
 
 
 def softsign_compress(x):
+    """Softsign gradient compression: x / (1 + |x|)."""
     x = list_guard(x)
     _compilable_softsign_compress_(x)
     return x
@@ -3402,6 +3411,7 @@ def _compilable_trust_region_clip_(grad, lerp, scale):
 
 
 def trust_region_clip_(grad, lerp=0.9, scale=1.5):
+    """Trust-region gradient clipping: interpolates toward mean, then scales."""
     grad = list_guard(grad)
     lerp, scale = scalar_guard(lerp, scale, grad[0])
     _compilable_trust_region_clip_(grad, lerp, scale)
@@ -3438,6 +3448,7 @@ _warned = set()
 
 
 def warn_once(msg):
+    """Emits a warning at most once per unique message."""
     if msg not in _warned:
         warnings.warn(msg)
         _warned.add(msg)
@@ -3725,6 +3736,7 @@ def pointwise_lr_adaptation(
 
 
 def hook_optimizer_into_model(model, optimizer, *args, **kwargs):
+    """Registers optimizer step as a post-backward hook on the model."""
     optimizers = {}
 
     def _step(p: Tensor):
@@ -3766,6 +3778,7 @@ def _compilable_caution_no_scale(g: Tensor, update: Tensor):
 
 
 def disable_caution_scaling():
+    """Disables gradient-agreement scaling in cautious updates (keeps masking only)."""
     global _compilable_cautioning
     _compilable_cautioning = _compilable_caution_no_scale
 

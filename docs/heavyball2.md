@@ -1,43 +1,26 @@
-# HeavyBall 2.0.0
+# Migrating from 1.x
 
-## Highlights
-
-* First‑class SAM via `SAMWrapper` (closure‑based)
-* More robust checkpoint/restore with HeavyBall‑internal state
-* New optimizers: `SGD`, `ForeachAdamC`, `MSAMLaProp`
-* Overhauled chainable pipeline: indexed transforms, branching, internal gradient‑accumulation, and `SqueezeGrad`
-* Faster, more accurate code paths
-* New `heavyball.helpers` with Optuna‑compatible samplers and utilities
-
----
-
-## Detailed changes
-
-### New & improved
-
-* `SAMWrapper` applies sharpness‑aware minimization to any HeavyBall optimizer while preserving the wrapped step logic;
-  requires a closure
-* `SGD` built on the chainable internals
-* `ForeachAdamC`, a ["corrected version of Adam"](https://arxiv.org/abs/2506.02285) with weight decay normalized by the
-  maximum LR
-* `MSAMLaProp` built on top of [Momentum‑SAM](https://arxiv.org/abs/2401.12033)
-* Chainable pipeline:
-    * Every transform carries a `transform_idx`; state keys include this index
-    * [Optimizer branching](https://github.com/HomebrewML/HeavyBall/blob/2f7e095fb8217a58600d86ea6b19682c10e7eb33/examples/branched_optimizer.py#L15-L28),
-      for more freedom in optimizer design and native [grafting](https://openreview.net/forum?id=FpKgG31Z_i9) support
-    * `PrecondGradAccumGuard` enables gradient accumulation for preconditioner fitting
-    * `SqueezeGrad` removes size‑1 dims before functional transforms, improving PSGD's speed and preconditioner fitting
-* PSGD and SOAP speedups through new, more accurate SVD calculation and better compilation
-* `heavyball.helpers` module with Optuna‑compatible samplers and sweep utilities
-
-### Breaking changes
-
-* Default orthogonalization switches to Newton-Schulz, impacting Muon; SOAP relies on `precise_zeroth_power_mode="qr"`
-  and remains unchanged
-* Optimizer state keys include the per‑transform index (e.g., `exp_avg_3`), breaking old checkpoints
+!!! warning "Breaking changes"
+    - Default orthogonalization switches to Newton-Schulz, impacting Muon. SOAP is unaffected (it uses QR decomposition through a separate code path).
+    - Optimizer state keys now include a per-transform index (e.g., `exp_avg_3`), breaking old checkpoints.
 
 ## Upgrade checklist
 
-1. Re‑test optimizers sensitive to orthogonalization; set `utils.zeroth_power_mode="qr"` to restore 1.x behavior
-2. Migrate checkpoints using `python scripts/migrate_optimizer_state.py <checkpoint_path> heavyball.<OptimizerClass>`
-3. Update any custom state‑dict tooling to handle transform‑indexed keys
+1. Re-test optimizers sensitive to orthogonalization. To restore 1.x behavior:
+   ```python
+   heavyball.utils.zeroth_power_mode = "qr"
+   ```
+2. Migrate checkpoints:
+   ```bash
+   python scripts/migrate_optimizer_state.py <checkpoint_path> heavyball.<OptimizerClass>
+   ```
+3. Update any custom state-dict tooling to handle transform-indexed keys.
+
+## What's new
+
+* First-class SAM via `SAMWrapper` (closure-based)
+* Robust checkpoint/restore with HeavyBall-internal state
+* New optimizers: `SGD`, `ForeachAdamC`, `MSAMLaProp`
+* Overhauled chainable pipeline: indexed transforms, [branching](https://github.com/HomebrewML/HeavyBall/blob/2f7e095fb8217a58600d86ea6b19682c10e7eb33/examples/branched_optimizer.py#L15-L28) for native [grafting](https://openreview.net/forum?id=FpKgG31Z_i9) support, `PrecondGradAccumGuard`, `SqueezeGrad`
+* Faster, more accurate PSGD and SOAP via improved SVD and better compilation
+* `heavyball.helpers` module with Optuna-compatible samplers and sweep utilities

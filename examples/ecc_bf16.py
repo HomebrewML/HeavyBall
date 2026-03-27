@@ -1,3 +1,8 @@
+"""Compares optimizer state precision: fp32, naive bf16, stochastic-rounding bf16, and ECC bf16+8.
+
+Trains an MLP teacher-student setup and plots convergence. Outputs precision_toy.png.
+Run: python examples/ecc_bf16.py
+"""
 import math
 import warnings
 

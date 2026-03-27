@@ -1,3 +1,8 @@
+"""Grafted optimizer via the Branch API: Adam's step size with SGD's direction.
+
+Demonstrates custom optimizer construction using heavyball.chainable.Branch.
+Run: python examples/branched_optimizer.py
+"""
 import random
 from typing import Iterable
 

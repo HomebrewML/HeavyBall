@@ -1,3 +1,7 @@
+"""MNIST autoencoder with PSGDKron, MARS gradient correction, and TensorBoard logging.
+
+Run: python examples/autoencoder.py
+"""
 import os
 import random
 from datetime import datetime

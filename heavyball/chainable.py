@@ -39,6 +39,8 @@ def _guard_in_state(state, key, template_fn):
 
 
 class FunctionTransform:
+    """Base class for stateful transforms in the optimizer chain. Manages per-parameter state keyed by transform_idx."""
+
     def __init__(self, fn, names: list[str] | None = None):
         if names is None:
             names = []
@@ -86,6 +88,8 @@ class FunctionTransform:
 
 
 class Branch:
+    """Runs parallel transform paths and merges their outputs. Used for optimizer grafting."""
+
     def __init__(self, branches: List[List[callable]], merge_fn: callable):
         self.branches = branches
         self.merge_fn = merge_fn
@@ -383,6 +387,7 @@ class SkipUpdate(ValueError):
 @zero_guard("mars_old_grad")
 @no_state
 def mars(group, update, grad, param, mars_old_grad):
+    """MARS gradient variance reduction using the previous gradient."""
     utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
     utils.copy_stochastic_list_(grad, update)
     return update
@@ -391,6 +396,7 @@ def mars(group, update, grad, param, mars_old_grad):
 @zero_guard("exp_avg")
 @no_state
 def exp_avg(group, update, grad, param, exp_avg):
+    """Exponential moving average momentum."""
     return utils.scale_by_exp_avg_(exp_avg, update, utils.beta_debias(utils.get_beta1(group), group["step"]))
 
 
@@ -402,12 +408,14 @@ def weight_decay_to_init(group, update, grad, param, init):
 
 
 def identity(state, group, update, grad, param):
+    """Pass-through: returns the update unchanged."""
     return update
 
 
 @zero_guard("exp_avg")
 @no_state
 def weight_decay_to_ema(group, update, grad, param, exp_avg):
+    """Decoupled weight decay toward EMA of parameter."""
     utils.weight_decay_to_ema_(
         param,
         exp_avg,
@@ -419,6 +427,7 @@ def weight_decay_to_ema(group, update, grad, param, exp_avg):
 
 @no_state
 def cautious_weight_decay(group, update, grad, param):
+    """Cautious weight decay: masks decay by gradient-update agreement."""
     utils.cautious_weight_decay_(param, update, group["cautious_weight_decay"] * group["lr"])
     return update
 
@@ -438,6 +447,7 @@ def l1_weight_decay_to_ema(group, update, grad, param, exp_avg):
 @zero_guard("exp_avg_sq")
 @no_state
 def scale_by_exp_avg_sq(group, update, grad, param, exp_avg_sq):
+    """RMSprop-style scaling by inverse root of the debiased second moment."""
     return utils.scale_by_exp_avg_sq_(
         exp_avg_sq,
         update,
@@ -449,6 +459,7 @@ def scale_by_exp_avg_sq(group, update, grad, param, exp_avg_sq):
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def scale_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
+    """Adam update: debiased first and second moment scaling. Returns the scaled gradient without applying it."""
     return utils.adam_(
         exp_avg,
         exp_avg_sq,
@@ -463,6 +474,7 @@ def scale_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
+    """Fused Adam: weight decay, momentum, variance scaling, and parameter update in one compiled call. Raises SkipUpdate."""
     utils.fused_adam_(
         param,
         exp_avg,
@@ -484,6 +496,7 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @no_state
 def scale_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
+    """NAdam: Adam with Nesterov momentum correction."""
     utils.nadam_(
         param,
         exp_avg,
@@ -505,6 +518,7 @@ def scale_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @no_state
 def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
+    """Fused NAdam with in-place parameter update. Raises SkipUpdate."""
     utils.fused_nadam_(
         param,
         exp_avg,
@@ -528,6 +542,7 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
+    """Fused AdamC: Adam with weight decay normalized by max_lr. Raises SkipUpdate."""
     utils.fused_adam_(
         param,
         exp_avg,
@@ -548,6 +563,7 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @no_state
 def scale_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq):
+    """AdEMAMix: dual-EMA (fast + slow momentum) with second moment scaling."""
     return utils.ademamix_(
         exp_avg_fast,
         exp_avg_slow,
@@ -565,6 +581,7 @@ def scale_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, ex
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @no_state
 def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq):
+    """Fused AdEMAMix with in-place parameter update. Raises SkipUpdate."""
     utils.fused_ademamix_(
         param,
         exp_avg_fast,
@@ -588,12 +605,14 @@ def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, e
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def scale_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
+    """LaProp: max-based second moment tracking instead of EMA."""
     return utils.laprop_(exp_avg, exp_avg_sq, update, utils.get_beta1(group), utils.get_beta2(group), group["step"])
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
+    """Fused LaProp with in-place parameter update. Raises SkipUpdate."""
     utils.fused_laprop_(
         param,
         exp_avg,
@@ -613,12 +632,14 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
 @needs_full_param
 @no_state
 def orthogonalize_grad_to_param(group, update, grad, param):
+    """Projects gradient orthogonal to the parameter direction."""
     return utils.orthogonalize_grad_to_param(param, update, group["eps"])
 
 
 @copy_guard(2, "z")
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
+    """Schedule-free parameter interpolation (Defazio & Mishchenko, 2024). Maintains a z-buffer for eval/train swapping."""
     # Compute weight_sum once per step, not per param in no-foreach mode.
     if group.get("_sf_step") != group["step"]:
         weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
@@ -661,6 +682,7 @@ def update_by_msam(group, update, grad, param, z, exp_avg):
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
+    """Fused ADOPT update. Skips first 2 steps for variance initialization. Raises SkipUpdate."""
     if group["step"] == 1:
         utils.scale_by_exp_avg_sq_(exp_avg_sq, update, 0, group["eps"])
         raise SkipUpdate from None
@@ -825,6 +847,7 @@ def precond_schedule(group, prob: Union[callable, float, None] = None, name: str
 @needs_full_param
 @no_state_no_foreach
 def orthogonalize_update(group, update, grad, param, scale_mode: str = "scale"):  # explore scale_mode="graft"
+    """Newton-Schulz orthogonalization of the update matrix. Only applies to 2D+ parameters."""
     if update.dim() < 2:
         return update
     original_shape = update.shape
@@ -837,12 +860,14 @@ def orthogonalize_update(group, update, grad, param, scale_mode: str = "scale"):
 @zero_guard("momentum")
 @no_state
 def nesterov_momentum(group, updates, grads, params, momentum):
+    """Nesterov-style momentum (applied to parameter lists, not individual params)."""
     return utils.nesterov_momentum(momentum, updates, utils.get_beta1(group))
 
 
 @zero_guard("momentum")
 @no_state
 def nesterov_ema(group, updates, grads, params, momentum):  # equivalent to Grokfast
+    """Nesterov EMA momentum. Equivalent to Grokfast."""
     return utils.nesterov_ema(momentum, updates, utils.get_beta1(group))
 
 
@@ -899,6 +924,7 @@ def scale_by_pointwise_lr_adaptation(group, update, grad, param, state, delta):
 @zero_guard("momentum")
 @no_state
 def heavyball_momentum(group, updates, grads, params, momentum):
+    """Heavy-ball (Polyak) momentum."""
     return utils.heavyball_momentum(momentum, updates, utils.get_beta1(group))
 
 
@@ -942,6 +968,7 @@ def _apply_soap_preconditioner(group, update, Q, GG, *references):
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
+    """SOAP: projects gradient into Shampoo eigenbasis, applies Adam, projects back."""
     grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
     precond = utils.adam_(
         exp_avg,
@@ -1149,6 +1176,7 @@ def _update_lra(
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
 def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
+    """PSGD low-rank approximation preconditioning."""
     u, v, d = _update_lra(group, U, V, d, param, update_to_precond, False)
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
@@ -1204,6 +1232,7 @@ def scale_by_psgd(
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
+    """PSGD Kronecker-factored preconditioning."""
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
@@ -1227,6 +1256,7 @@ def scale_by_delayed_psgd(
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
+    """PSGD Kronecker with delayed preconditioner update: precondition first, then update Q."""
     if group.get("inverse_free", False):
         precond = None
     else:
@@ -1264,11 +1294,13 @@ def update_by_psgd(
 @needs_full_param
 @no_state
 def sign(group, update, grad, param, graft: bool = True):
+    """Sign compression of the update. With graft=True, preserves the original norm."""
     return utils.sign_(update, graft)
 
 
 @no_state
 def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
+    """Global gradient clipping using the provided clip function."""
     assert clip_fn is not None
     return clip_fn(update)
 
@@ -1298,6 +1330,7 @@ def update_by_delayed_psgd(
 
 
 def palm_beta2(state, group, update, grad, param):
+    """PaLM-style beta2 scheduling: sets beta2 = 1 - step^(-beta2_scale)."""
     beta2 = 1 - group["step"] ** -group["beta2_scale"]
     group["betas"] = (utils.get_beta1(group), beta2)
     return update
@@ -1822,6 +1855,8 @@ class BaseOpt(ChainOpt):
 
 
 class ScheduleFree(BaseOpt):
+    """BaseOpt that interpolates between training and eval parameter states. Call .eval()/.train() around validation."""
+
     def eval(self):
         for group in self.param_groups:
             group["train_mode"] = train_mode = not group.get("train_mode")
@@ -1851,6 +1886,8 @@ class ScheduleFree(BaseOpt):
 
 
 class MSAM(BaseOpt):
+    """BaseOpt for Momentum-SAM. Call .eval()/.train() around validation."""
+
     def eval(self):
         for group in self.param_groups:
             group["train_mode"] = train_mode = not group.get("train_mode")

@@ -9,6 +9,8 @@ from . import utils
 
 
 class SGD(C.BaseOpt):
+    """Heavy-ball momentum SGD (Polyak, 1964)."""
+
     def __init__(
         self,
         params,
@@ -34,6 +36,8 @@ class SGD(C.BaseOpt):
 
 
 class ForeachAdamW(C.BaseOpt):
+    """Fused AdamW (Loshchilov & Hutter, 2019). Entire update compiles to a single kernel."""
+
     def __init__(
         self,
         params,
@@ -62,6 +66,8 @@ class ForeachAdamW(C.BaseOpt):
 
 
 class ForeachNAdam(C.BaseOpt):
+    """NAdam: Adam with Nesterov momentum (Dozat, 2016)."""
+
     def __init__(
         self,
         params,
@@ -92,6 +98,8 @@ class ForeachNAdam(C.BaseOpt):
 
 
 class ForeachAdEMAMix(C.BaseOpt):
+    """AdEMAMix (Pagliardini et al., 2024): dual-EMA Adam with fast and slow momentum. Expects 3 betas."""
+
     def __init__(
         self,
         params,
@@ -124,6 +132,8 @@ class ForeachAdEMAMix(C.BaseOpt):
 
 
 class UnscaledAdamW(C.BaseOpt):
+    """Adam without 1/sqrt(v) denominator scaling. Tracks second moment for diagnostics only."""
+
     def __init__(
         self,
         params,
@@ -154,6 +164,8 @@ class UnscaledAdamW(C.BaseOpt):
 
 
 class SUDSAdamW(C.BaseOpt):
+    """SUDS: rank-1 spectral preconditioner layered on Adam."""
+
     def __init__(
         self,
         params,
@@ -183,6 +195,8 @@ class SUDSAdamW(C.BaseOpt):
 
 
 class Scion(C.BaseOpt):
+    """Scion: gradient normalization with auto-initialized scaling. Chain: exp_avg -> scion_auto_norm."""
+
     def __init__(
         self,
         params,
@@ -227,6 +241,8 @@ class Scion(C.BaseOpt):
 
 
 class ForeachAdamC(C.BaseOpt):
+    """AdamC (arXiv:2506.02285): weight decay normalized by max_lr to decouple decay from schedule."""
+
     def __init__(
         self,
         params,
@@ -304,6 +320,8 @@ class ForeachRMSprop(C.BaseOpt):
 
 
 class ForeachSFAdamW(C.ScheduleFree):
+    """Schedule-Free AdamW (Defazio & Mishchenko, 2024). Call .eval() before validation, .train() before resuming."""
+
     def __init__(
         self,
         params,
@@ -342,6 +360,8 @@ class ForeachSFAdamW(C.ScheduleFree):
 
 
 class MSAMLaProp(C.MSAM):
+    """Momentum SAM with LaProp scaling. Call .eval()/.train() around validation."""
+
     def __init__(
         self,
         params,
@@ -381,10 +401,14 @@ class MSAMLaProp(C.MSAM):
 
 
 class PaLMForeachSFAdamW(ForeachSFAdamW):
+    """Schedule-Free AdamW with PaLM-style beta2 scheduling."""
+
     palm: bool = True
 
 
 class ForeachADOPT(C.BaseOpt):
+    """ADOPT (Taniguchi et al., 2024): convergence-guaranteed Adam variant. Skips first step for variance init."""
+
     def __init__(
         self,
         params,
@@ -413,6 +437,8 @@ class ForeachADOPT(C.BaseOpt):
 
 
 class ForeachMuon(C.BaseOpt):
+    """Muon: momentum + Newton-Schulz orthogonalization. Second-order on 2D+ params, first-order fallback on 1D."""
+
     def __init__(
         self,
         params,
@@ -459,6 +485,8 @@ class ForeachMuon(C.BaseOpt):
 
 
 class ForeachLaProp(C.BaseOpt):
+    """LaProp (Ziyin et al., 2021): layer-wise adaptive lr with max-based variance tracking."""
+
     def __init__(
         self,
         params,
@@ -487,6 +515,8 @@ class ForeachLaProp(C.BaseOpt):
 
 
 class MuonLaProp(C.BaseOpt):
+    """LaProp scaling followed by Muon-style Newton-Schulz orthogonalization."""
+
     def __init__(
         self,
         params,
@@ -593,6 +623,8 @@ class ForeachSOAP(C.BaseOpt):
 
 
 class ForeachSOAPNAdam(C.BaseOpt):
+    """SOAP with NAdam (Nesterov momentum) in the preconditioned space."""
+
     use_precond_schedule: bool = False
 
     def __init__(
@@ -654,6 +686,8 @@ class ForeachSOAPNAdam(C.BaseOpt):
 
 
 class ForeachSOAPAdEMAMix(C.BaseOpt):
+    """SOAP with AdEMAMix in the preconditioned space."""
+
     use_precond_schedule: bool = False
 
     def __init__(
@@ -716,6 +750,8 @@ class ForeachSOAPAdEMAMix(C.BaseOpt):
 
 
 class ForeachSignLaProp(C.BaseOpt):
+    """LaProp scaling compressed to sign (SignSGD direction)."""
+
     def __init__(
         self,
         params,
@@ -821,20 +857,28 @@ class ForeachSOLP(C.BaseOpt):
 
 
 class PaLMForeachSOAP(ForeachSOAP):
+    """SOAP with PaLM-style beta2 scheduling."""
+
     use_precond_schedule: bool = False
     palm: bool = True
 
 
 class PrecondScheduleForeachSOAP(ForeachSOAP):
+    """SOAP with adaptive preconditioner update schedule."""
+
     use_precond_schedule: bool = True
 
 
 class PrecondSchedulePaLMForeachSOAP(ForeachSOAP):
+    """SOAP with PaLM beta2 and adaptive preconditioner scheduling."""
+
     use_precond_schedule: bool = True
     palm: bool = True
 
 
 class OrthoLaProp(C.BaseOpt):
+    """Orthogonalize gradient to parameter direction, then LaProp scale."""
+
     def __init__(
         self,
         params,
@@ -871,6 +915,8 @@ class OrthoLaProp(C.BaseOpt):
 
 
 class LaPropOrtho(C.BaseOpt):
+    """LaProp scale, then orthogonalize gradient to parameter direction. Reversed order vs OrthoLaProp."""
+
     def __init__(
         self,
         params,
@@ -907,7 +953,8 @@ class LaPropOrtho(C.BaseOpt):
 
 
 class ForeachPSGDKron(C.BaseOpt):
-    """
+    """PSGD with Kronecker-factored preconditioner (Xi-Lin Li, 2015).
+
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
     Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
@@ -999,32 +1046,45 @@ class ForeachPSGDKron(C.BaseOpt):
 
 
 class ForeachPurePSGD(ForeachPSGDKron):
+    """PSGD Kronecker without input momentum (pure preconditioned gradient)."""
+
     exp_avg_input: bool = False
 
 
 class ForeachCachedDelayedPSGDKron(ForeachPSGDKron):
+    """PSGD Kronecker with cached preconditioner and delayed updates."""
+
     delayed: bool = True
     cached: bool = True
 
 
 class ForeachCachedPSGDKron(ForeachPSGDKron):
+    """PSGD Kronecker with cached preconditioner. Trades 2x Q memory for faster steps."""
+
     cached: bool = True
 
 
 class ForeachDelayedPSGD(ForeachPSGDKron):
+    """PSGD Kronecker with delayed preconditioner update (precondition first, update Q after)."""
+
     delayed: bool = True
 
 
 class ForeachCachedNewtonPSGD(ForeachCachedPSGDKron):
+    """Newton-PSGD: uses Hessian-vector products instead of finite differences. Requires closure."""
+
     hessian_approx = True
 
 
 class NewtonHybrid2PSGDKron(ForeachCachedNewtonPSGD):
+    """Newton-PSGD with HVP every 2 steps, finite differences otherwise. Requires closure."""
+
     hvp_interval = 2
 
 
 class ForeachPSGDLRA(C.BaseOpt):
-    """
+    """PSGD with low-rank approximation.
+
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
     Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
@@ -1104,14 +1164,20 @@ class ForeachPSGDLRA(C.BaseOpt):
 
 
 class ForeachDelayedPSGDLRA(ForeachPSGDLRA):
+    """PSGD low-rank approximation with delayed preconditioner update."""
+
     delayed: bool = True
 
 
 class ForeachNewtonPSGDLRA(ForeachPSGDLRA):
+    """Newton-PSGD with low-rank approximation. Requires closure."""
+
     hessian_approx = True
 
 
 class NewtonHybrid2PSGDLRA(ForeachNewtonPSGDLRA):
+    """Newton-PSGD LRA with HVP every 2 steps, finite differences otherwise. Requires closure."""
+
     hvp_interval = 2
 
 
@@ -1163,6 +1229,8 @@ class SplitOpt(utils.StatefulOptimizer):
 
 
 class SAMWrapper(torch.optim.Optimizer):
+    """Wraps any HeavyBall optimizer with sharpness-aware minimization (Foret et al., 2021). Requires closure."""
+
     def __init__(
         self,
         params,

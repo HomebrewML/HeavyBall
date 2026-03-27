@@ -1,3 +1,8 @@
+"""Adds orthogonalize_update to a SOAP optimizer after construction.
+
+Shows runtime modification of the transform chain via assignment to optimizer.fns.
+Run: python examples/modify_functions.py
+"""
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
