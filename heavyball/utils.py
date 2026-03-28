@@ -2363,7 +2363,7 @@ def init_Q_exprs(
 
 @decorator_knowngood
 def psgd_balance_Q(Q):
-    norms = [promote(q.norm(float("inf"))).log() for q in Q]
+    norms = [promote(q.abs().max()).log() for q in Q]
     geometric_mean = sum([n for n in norms]) / len(Q)
     for q, n in zip(Q, norms):
         q *= (geometric_mean - n).exp()
@@ -2726,7 +2726,7 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     Adapted from @evanatyourservice
     """
     if max_abs is None:
-        max_abs = A.norm(float("inf")).clamp(min=1e-8)
+        max_abs = A.abs().max().clamp(min=1e-8)
 
     # cholesky uses random projection, but this uses topk -- topk is a warm start, which may converge to a biased result
     k = 2 ** math.ceil(math.log2(math.log2(min(A.shape))))  # next-largest-power-of-2 of log2-of-size
@@ -2794,15 +2794,16 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
 
 @decorator_knowngood
 def procrustes_step(Q: Tensor, max_step_size: float = 1 / 8) -> None:
-    R = (Q.T - Q).contiguous()
+    Q_ = promote(Q)
+    R = (Q_.T - Q_).contiguous()
     R_norm = max_singular_value(R, power_iter=2) + torch.finfo(R.dtype).smallest_normal
     R = R / R_norm
-    RQ = R @ Q
+    RQ = R @ Q_
     RRQ = R @ RQ
     tr_RQ = RQ.diagonal().sum()
     tr_RRQ = RRQ.diagonal().sum()
     a = torch.where(tr_RRQ < 0, torch.clamp(-tr_RQ / tr_RRQ, max=max_step_size), max_step_size)
-    Q.add_(a * (RQ + 0.5 * a * RRQ))
+    copy_stochastic_(Q, Q_ + a * (RQ + 0.5 * a * RRQ))
 
 
 @decorator_knowngood
@@ -3031,7 +3032,7 @@ def psgd_pro_update_precond(
 
     total_numel = G.numel()
     for q, exprG, lb_state in zip(Q, exprGs, running_lower_bound):
-        term1 = promote(compiled_einsum(exprG, Pg, Pg))
+        term1 = compiled_einsum(exprG, Pg, Pg)
         q_ = promote(q)
 
         if q.ndim < 2:
@@ -3159,7 +3160,7 @@ def _psgd_precond_update_(
 
         q = promote(oq)
         if update.ndim < 2:
-            lb = update.norm(float("inf"))
+            lb = update.abs().max()
         else:
             lb = max_singular_value(update, power_iter=power_iter)
             update = promote(update)
@@ -3543,17 +3544,13 @@ def precond_grad_cached_(
     cached_q: List[Tensor],
     caution: bool = False,
     grad: Optional[Tensor] = None,
-    cast: bool = True,
 ):
     if caution:
         ea = _compilable_cautioning(grad, ea)
     args = [promote(q) for q in cached_q]
     args = args + [promote(ea)]
     expr = cached_precond_grad_expr(ndim_tuple(cached_q), ea.ndim)
-    new = compiled_einsum(expr, *args)
-    if cast:
-        return new.to(ea.dtype)
-    return new
+    return compiled_einsum(expr, *args)
 
 
 TriuOrLine = Union[List[Tensor], List[Tuple[Optional[List[int]], Tensor]]]
@@ -3561,7 +3558,7 @@ TriuOrLine = Union[List[Tensor], List[Tuple[Optional[List[int]], Tensor]]]
 
 @decorator_knowngood
 def _compilable_fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cached_q: List[Tensor]):
-    precond = precond_grad_cached_(ea, cached_q, caution=caution, grad=grad, cast=False)
+    precond = precond_grad_cached_(ea, cached_q, caution=caution, grad=grad)
     update_param_(param, precond, lr, decay, caution=False)
 
 
@@ -3589,7 +3586,6 @@ def psgd_precond_grad(
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
-    cast: bool = True,
 ):
     if caution:
         ea = _compilable_cautioning(grad, ea)
@@ -3597,10 +3593,7 @@ def psgd_precond_grad(
         preconds = line_to_triu(preconds, symmetric_output)
     args = [promote(q) for q in preconds]
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
-    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
-    if cast:
-        return new.to(ea.dtype)
-    return new
+    return compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
 
 
 @decorator_knowngood
@@ -3622,7 +3615,6 @@ def _compilable_fused_psgd_precond_grad(
         grad=grad,
         store_triu_as_line=store_triu_as_line,
         symmetric_output=symmetric_output,
-        cast=False,
     )
     update_param_(param, precond, lr, decay, caution=False, grad=grad)
 
