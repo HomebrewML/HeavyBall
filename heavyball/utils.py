@@ -1504,7 +1504,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 p.vector = torch.randn_like(p)
                 p.orig = p.data.clone()
                 # scale taken from https://github.com/lixilinx/psgd_torch/blob/1943e66596111e78157ca1b72b31c1dfdf0653ef/preconditioned_stochastic_gradient_descent.py#L2161
-                stochastic_add_(p.data, p.vector, torch.finfo(p.dtype).eps ** 0.5)
+                stochastic_add_(p.data, p.vector, torch.finfo(torch.float32).eps ** 0.5)
 
         with torch.enable_grad():
             closure()
@@ -1514,7 +1514,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
         for group in self.param_groups:
             for p, g in self.split_p_and_g_in_group(group, skip_none=True, raw=True):
                 p.grad = grads.pop(0)
-                stochastic_add_divide_(g, p.grad, -1, torch.finfo(p.dtype).eps ** 0.5)
+                stochastic_add_divide_(g, p.grad, -1, torch.finfo(torch.float32).eps ** 0.5)
                 p.hessian_vector = g
                 p.data.copy_(p.orig)
                 del p.orig
@@ -2524,10 +2524,9 @@ def lra_precond(U: Tensor, V: Tensor, d: Tensor, g: Tensor):
 
 
 @decorator_knowngood
-def dampen_grad(g: Tensor, damp: float = 2**-13):
-    # https://github.com/lixilinx/psgd_torch/blob/89b4cead31b7ad1494c4cf4dc39f4cbf920ff14d/psgd.py
+def dampen_grad(g: Tensor, damp: float = 1e-9):
     v = torch.randn_like(g)
-    damping = damp + torch.finfo(g.dtype).eps * g.abs()
+    damping = damp + torch.finfo(torch.float32).eps * g.abs()
     return v, g + damping * v
 
 
@@ -3028,7 +3027,7 @@ def psgd_pro_update_precond(
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
     precond_lr, lower_bount_beta = scalar_guard(precond_lr, lower_bount_beta, G)
 
-    damping = dampening + torch.finfo(G.dtype).eps * G.abs()
+    damping = dampening + torch.finfo(torch.float32).eps * G.abs()
     Pg = psgd_precond_grad(G + damping * torch.randn_like(G), Q)
 
     total_numel = G.numel()
@@ -3691,6 +3690,41 @@ def _compilable_cautioning(g: Tensor, update: Tensor):
 
 def caution(g, update):
     return _compilable_cautioning(g, update)
+
+
+@decorator_knowngood
+def _compilable_hyperball_(
+    p: List[Tensor],
+    u: List[Tensor],
+    init_norm: List[Tensor],
+    lr: Tensor,
+    decay: float,
+    caution: bool,
+    g: List[Tensor],
+):
+    for op, u_, n_, g_ in zip(p, u, init_norm, g):
+        u_ = promote(u_.view_as(op))
+        p_ = promote(op)
+        if decay != 0:
+            u_ = u_ + p_ * decay
+        if caution:
+            u_ = _compilable_cautioning(promote(g_), u_)
+        u_norm = u_.norm()
+        u_norm = u_norm.clamp(min=1e-12)
+        u_ = u_ / u_norm
+        p_ = p_ - lr * u_ * n_
+        p_norm = p_.norm()
+        p_norm = p_norm.clamp(min=1e-12)
+        p_ = p_ * (n_ / p_norm)
+        copy_stochastic_(op, p_)
+
+
+def hyperball_step_(param, update, init_norm, lr, decay, caution, grad):
+    param, update, init_norm, grad = list_guard(param, update, init_norm, grad)
+    lr = scalar_guard(lr, param[0])
+    if not caution:
+        grad = [None] * len(param)
+    _compilable_hyperball_(param, update, init_norm, lr, decay, caution, grad)
 
 
 def _inner_precond_update_prob_schedule(

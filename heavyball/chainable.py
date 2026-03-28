@@ -85,20 +85,94 @@ class FunctionTransform:
         return f"{self.__class__.__name__}({self.fn}, transform_idx={self.transform_idx})"
 
 
-class Branch:
+def _enforce_uniform_skip(results):
+    skips = [skip for _, skip, _ in results]
+    if not skips:
+        return False
+    if all(skips):
+        return True
+    if not any(skips):
+        return False
+    raise ValueError("All branches must uniformly skip or not skip updates")
+
+
+def _normalize_chain(fns):
+    if fns is None:
+        return None
+    return fns if isinstance(fns, (list, tuple)) else (fns,)
+
+
+class Parallel:
     def __init__(self, branches: List[List[callable]], merge_fn: callable):
         self.branches = branches
         self.merge_fn = merge_fn
 
     def __call__(self, state, group, update, grad, param):
-        outputs = []
+        results = []
         for branch in self.branches:
             branch_update = [torch.clone(u, memory_format=torch.preserve_format) for u in update]
-            branch_update, skip_update = _inner_chain(state, group, branch_update, grad, param, *branch)
-            if skip_update:
-                raise ValueError("Branches should not skip updates")
-            outputs.append(branch_update)
-        return self.merge_fn(outputs)
+            u, skip = _inner_chain(state, group, branch_update, grad, param, *branch)
+            results.append((u, skip, None))
+        if _enforce_uniform_skip(results):
+            raise SkipUpdate from None
+        return self.merge_fn([u for u, _, _ in results])
+
+
+class Route:
+    """Route params by predicate through different fn chains.
+
+    Takes arbitrary (predicate, fns) pairs. Each param is assigned to the first
+    matching route; unmatched params use the default chain (None = passthrough).
+    All routes must uniformly either skip or not skip updates.
+    """
+
+    def __init__(self, *routes, default=None):
+        self.routes = [(pred, _normalize_chain(fns)) for pred, fns in routes]
+        self.default = _normalize_chain(default)
+
+    def __call__(self, state, group, update, grad, param):
+        buckets = {}
+        assigned = set()
+        for j, (pred, _) in enumerate(self.routes):
+            for i, p in enumerate(param):
+                if i not in assigned and pred(p):
+                    buckets.setdefault(j, []).append(i)
+                    assigned.add(i)
+        default_idx = [i for i in range(len(param)) if i not in assigned]
+
+        def _sel(lst, idx):
+            return [lst[i] for i in idx]
+
+        caution = group["caution"]
+        results = []
+
+        all_chains = [(buckets.get(j), fns) for j, (_, fns) in enumerate(self.routes)]
+        if default_idx:
+            all_chains.append((default_idx, self.default))
+
+        for idx, fns in all_chains:
+            if not idx:
+                continue
+            group["caution"] = caution
+            if fns is not None:
+                u, skip = _inner_chain(state, group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns)
+            else:
+                u, skip = _sel(update, idx), False
+            results.append((u, skip, idx))
+
+        if _enforce_uniform_skip(results):
+            raise SkipUpdate from None
+
+        out = [None] * len(param)
+        for u_list, _, idx in results:
+            if u_list is not None:
+                for i, u in zip(idx, u_list):
+                    out[i] = u
+        return out
+
+
+def route(*routes, default=None):
+    return Route(*routes, default=default)
 
 
 def _zero_guard(state, key, ref, dtype):
@@ -403,6 +477,12 @@ def weight_decay_to_init(group, update, grad, param, init):
 
 def identity(state, group, update, grad, param):
     return update
+
+
+@no_state
+def apply_update(group, update, grad, param):
+    utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+    raise SkipUpdate from None
 
 
 @zero_guard("exp_avg")
@@ -865,6 +945,18 @@ def nesterov_momentum(group, updates, grads, params, momentum):
 @no_state
 def nesterov_ema(group, updates, grads, params, momentum):  # equivalent to Grokfast
     return utils.nesterov_ema(momentum, updates, utils.get_beta1(group))
+
+
+def _store_init_norm(state, group, update, grad, param):
+    state["init_norm"] = param.float().norm()
+
+
+@needs_full_param
+@general_guard("init_norm", init_fn=_store_init_norm, skip_first=False)
+@no_state
+def update_by_hyperball(group, update, grad, param, init_norm):
+    utils.hyperball_step_(param, update, init_norm, group["lr"], group["weight_decay"], group["caution"], grad)
+    raise SkipUpdate from None
 
 
 def _store_std(state, group, update, grad, param):
@@ -1616,9 +1708,14 @@ def _walk_fns(obj):
             stack.append(cur.fn)
         elif isinstance(cur, functools.partial):
             stack.append(cur.func)
-        elif isinstance(cur, Branch):
+        elif isinstance(cur, Parallel):
             for branch in cur.branches:
                 stack.extend(branch)
+        elif isinstance(cur, Route):
+            for _, fns in cur.routes:
+                stack.extend(fns)
+            if cur.default is not None:
+                stack.extend(cur.default)
         elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
             stack.extend(cur)
 

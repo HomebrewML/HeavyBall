@@ -303,6 +303,86 @@ class ForeachRMSprop(C.BaseOpt):
         )
 
 
+class HyperBallAdamW(C.BaseOpt):
+    def __init__(
+        self,
+        params,
+        lr=0.0025,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0,
+        warmup_steps=0,
+        foreach: bool = True,
+        storage_dtype: str = "float32",
+        mars: bool = False,
+        caution: bool = False,
+        mars_gamma: float = 0.0025,
+        gradient_clipping: C.str_or_fn = C.use_default,
+        update_clipping: C.str_or_fn = C.use_default,
+        palm: bool = C.use_default,
+        beta2_scale: float = 0.8,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
+        **kwargs,
+    ):
+        params, defaults = C._build_defaults(locals())
+        super().__init__(
+            params,
+            defaults,
+            foreach,
+            gradient_clipping,
+            update_clipping,
+            palm,
+            fns=(C.scale_by_exp_avg_sq, C.route(
+                (lambda p: p.ndim >= 2, C.update_by_hyperball),
+                default=C.apply_update,
+            )),
+        )
+
+
+class MuonAdamW(C.BaseOpt):
+    def __init__(
+        self,
+        params,
+        lr=0.0025,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0,
+        warmup_steps=0,
+        foreach: bool = True,
+        storage_dtype: str = "float32",
+        mars: bool = False,
+        caution: bool = False,
+        mars_gamma: float = 0.0025,
+        gradient_clipping: C.str_or_fn = C.use_default,
+        update_clipping: C.str_or_fn = C.use_default,
+        palm: bool = C.use_default,
+        beta2_scale: float = 0.8,
+        nesterov: bool = True,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
+        **kwargs,
+    ):
+        params, defaults = C._build_defaults(locals())
+        ema = C.nesterov_ema if nesterov else C.exp_avg
+        super().__init__(
+            params,
+            defaults,
+            foreach,
+            gradient_clipping,
+            update_clipping,
+            palm,
+            fns=(C.route(
+                (lambda p: p.ndim >= 2, (ema, C.orthogonalize_update)),
+                default=C.scale_by_adam,
+            ),),
+        )
+
+
 class ForeachSFAdamW(C.ScheduleFree):
     def __init__(
         self,
@@ -951,7 +1031,7 @@ class ForeachPSGDKron(C.BaseOpt):
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,  # 0.0 recovers pre-2.0.0 PSGD
         inverse_free: bool = C.use_default,
-        dampening: float = 2**-13,
+        dampening: float = 1e-9,
         precond_update_power_iterations: int = 2,
         # expert parameters
         precond_init_scale=None,
@@ -1061,7 +1141,7 @@ class PSGDPRO(C.BaseOpt):
         update_clipping: C.str_or_fn = C.use_default,
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
-        dampening: float = 2**-13,
+        dampening: float = 1e-9,
         precond_update_power_iterations: int = 2,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
