@@ -988,6 +988,8 @@ def scalar_guard(*args):
             out.append(torch.empty((), dtype=promote(ref.dtype), device=ref.device).fill_(x))
         elif isinstance(x, int):
             out.append(torch.empty((), dtype=torch.int64, device=ref.device).fill_(x))
+        elif isinstance(x, Tensor) and x.is_floating_point() and x.ndim == 0:
+            out.append(x.to(dtype=promote(ref.dtype)))
         else:
             out.append(x)
     if len(xs) == 1:

@@ -1754,6 +1754,8 @@ class ChainOpt(utils.StatefulOptimizer):
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, multi_tensor)
         self.fns = fns
+        if self.compile_step:
+            self._chain = torch.compile(self._chain, fullgraph=True)
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
 
@@ -1890,16 +1892,35 @@ class ChainOpt(utils.StatefulOptimizer):
         group["step"] = state["step"] = step = step + 1
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / max(step, group["warmup_steps"] + 1)
 
+        if isinstance(step, torch.Tensor):
+            _orig_floats = {}
+            for k, v in group.items():
+                if isinstance(v, float):
+                    _orig_floats[k] = v
+                    group[k] = torch.tensor(v, dtype=torch.float64, device=step.device)
+                elif isinstance(v, tuple) and any(isinstance(x, float) for x in v):
+                    _orig_floats[k] = v
+                    group[k] = tuple(
+                        torch.tensor(x, dtype=torch.float64, device=step.device) if isinstance(x, float) else x
+                        for x in v
+                    )
+
         if not group["multi_tensor"] or len(p) == 1:
             for param, grad in zip(p, g):
-                chain(self.state_, group, [grad], [param], *self.fns)
-                group["caution"] = caution
+                self._chain(group, [grad], [param], caution)
         else:
-            chain(self.state_, group, g, p, *self.fns)
+            self._chain(group, g, p, caution)
+
+        if isinstance(step, torch.Tensor):
+            group.update(_orig_floats)
 
         group["caution"] = caution
         group["lr"] = group["prev_lr"]
         group["step"] = None
+
+    def _chain(self, group, g, p, caution):
+        chain(self.state_, group, g, p, *self.fns)
+        group["caution"] = caution
 
 
 str_or_fn = Union[str, callable, None, Literal[use_default]]
