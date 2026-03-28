@@ -1305,13 +1305,13 @@ class StatefulOptimizer(torch.optim.Optimizer):
         "hessian_approx",
     )
 
-    def __init__(self, params, defaults, foreach: bool = True, use_ema: bool = False):
+    def __init__(self, params, defaults, multi_tensor: bool = True, use_ema: bool = False):
         for attr in self._INSTANCE_ATTRS:
             if attr in defaults:
                 val = defaults.pop(attr)
                 if val is not use_default:
                     setattr(self, attr, val)
-        super().__init__(params, {**defaults, "foreach": foreach})
+        super().__init__(params, {**defaults, "multi_tensor": multi_tensor})
         self.use_ema = use_ema
         self.mapping = {}
         self.mapping_inverse = {}
@@ -2151,7 +2151,7 @@ def _compilable_update_(
     caution: bool,
     g: List[Optional[Tensor]],
 ):
-    for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a foreach
+    for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a multi-tensor op
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
         if caution:
@@ -2620,7 +2620,7 @@ def multi_flatten(*xs: Tuple[List[Tensor], int]):
 
 
 @decorator_knowngood
-def dampen_multiple(g: List[Tensor], damp: float = 2**-13):
+def dampen_multiple(g: List[Tensor], damp: float = 1e-9):
     vs = []
     gs = []
     for g_ in g:
@@ -2631,8 +2631,7 @@ def dampen_multiple(g: List[Tensor], damp: float = 2**-13):
 
 
 def casted_einsum(expr: str, *args: Tensor) -> Tensor:
-    md = min_dtype(args)
-    return compiled_einsum(expr, *[a.to(md) for a in args]).to(args[-1].dtype)
+    return compiled_einsum(expr, *[promote(a) for a in args]).to(args[-1].dtype)
 
 
 @decorator_knowngood
@@ -3012,7 +3011,7 @@ def psgd_update_precond(
     return None
 
 
-@decorator
+@decorator_knowngood
 def psgd_pro_update_precond(
     G: Tensor,
     precond_lr: float,
@@ -3548,9 +3547,8 @@ def precond_grad_cached_(
 ):
     if caution:
         ea = _compilable_cautioning(grad, ea)
-    md = min_dtype(list(cached_q) + [ea])
-    args = [q.to(md) for q in cached_q]
-    args = args + [ea.to(md)]
+    args = [promote(q) for q in cached_q]
+    args = args + [promote(ea)]
     expr = cached_precond_grad_expr(ndim_tuple(cached_q), ea.ndim)
     new = compiled_einsum(expr, *args)
     if cast:
@@ -3591,16 +3589,18 @@ def psgd_precond_grad(
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
     symmetric_output: bool = False,
+    cast: bool = True,
 ):
     if caution:
         ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
         preconds = line_to_triu(preconds, symmetric_output)
-    md = min_dtype(list(preconds) + [ea])
-    args = [q.to(md) for q in preconds]
+    args = [promote(q) for q in preconds]
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
-    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea.to(md))
-    return new.to(ea.dtype)
+    new = compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
+    if cast:
+        return new.to(ea.dtype)
+    return new
 
 
 @decorator_knowngood
@@ -3622,6 +3622,7 @@ def _compilable_fused_psgd_precond_grad(
         grad=grad,
         store_triu_as_line=store_triu_as_line,
         symmetric_output=symmetric_output,
+        cast=False,
     )
     update_param_(param, precond, lr, decay, caution=False, grad=grad)
 

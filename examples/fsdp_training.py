@@ -2,8 +2,8 @@
 
 Launch with torchrun:
     torchrun --nproc_per_node=2 examples/fsdp_training.py
-    torchrun --nproc_per_node=2 examples/fsdp_training.py --opt ForeachSOAP
-    torchrun --nproc_per_node=2 examples/fsdp_training.py --opt ForeachMuon --lr 0.01
+    torchrun --nproc_per_node=2 examples/fsdp_training.py --opt SOAP
+    torchrun --nproc_per_node=2 examples/fsdp_training.py --opt Muon --lr 0.01
 
 Shape-aware optimizers (SOAP, Muon, PSGD, Scion, etc.) auto-detect FSDP-flattened
 params and restore original shapes. No manual intervention needed.
@@ -11,7 +11,7 @@ params and restore original shapes. No manual intervention needed.
 For non-FSDP parallelism backends, capture shapes before wrapping:
     shapes = heavyball.capture_param_shapes(model)
     model = your_wrapper(model)
-    opt = heavyball.ForeachSOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
+    opt = heavyball.SOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
 """
 
 import argparse
@@ -44,7 +44,7 @@ def make_model():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opt", default="ForeachAdamW")
+    parser.add_argument("--opt", default="AdamW")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)

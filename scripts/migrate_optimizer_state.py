@@ -234,7 +234,7 @@ def migrate(
     ),
     optimizer_class: str = typer.Argument(
         ...,
-        help="Optimizer class to instantiate (e.g., heavyball.ForeachAdamW)",
+        help="Optimizer class to instantiate (e.g., heavyball.AdamW)",
     ),
     state_key: str = typer.Option(
         "optimizer",

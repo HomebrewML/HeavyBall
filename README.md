@@ -55,29 +55,25 @@ training, and SAM.
 <summary>Full list</summary>
 
 **First-order:**
-AdamW, NAdam, RMSprop, ADOPT, ForeachAdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, ForeachAdamC, SUDSAdamW
+AdamW, NAdam, RMSprop, ADOPT, AdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, AdamC, SUDSAdamW
 
 **Schedule-Free:**
-SFAdamW, PaLMSFAdamW
+SFAdamW
 
 Schedule-Free optimizers override `.eval()` and `.train()` to swap between training and evaluation parameter states.
 Call `opt.eval()` before validation and `opt.train()` before resuming training.
 
 **Orthogonal:**
-Muon, MuonLaProp, OrthoLaProp, LaPropOrtho
+Muon, MuonAdamW, MuonLaProp, HyperBallAdamW, OrthoLaProp, LaPropOrtho
 
 **Shampoo-based (SOAP):**
-SOAP, PaLMSOAP, PrecondScheduleSOAP, PrecondSchedulePaLMSOAP, SOAPNAdam, SOAPAdEMAMix, ForeachSOLP
+SOAP, SOAPNAdam, SOAPAdEMAMix, SOLP
 
 **PSGD (Kronecker):**
-PSGDPRO, PSGDKron, CachedPSGDKron, DelayedPSGD, CachedDelayedPSGDKron, PurePSGD, NewtonPSGDKron, NewtonHybrid2PSGDKron
-
-`Newton`-PSGD requires a closure passed to `step()`.
+PSGDKron, PSGDPRO
 
 **PSGD (Low-Rank):**
-PSGDLRA, DelayedPSGDLRA, NewtonPSGDLRA, NewtonHybrid2PSGDLRA
-
-`Newton`-PSGD requires a closure passed to `step()`.
+PSGDLRA
 
 **SAM:**
 SAMWrapper, MSAMLaProp
@@ -169,11 +165,11 @@ def graft(outputs, eps=1e-8):
 
 class GraftedAdam(C.BaseOpt):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, warmup_steps=0, foreach=True):
+                 weight_decay=0, warmup_steps=0, multi_tensor=True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         warmup_steps=warmup_steps)
         branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
-        super().__init__(params, defaults, foreach, fns=(branch,))
+        super().__init__(params, defaults, multi_tensor, fns=(branch,))
 ```
 
 Custom optimizers that inherit from `BaseOpt` get ECC, MARS, caution, clipping, warmup, and stochastic rounding

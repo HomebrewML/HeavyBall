@@ -70,7 +70,7 @@ def _train_linear(compile_mode, rne=False, steps=50):
     try:
         with ctx:
             model = torch.nn.Linear(64, 32, bias=False, device="cuda")
-            opt = heavyball.ForeachAdamW(model.parameters(), lr=1e-2, param_ecc="bf16+8")
+            opt = heavyball.AdamW(model.parameters(), lr=1e-2, param_ecc="bf16+8")
             data = torch.randn(32, 64, device="cuda")
             target = torch.randn(32, 32, device="cuda")
             for _ in range(steps):

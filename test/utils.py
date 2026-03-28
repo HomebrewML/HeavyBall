@@ -13,17 +13,11 @@ from heavyball.chainable import FunctionTransform
 #   AdEMAMix variants require 3 betas, SplitOpt requires dict param specs,
 #   SAMWrapper and Newton variants require closures
 _SKIP_GET_OPTIM = {
-    "ForeachAdEMAMix",
-    "ForeachSOAPAdEMAMix",
+    "AdEMAMix",
+    "SOAPAdEMAMix",
     "SOAPAdEMAMix",
     "SplitOpt",
     "SAMWrapper",
-    "ForeachCachedNewtonPSGD",
-    "NewtonHybrid2PSGDKron",
-    "ForeachNewtonPSGDLRA",
-    "NewtonHybrid2PSGDLRA",
-    "NewtonPSGDLRA",
-    "NewtonPSGDKron",
 }
 
 
@@ -40,7 +34,7 @@ def _fn_key(f):
 def _deduplicate_by_chain(names):
     """Keep one optimizer per unique chain of functions.
 
-    Two optimizers that differ only by foreach=True/False have identical
+    Two optimizers that differ only by multi_tensor=True/False have identical
     chains and test the same code paths — keep whichever appears first.
     """
     seen = set()

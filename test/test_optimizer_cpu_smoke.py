@@ -31,7 +31,7 @@ def _optimizer_params():
                 )
             )
             continue
-        if name == "ForeachSOAPNAdam":
+        if name == "SOAPNAdam":
             params.append(
                 pytest.param(
                     name,

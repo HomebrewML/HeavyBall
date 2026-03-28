@@ -29,7 +29,7 @@ class GraftedAdam(C.BaseOpt):
         eps: float = 1e-8,
         weight_decay: float = 1e-4,
         warmup_steps: int = 0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
     ):
         defaults = dict(
             lr=lr,
@@ -39,7 +39,7 @@ class GraftedAdam(C.BaseOpt):
             warmup_steps=warmup_steps,
         )
         branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=_graft)
-        super().__init__(params, defaults, foreach, fns=(branch,))
+        super().__init__(params, defaults, multi_tensor, fns=(branch,))
 
 
 def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):

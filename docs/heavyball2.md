@@ -4,7 +4,7 @@
 
 * First‑class SAM via `SAMWrapper` (closure‑based)
 * More robust checkpoint/restore with HeavyBall‑internal state
-* New optimizers: `SGD`, `ForeachAdamC`, `MSAMLaProp`
+* New optimizers: `SGD`, `AdamC`, `MSAMLaProp`
 * Overhauled chainable pipeline: indexed transforms, branching, internal gradient‑accumulation, and `SqueezeGrad`
 * Faster, more accurate code paths
 * New `heavyball.helpers` with Optuna‑compatible samplers and utilities
@@ -18,7 +18,7 @@
 * `SAMWrapper` applies sharpness‑aware minimization to any HeavyBall optimizer while preserving the wrapped step logic;
   requires a closure
 * `SGD` built on the chainable internals
-* `ForeachAdamC`, a ["corrected version of Adam"](https://arxiv.org/abs/2506.02285) with weight decay normalized by the
+* `AdamC`, a ["corrected version of Adam"](https://arxiv.org/abs/2506.02285) with weight decay normalized by the
   maximum LR
 * `MSAMLaProp` built on top of [Momentum‑SAM](https://arxiv.org/abs/2401.12033)
 * Chainable pipeline:

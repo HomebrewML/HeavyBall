@@ -56,9 +56,9 @@ reinforcing the need for diagnostic rather than purely comparative evaluation.
 | Optimizer      | Cautious¹ | Mars² | Success | Attempts | Avg Runtime (s) |
 |:---------------|:----------|:------|:--------|:---------|:----------------|
 | PSGDKron       | No        | No    | 77.0%   | 73.2     | 8240            |
-| NewtonPSGDKron | No        | No    | 77.0%   | 80.5     | 9052            |
+| PSGDKron (Newton) | No     | No    | 77.0%   | 80.5     | 9052            |
 | AdamW          | Yes       | No    | 75.7%   | 61.2     | 8072            |
-| ForeachSOAP    | No        | No    | 72.5%   | 77.9     | 7827            |
+| SOAP           | No        | No    | 72.5%   | 77.9     | 7827            |
 | AdamW          | No        | No    | 72.3%   | 107.8    | 10029           |
 | MuonLaProp     | No        | No    | 68.2%   | 82.7     | 10141           |
 | RMSprop        | No        | No    | 55.6%   | 114.4    | 10725           |

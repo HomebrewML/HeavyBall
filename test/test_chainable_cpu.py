@@ -70,46 +70,36 @@ def test_set_indices_assigns_transform_ids():
 # Optimizers whose chains are purely elementwise must NOT need gather
 _EXPECT_NO_GATHER = {
     "SGD",
-    "ForeachAdamW",
-    "ForeachNAdam",
-    "ForeachAdEMAMix",
+    "AdamW",
+    "NAdam",
+    "AdEMAMix",
     "UnscaledAdamW",
-    "ForeachAdamC",
-    "ForeachRMSprop",
-    "ForeachSFAdamW",
-    "ForeachADOPT",
-    "ForeachLaProp",
-    "PaLMForeachSFAdamW",
+    "AdamC",
+    "RMSprop",
+    "SFAdamW",
+    "ADOPT",
+    "LaProp",
 }
 
 # Optimizers whose chains use shape-dependent or global-reduction ops must need gather
 _EXPECT_GATHER = {
-    "ForeachSOAP",
-    "ForeachSOAPNAdam",
-    "ForeachSOAPAdEMAMix",
-    "ForeachSOLP",
-    "ForeachMuon",
+    "SOAP",
+    "SOAPNAdam",
+    "SOAPAdEMAMix",
+    "SOLP",
+    "Muon",
     "MuonLaProp",
     "OrthoLaProp",
     "LaPropOrtho",
-    "ForeachPSGDKron",
-    "ForeachPurePSGD",
-    "ForeachCachedPSGDKron",
-    "ForeachDelayedPSGD",
-    "ForeachCachedDelayedPSGDKron",
-    "ForeachCachedNewtonPSGD",
-    "NewtonHybrid2PSGDKron",
-    "ForeachPSGDLRA",
-    "ForeachDelayedPSGDLRA",
-    "ForeachNewtonPSGDLRA",
-    "NewtonHybrid2PSGDLRA",
+    "PSGDKron",
+    "PSGDLRA",
+    "PSGDPRO",
     "SUDSAdamW",
     "Scion",
-    "ForeachSignLaProp",
+    "SignLaProp",
     "MSAMLaProp",
-    "PaLMForeachSOAP",
-    "PrecondScheduleForeachSOAP",
-    "PrecondSchedulePaLMForeachSOAP",
+    "HyperBallAdamW",
+    "MuonAdamW",
 }
 
 _SKIP_INSTANTIATE = {"SplitOpt", "SAMWrapper"}
@@ -120,7 +110,7 @@ _ALL_OPTS = [n for n in heavyball.__all__ if n not in _SKIP_INSTANTIATE and n in
 @pytest.mark.parametrize("opt_name", _ALL_OPTS)
 def test_needs_gather_flag(opt_name):
     params = [torch.nn.Parameter(torch.randn(4, 4))]
-    extra = {"max_lr": 0.0025} if opt_name == "ForeachAdamC" else {}
+    extra = {"max_lr": 0.0025} if opt_name == "AdamC" else {}
     opt = getattr(heavyball, opt_name)(params, lr=1e-3, **extra)
     if opt_name in _EXPECT_NO_GATHER:
         assert not opt._needs_gather, f"{opt_name} should be elementwise (no gather needed)"

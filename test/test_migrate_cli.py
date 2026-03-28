@@ -130,7 +130,7 @@ def test_cli_migrates_legacy_checkpoint(runner, tmp_path):
                     "eps": 1e-8,
                     "weight_decay": 0.0,
                     "warmup_steps": 0,
-                    "foreach": True,
+                    "multi_tensor": True,
                     "storage_dtype": "float32",
                     "mars": False,
                     "caution": False,
@@ -139,7 +139,7 @@ def test_cli_migrates_legacy_checkpoint(runner, tmp_path):
                     "update_clipping": "use_default",
                     "palm": "use_default",
                     "beta2_scale": 0.8,
-                    "__class__": "heavyball.ForeachAdamW",
+                    "__class__": "heavyball.AdamW",
                 }
             ],
         }
@@ -148,7 +148,7 @@ def test_cli_migrates_legacy_checkpoint(runner, tmp_path):
 
         result = runner.invoke(
             migrate_script.app,
-            [str(checkpoint_path), "heavyball.ForeachAdamW", "--output", str(output_path)],
+            [str(checkpoint_path), "heavyball.AdamW", "--output", str(output_path)],
         )
 
         assert result.exit_code == 0, result.stderr or result.stdout

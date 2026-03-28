@@ -44,9 +44,9 @@ def _make_batch(
 @pytest.mark.parametrize(
     "opt_name",
     [
-        "ForeachSOAP",
+        "SOAP",
         "Muon",
-        "ForeachAdamW",
+        "AdamW",
     ],
 )
 def test_selected_optimizers_run_on_cpu(opt_name: str) -> None:
@@ -92,8 +92,8 @@ def test_mars_flag_changes_behavior() -> None:
     model_a, data, target = _make_batch()
     model_b = deepcopy(model_a)
 
-    opt_a = heavyball.ForeachAdamW(model_a.parameters(), mars=False, warmup_steps=0)
-    opt_b = heavyball.ForeachAdamW(model_b.parameters(), mars=True, warmup_steps=0)
+    opt_a = heavyball.AdamW(model_a.parameters(), mars=False, warmup_steps=0)
+    opt_b = heavyball.AdamW(model_b.parameters(), mars=True, warmup_steps=0)
 
     init = [param.detach().clone() for param in model_a.parameters()]
 
@@ -112,7 +112,7 @@ def test_mars_flag_changes_behavior() -> None:
 
 def test_sam_wrapper_requires_closure() -> None:
     model = nn.Linear(4, 2)
-    base = heavyball.ForeachAdamW(model.parameters())
+    base = heavyball.AdamW(model.parameters())
     wrapper = heavyball.SAMWrapper(model.parameters(), wrapped_optimizer=base)
 
     with pytest.raises(ValueError):

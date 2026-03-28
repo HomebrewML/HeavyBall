@@ -57,12 +57,12 @@ def test_foreach(
     losses = [[], []]
 
     for i in range(total_runs):
-        for foreach in [True, False]:
-            lss, pk = losses[int(foreach)], peaks[int(foreach)]
+        for multi_tensor in [True, False]:
+            lss, pk = losses[int(multi_tensor)], peaks[int(multi_tensor)]
             torch.manual_seed(0x2131290)
 
             model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-            o = get_optim(opt, model.parameters(), lr=1e-3, foreach=foreach)
+            o = get_optim(opt, model.parameters(), lr=1e-3, multi_tensor=multi_tensor)
 
             clean()
 
@@ -92,17 +92,17 @@ def test_foreach(
         cutoff = warmup_runs * iterations
         losses = [loss_list[cutoff:] for loss_list in losses]
 
-    for peak_no_foreach, peak_foreach in zip(*peaks):
-        assert peak_no_foreach < peak_foreach
+    for peak_single, peak_multi in zip(*peaks):
+        assert peak_single < peak_multi
 
-    # no-foreach LRA is a different optimizer (per-parameter LRA vs global LRA),
+    # single-tensor LRA is a different optimizer (per-parameter LRA vs global LRA),
     # so we only check that both converge, not that they match.
     if "LRA" in opt.__name__:
         return
 
-    for loss_no_foreach, loss_foreach in zip(*losses):
-        if torch.isnan(loss_no_foreach) and torch.isnan(loss_foreach):
+    for loss_single, loss_multi in zip(*losses):
+        if torch.isnan(loss_single) and torch.isnan(loss_multi):
             continue
 
         # increase error tolerance for PSGD, as we have different RNGs -> expected differences
-        assert torch.allclose(loss_no_foreach, loss_foreach, rtol=0.01 if "PSGD" in opt.__name__ else 1e-5)
+        assert torch.allclose(loss_single, loss_multi, rtol=0.01 if "PSGD" in opt.__name__ else 1e-5)

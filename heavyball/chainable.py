@@ -374,7 +374,7 @@ class NoState(FunctionTransform):
         return self.fn(group, update, grad, param, *args, **kwargs)
 
 
-class NoStateNoForeach(FunctionTransform):
+class NoStateNoMultiTensor(FunctionTransform):
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         updates = []
         skip_update = False
@@ -446,8 +446,8 @@ def no_state(fn):
     return NoState(fn)
 
 
-def no_state_no_foreach(fn):
-    return NoStateNoForeach(fn)
+def no_state_no_multi_tensor(fn):
+    return NoStateNoMultiTensor(fn)
 
 
 class SkipUpdate(ValueError):
@@ -699,7 +699,7 @@ def orthogonalize_grad_to_param(group, update, grad, param):
 @copy_guard(2, "z")
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
-    # Compute weight_sum once per step, not per param in no-foreach mode.
+    # Compute weight_sum once per step, not per param in no-multi_tensor mode.
     if group.get("_sf_step") != group["step"]:
         weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
         group["weight_sum"] = group.get("weight_sum", 0) + weight
@@ -779,7 +779,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
 
 @needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq", "fisher_approx")
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
     if group["step"] == 1:
         utils.copy_stochastic_(fisher_approx, update / update.norm().clamp(min=1e-8))
@@ -924,7 +924,7 @@ def precond_schedule(group, prob: Union[callable, float, None] = None, name: str
 
 
 @needs_full_param
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def orthogonalize_update(group, update, grad, param, scale_mode: str = "scale"):  # explore scale_mode="graft"
     if update.dim() < 2:
         return update
@@ -1352,7 +1352,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def scale_by_psgd(
     group,
     update,
@@ -1375,7 +1375,7 @@ def scale_by_psgd(
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def scale_by_delayed_psgd(
     group,
     update,
@@ -1404,7 +1404,7 @@ def scale_by_delayed_psgd(
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def update_by_psgd(
     group,
     update,
@@ -1440,7 +1440,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def update_by_delayed_psgd(
     group,
     update,
@@ -1464,7 +1464,7 @@ def update_by_delayed_psgd(
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def scale_by_psgd_pro(
     group,
     update,
@@ -1486,7 +1486,7 @@ def scale_by_psgd_pro(
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
-@no_state_no_foreach
+@no_state_no_multi_tensor
 def update_by_psgd_pro(
     group,
     update,
@@ -1745,14 +1745,14 @@ class ChainOpt(utils.StatefulOptimizer):
         "eps": 1e-8,
     }
 
-    def __init__(self, params, defaults, foreach: bool, *fns):
+    def __init__(self, params, defaults, multi_tensor: bool, *fns):
         orig = defaults.pop("orig_shapes", None)
         self._orig_shapes = (
             {k: _ShapeInfo(v) if isinstance(v, tuple) else v for k, v in orig.items()} if orig is not None else None
         )
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
-        super().__init__(params, base, foreach)
+        super().__init__(params, base, multi_tensor)
         self.fns = fns
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
@@ -1854,7 +1854,7 @@ class ChainOpt(utils.StatefulOptimizer):
         if "prev_lr" in group and group["prev_lr"] != group["lr"]:
             utils.warn_once(
                 f"Learning rate changed between steps. This is an experimental feature and "
-                f"only supported with foreach=True (currently foreach={group['foreach']})."
+                f"only supported with multi_tensor=True (currently multi_tensor={group['multi_tensor']})."
             )
             group["base_lr"] = group["lr"]
 
@@ -1890,7 +1890,7 @@ class ChainOpt(utils.StatefulOptimizer):
         group["step"] = state["step"] = step = step + 1
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / max(step, group["warmup_steps"] + 1)
 
-        if not group["foreach"] or len(p) == 1:
+        if not group["multi_tensor"] or len(p) == 1:
             for param, grad in zip(p, g):
                 chain(self.state_, group, [grad], [param], *self.fns)
                 group["caution"] = caution
@@ -1936,6 +1936,7 @@ _scale_to_update_map = {
     scale_by_laprop.get_fn(): update_by_laprop,  #
     scale_by_adopt.get_fn(): update_by_adopt,  #
     scale_by_ademamix.get_fn(): update_by_ademamix,  #
+    scale_by_psgd_pro.get_fn(): update_by_psgd_pro,  #
 }
 _scale_to_update_map_inv = {
     update_by_delayed_psgd.get_fn(): scale_by_delayed_psgd,  #
@@ -1947,6 +1948,7 @@ _scale_to_update_map_inv = {
     update_by_laprop.get_fn(): scale_by_laprop,  #
     update_by_adopt.get_fn(): scale_by_adopt,  #
     update_by_ademamix.get_fn(): scale_by_ademamix,  #
+    update_by_psgd_pro.get_fn(): scale_by_psgd_pro,  #
 }
 
 
@@ -1961,7 +1963,7 @@ class BaseOpt(ChainOpt):
     promote: bool = False
     Whether to promote the gradients to fp32 before applying the optimizer
     Improves update quality for low-precision parameters, but increases costs
-    Compiling the optimizer step would reduce memory and compute. Alternatively, `foreach=False` decreases memory at the cost of runtime
+    Compiling the optimizer step would reduce memory and compute. Alternatively, `multi_tensor=False` decreases memory at the cost of runtime
 
     gradient_clipping: str_or_fn = None
     The function to use for clipping the incoming gradients, before any other transformations.
@@ -1983,7 +1985,7 @@ class BaseOpt(ChainOpt):
         self,
         params,
         defaults,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         gradient_clipping: str_or_fn = None,
         update_clipping: str_or_fn = None,
         palm: bool = use_default,
@@ -2031,7 +2033,7 @@ class BaseOpt(ChainOpt):
         if default(update_clipping, self.update_clipping) is not None:
             fns = fns + (apply_to_idx(update_clipping, 2),)
 
-        super().__init__(params, defaults, foreach, *fns)
+        super().__init__(params, defaults, multi_tensor, *fns)
 
 
 class ScheduleFree(BaseOpt):

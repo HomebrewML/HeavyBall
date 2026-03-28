@@ -16,7 +16,7 @@ class SGD(C.BaseOpt):
         beta=0.9,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -30,10 +30,10 @@ class SGD(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.heavyball_momentum,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.heavyball_momentum,))
 
 
-class ForeachAdamW(C.BaseOpt):
+class AdamW(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -42,7 +42,7 @@ class ForeachAdamW(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -58,10 +58,10 @@ class ForeachAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adam,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adam,))
 
 
-class ForeachNAdam(C.BaseOpt):
+class NAdam(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -72,7 +72,7 @@ class ForeachNAdam(C.BaseOpt):
         momentum_decay: float = 4e-3,
         decoupled_weight_decay: bool = False,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -88,10 +88,10 @@ class ForeachNAdam(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_nadam,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_nadam,))
 
 
-class ForeachAdEMAMix(C.BaseOpt):
+class AdEMAMix(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -103,7 +103,7 @@ class ForeachAdEMAMix(C.BaseOpt):
         beta3_warmup: Optional[int] = None,
         alpha_warmup: Optional[int] = None,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -120,7 +120,7 @@ class ForeachAdEMAMix(C.BaseOpt):
             raise ValueError("AdEMAMix expects betas with three coefficients.")
 
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
 
 
 class UnscaledAdamW(C.BaseOpt):
@@ -132,7 +132,7 @@ class UnscaledAdamW(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -149,7 +149,7 @@ class UnscaledAdamW(C.BaseOpt):
     ):
         params, defaults = C._build_defaults(locals())
         super().__init__(
-            params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
+            params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
         )
 
 
@@ -162,7 +162,7 @@ class SUDSAdamW(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -179,7 +179,7 @@ class SUDSAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
 
 
 class Scion(C.BaseOpt):
@@ -191,7 +191,7 @@ class Scion(C.BaseOpt):
         eps: float = 1e-8,
         weight_decay: float = 0,
         warmup_steps: int = 0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -222,11 +222,11 @@ class Scion(C.BaseOpt):
         defaults.pop("momentum", None)
 
         super().__init__(
-            params, defaults, foreach, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
+            params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
         )
 
 
-class ForeachAdamC(C.BaseOpt):
+class AdamC(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -236,7 +236,7 @@ class ForeachAdamC(C.BaseOpt):
         weight_decay=0,
         max_lr: float | None = None,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -258,10 +258,10 @@ class ForeachAdamC(C.BaseOpt):
             max_lr = lr
 
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
 
 
-class ForeachRMSprop(C.BaseOpt):
+class RMSprop(C.BaseOpt):
     """
     Debiased RMSprop (not torch.optim.RMSprop)
     """
@@ -276,7 +276,7 @@ class ForeachRMSprop(C.BaseOpt):
         warmup_steps=0,
         r=0.0,
         weight_lr_power=2.0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -295,7 +295,7 @@ class ForeachRMSprop(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -312,7 +312,7 @@ class HyperBallAdamW(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -331,7 +331,7 @@ class HyperBallAdamW(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -351,7 +351,7 @@ class MuonAdamW(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -372,7 +372,7 @@ class MuonAdamW(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -383,7 +383,7 @@ class MuonAdamW(C.BaseOpt):
         )
 
 
-class ForeachSFAdamW(C.ScheduleFree):
+class SFAdamW(C.ScheduleFree):
     def __init__(
         self,
         params,
@@ -394,7 +394,7 @@ class ForeachSFAdamW(C.ScheduleFree):
         warmup_steps=0,
         r=0.0,
         weight_lr_power=2.0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -413,7 +413,7 @@ class ForeachSFAdamW(C.ScheduleFree):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -432,7 +432,7 @@ class MSAMLaProp(C.MSAM):
         warmup_steps=0,
         r=0.0,
         weight_lr_power=2.0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -452,7 +452,7 @@ class MSAMLaProp(C.MSAM):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -460,11 +460,7 @@ class MSAMLaProp(C.MSAM):
         )
 
 
-class PaLMForeachSFAdamW(ForeachSFAdamW):
-    palm: bool = True
-
-
-class ForeachADOPT(C.BaseOpt):
+class ADOPT(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -473,7 +469,7 @@ class ForeachADOPT(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -489,10 +485,10 @@ class ForeachADOPT(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_adopt,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adopt,))
 
 
-class ForeachMuon(C.BaseOpt):
+class Muon(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -501,7 +497,7 @@ class ForeachMuon(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -530,7 +526,7 @@ class ForeachMuon(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -538,7 +534,7 @@ class ForeachMuon(C.BaseOpt):
         )
 
 
-class ForeachLaProp(C.BaseOpt):
+class LaProp(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -547,7 +543,7 @@ class ForeachLaProp(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -563,7 +559,7 @@ class ForeachLaProp(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, foreach, gradient_clipping, update_clipping, palm, fns=(C.update_by_laprop,))
+        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_laprop,))
 
 
 class MuonLaProp(C.BaseOpt):
@@ -575,7 +571,7 @@ class MuonLaProp(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -594,7 +590,7 @@ class MuonLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -602,9 +598,9 @@ class MuonLaProp(C.BaseOpt):
         )
 
 
-class ForeachSOAP(C.BaseOpt):
+class SOAP(C.BaseOpt):
     """
-    ForeachSOAP
+    SOAP
 
     Sources:
         Baseline SOAP:
@@ -632,7 +628,7 @@ class ForeachSOAP(C.BaseOpt):
         correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
@@ -664,7 +660,7 @@ class ForeachSOAP(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,  #
@@ -672,7 +668,7 @@ class ForeachSOAP(C.BaseOpt):
         )
 
 
-class ForeachSOAPNAdam(C.BaseOpt):
+class SOAPNAdam(C.BaseOpt):
     use_precond_schedule: bool = False
 
     def __init__(
@@ -691,7 +687,7 @@ class ForeachSOAPNAdam(C.BaseOpt):
         correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
@@ -725,7 +721,7 @@ class ForeachSOAPNAdam(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -733,7 +729,7 @@ class ForeachSOAPNAdam(C.BaseOpt):
         )
 
 
-class ForeachSOAPAdEMAMix(C.BaseOpt):
+class SOAPAdEMAMix(C.BaseOpt):
     use_precond_schedule: bool = False
 
     def __init__(
@@ -752,7 +748,7 @@ class ForeachSOAPAdEMAMix(C.BaseOpt):
         correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
@@ -787,7 +783,7 @@ class ForeachSOAPAdEMAMix(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -795,7 +791,7 @@ class ForeachSOAPAdEMAMix(C.BaseOpt):
         )
 
 
-class ForeachSignLaProp(C.BaseOpt):
+class SignLaProp(C.BaseOpt):
     def __init__(
         self,
         params,
@@ -804,7 +800,7 @@ class ForeachSignLaProp(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -823,7 +819,7 @@ class ForeachSignLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -831,9 +827,9 @@ class ForeachSignLaProp(C.BaseOpt):
         )
 
 
-class ForeachSOLP(C.BaseOpt):
+class SOLP(C.BaseOpt):
     """
-    ForeachSOLP
+    SOLP
 
     Sources:
         Baseline SOAP:
@@ -861,7 +857,7 @@ class ForeachSOLP(C.BaseOpt):
         correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
@@ -892,26 +888,12 @@ class ForeachSOLP(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,  #
             fns=(C.scale_by_soap_laprop,),
         )
-
-
-class PaLMForeachSOAP(ForeachSOAP):
-    use_precond_schedule: bool = False
-    palm: bool = True
-
-
-class PrecondScheduleForeachSOAP(ForeachSOAP):
-    use_precond_schedule: bool = True
-
-
-class PrecondSchedulePaLMForeachSOAP(ForeachSOAP):
-    use_precond_schedule: bool = True
-    palm: bool = True
 
 
 class OrthoLaProp(C.BaseOpt):
@@ -923,7 +905,7 @@ class OrthoLaProp(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -942,7 +924,7 @@ class OrthoLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -959,7 +941,7 @@ class LaPropOrtho(C.BaseOpt):
         eps=1e-8,
         weight_decay=0,
         warmup_steps=0,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -978,7 +960,7 @@ class LaPropOrtho(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -986,7 +968,7 @@ class LaPropOrtho(C.BaseOpt):
         )
 
 
-class ForeachPSGDKron(C.BaseOpt):
+class PSGDKron(C.BaseOpt):
     """
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
@@ -1014,7 +996,7 @@ class ForeachPSGDKron(C.BaseOpt):
         merge_dims: bool = False,
         split: bool = False,
         store_triu_as_line: bool = True,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         q_dtype="float32",
         stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
@@ -1067,7 +1049,7 @@ class ForeachPSGDKron(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             False,  #
@@ -1076,31 +1058,6 @@ class ForeachPSGDKron(C.BaseOpt):
                 functools.partial(C.scale_by_delayed_psgd if delayed else C.scale_by_psgd, cached=cached),
             ),
         )
-
-
-class ForeachPurePSGD(ForeachPSGDKron):
-    exp_avg_input: bool = False
-
-
-class ForeachCachedDelayedPSGDKron(ForeachPSGDKron):
-    delayed: bool = True
-    cached: bool = True
-
-
-class ForeachCachedPSGDKron(ForeachPSGDKron):
-    cached: bool = True
-
-
-class ForeachDelayedPSGD(ForeachPSGDKron):
-    delayed: bool = True
-
-
-class ForeachCachedNewtonPSGD(ForeachCachedPSGDKron):
-    hessian_approx = True
-
-
-class NewtonHybrid2PSGDKron(ForeachCachedNewtonPSGD):
-    hvp_interval = 2
 
 
 class PSGDPRO(C.BaseOpt):
@@ -1128,7 +1085,7 @@ class PSGDPRO(C.BaseOpt):
         warmup_steps: int = 0,
         merge_dims: bool = False,
         split: bool = False,
-        foreach: bool = True,
+        multi_tensor: bool = True,
         q_dtype="float32",
         stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
@@ -1155,7 +1112,7 @@ class PSGDPRO(C.BaseOpt):
     ):
         cached = C.default(cached, self.cached)
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        update_clipping = C.default(update_clipping, utils.trust_region_clip_)
+        update_clipping = C.default(update_clipping, None)
 
         params, defaults = C._build_defaults(locals())
         defaults["store_triu_as_line"] = False
@@ -1168,7 +1125,7 @@ class PSGDPRO(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             False,
@@ -1179,14 +1136,14 @@ class PSGDPRO(C.BaseOpt):
         )
 
 
-class ForeachPSGDLRA(C.BaseOpt):
+class PSGDLRA(C.BaseOpt):
     """
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
     Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
 
-    Note: `foreach=True` (default) uses a single global low-rank approximation shared across all
-    parameters, while `foreach=False` fits an independent per-parameter LRA. These are different
+    Note: `multi_tensor=True` (default) uses a single global low-rank approximation shared across all
+    parameters, while `multi_tensor=False` fits an independent per-parameter LRA. These are different
     algorithms and will produce different results.
     """
 
@@ -1203,7 +1160,7 @@ class ForeachPSGDLRA(C.BaseOpt):
         momentum_into_precond_update=True,
         rank: Optional[int] = None,
         warmup_steps: int = 0,
-        foreach: bool = True,  # True: global LRA across all params. False: independent per-param LRA.
+        multi_tensor: bool = True,  # True: global LRA across all params. False: independent per-param LRA.
         q_dtype="float32",
         stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
@@ -1251,24 +1208,12 @@ class ForeachPSGDLRA(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            foreach,
+            multi_tensor,
             gradient_clipping,
             update_clipping,
             False,  #
             fns=(*(C.exp_avg,) * exp_avg_input, C.scale_by_delayed_psgd_lra if delayed else C.scale_by_psgd_lra),
         )
-
-
-class ForeachDelayedPSGDLRA(ForeachPSGDLRA):
-    delayed: bool = True
-
-
-class ForeachNewtonPSGDLRA(ForeachPSGDLRA):
-    hessian_approx = True
-
-
-class NewtonHybrid2PSGDLRA(ForeachNewtonPSGDLRA):
-    hvp_interval = 2
 
 
 class SplitOpt(utils.StatefulOptimizer):
@@ -1291,7 +1236,7 @@ class SplitOpt(utils.StatefulOptimizer):
                 all_params.extend(params)
         if not self.optimizers:
             raise ValueError("No optimizers created")
-        super().__init__(all_params, {}, foreach=True)
+        super().__init__(all_params, {}, multi_tensor=True)
 
     def _step(self, group):
         pass
@@ -1322,7 +1267,7 @@ class SAMWrapper(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        wrapped_optimizer: Union[utils.StatefulOptimizer, Type[utils.StatefulOptimizer]] = ForeachAdamW,
+        wrapped_optimizer: Union[utils.StatefulOptimizer, Type[utils.StatefulOptimizer]] = AdamW,
         ball: float = 0.1,
     ):
         params = list(params)
@@ -1365,32 +1310,6 @@ class SAMWrapper(torch.optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
 
-
-PalmForEachSoap = PaLMForeachSOAP
-PaLMSOAP = PaLMForeachSOAP
-PaLMSFAdamW = PaLMForeachSFAdamW
-SOAP = ForeachSOAP
-SOAPAdEMAMix = ForeachSOAPAdEMAMix
-SOAPNAdam = ForeachSOAPNAdam
-SFAdamW = ForeachSFAdamW
-LaProp = ForeachLaProp
-ADOPT = ForeachADOPT
-RMSprop = ForeachRMSprop
-PrecondScheduleSOAP = PrecondScheduleForeachSOAP
-PrecondSchedulePaLMSOAP = PrecondSchedulePaLMForeachSOAP
-PSGDKron = ForeachPSGDKron
-AdamW = ForeachAdamW
-NAdam = ForeachNAdam
-PurePSGD = ForeachPurePSGD
-DelayedPSGD = ForeachDelayedPSGD
-CachedPSGDKron = ForeachCachedPSGDKron
-CachedDelayedPSGDKron = ForeachCachedDelayedPSGDKron
-Muon = ForeachMuon
-SignLaProp = ForeachSignLaProp
-DelayedPSGDLRA = ForeachDelayedPSGDLRA
-PSGDLRA = ForeachPSGDLRA
-NewtonPSGDLRA = ForeachNewtonPSGDLRA
-NewtonPSGDKron = ForeachCachedNewtonPSGD
 
 capture_param_shapes = utils.capture_param_shapes
 __all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer)]
