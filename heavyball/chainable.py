@@ -792,6 +792,27 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
     state["Q_cache"] = [torch.empty_like(q) for q in Q]
 
 
+def _init_psgd_pro_kron(state, group, update, grad, param, cached: bool = False, prob: Optional[callable] = None):
+    Q = utils.init_Q_exprs(
+        grad,
+        group["precond_init_scale"],
+        group["precond_init_scale_scale"],
+        group["precond_init_scale_power"],
+        group["max_size_triangular"],
+        group["min_ndim_triangular"],
+        group["memory_save_mode"],
+        None,
+        None,
+        dtype=getattr(torch, group["q_dtype"]),
+    )
+    state["Q"] = Q
+    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
+    if not cached:
+        return
+    state["Q_cache"] = [torch.empty_like(q) for q in Q]
+
+
 def _init_psgd_lra(state, group, update, grad, param, cached: bool = False, prob: Optional[callable] = None):
     state["U"], state["V"], state["d"] = utils.init_lra(
         grad,
@@ -1094,6 +1115,56 @@ def _update_psgd_precond(
     return None
 
 
+def _update_psgd_pro_precond(
+    cached,
+    Q_cache,
+    group,
+    param,
+    grad,
+    Q,
+    running_lower_bound,
+    step,
+    prob: Optional[callable] = None,
+) -> None:
+    if prob is None:
+        prob = utils.precond_update_prob_schedule()
+
+    if not group["is_preconditioning"]:
+        return
+
+    utils.psgd_pro_update_precond(
+        grad,
+        group["precond_lr"],
+        Q,
+        running_lower_bound,
+        group["lower_bound_beta"],
+        group["precond_update_power_iterations"],
+        group["dampening"],
+    )
+
+    if isinstance(prob, float):
+        float_prob = prob
+    else:
+        float_prob = prob(group["step"])
+    group["is_cached"] = should_use_cache = cached and float_prob < 0.5
+
+    if not should_use_cache or not cached:
+        return
+
+    for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
+        if c_ is None:
+            c_ = (
+                torch.empty_like(q_)
+                if q_.ndim == 1
+                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
+            )
+            Q_cache[i] = c_
+        if q_.ndim == 2:
+            torch.matmul(q_.T, q_, out=c_)
+        else:
+            torch.mul(q_, q_, out=c_)
+
+
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
     kwargs = {"ea": update, "caution": group["caution"], "grad": grad}
     if group.get("is_cached", False) and Q_cache[0] is not None:
@@ -1294,6 +1365,51 @@ def update_by_delayed_psgd(
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    raise SkipUpdate from None
+
+
+@needs_full_param
+@SqueezeGrad
+@PrecondGradAccumGuard
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
+@no_state_no_foreach
+def scale_by_psgd_pro(
+    group,
+    update,
+    grad,
+    param,
+    update_to_precond,
+    Q,
+    Q_cache,
+    running_lower_bound: List[Tensor],
+    step: Tensor,
+    cached: bool = False,
+    prob: Optional[callable] = None,
+):
+    _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
+
+
+@needs_full_param
+@SqueezeGrad
+@PrecondGradAccumGuard
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
+@no_state_no_foreach
+def update_by_psgd_pro(
+    group,
+    update,
+    grad,
+    param,
+    update_to_precond,
+    Q,
+    Q_cache,
+    running_lower_bound: List[Tensor],
+    step: Tensor,
+    cached: bool = False,
+    prob: Optional[callable] = None,
+):
+    _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     raise SkipUpdate from None
 
 

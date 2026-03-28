@@ -2525,9 +2525,10 @@ def lra_precond(U: Tensor, V: Tensor, d: Tensor, g: Tensor):
 
 @decorator_knowngood
 def dampen_grad(g: Tensor, damp: float = 2**-13):
-    # https://github.com/lixilinx/psgd_torch/blob/1943e66596111e78157ca1b72b31c1dfdf0653ef/preconditioned_stochastic_gradient_descent.py#L50
+    # https://github.com/lixilinx/psgd_torch/blob/89b4cead31b7ad1494c4cf4dc39f4cbf920ff14d/psgd.py
     v = torch.randn_like(g)
-    return v, g + damp * g.abs().mean() * v
+    damping = damp + torch.finfo(g.dtype).eps * g.abs()
+    return v, g + damping * v
 
 
 @decorator_knowngood
@@ -2769,6 +2770,44 @@ def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, 
 
 
 @decorator_knowngood
+def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
+    """Power iteration for the largest eigenvalue of a symmetric positive (semi)definite matrix.
+    Exploits A = A^T: A^T A = A^2, so v -> A^T(Av) = v -> A(Av), saving a transpose.
+    Uses x @ A.mT (gemm transB=true) for faster BLAS dispatch than A.mv(x)."""
+    if A_outer.ndim < 2:
+        return A_outer.max()
+    x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+    x_norm = promote(x_norm)
+
+    def _inner():
+        x = A_outer.index_select(0, max_idx).flatten().contiguous()
+        A = stochastic_round_(A_outer / x_norm)
+        x = x / x_norm
+
+        def _mv(x):
+            return promote((x.to(A.dtype) @ A.mT) @ A.mT)
+
+        for _ in range(power_iter):
+            x = F.normalize(_mv(x), dim=0)
+        return (x @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
+
+    return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone()).squeeze()
+
+
+@decorator_knowngood
+def procrustes_step(Q: Tensor, max_step_size: float = 1 / 8) -> None:
+    R = (Q.T - Q).contiguous()
+    R_norm = max_singular_value(R, power_iter=2) + torch.finfo(R.dtype).smallest_normal
+    R = R / R_norm
+    RQ = R @ Q
+    RRQ = R @ RQ
+    tr_RQ = RQ.diagonal().sum()
+    tr_RRQ = RRQ.diagonal().sum()
+    a = torch.where(tr_RRQ < 0, torch.clamp(-tr_RQ / tr_RRQ, max=max_step_size), max_step_size)
+    Q.add_(a * (RQ + 0.5 * a * RRQ))
+
+
+@decorator_knowngood
 def clamped_max_singular_value(
     A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
 ) -> Tensor:
@@ -2927,22 +2966,11 @@ def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
     return coeff0.float(), coeffs.float()
 
 
-@decorator_knowngood
-def _psgd_default_preconditioner_grad(
-    terms: List[Tuple[Tensor, Tensor]],
-    Q: List[Tensor],
-) -> List[Tensor]:
-    out = []
-    for q, (x, y) in zip(Q, terms):
-        x = promote(x)
-        y = promote(y)
-        update = x - y
-        if q.ndim < 2:
-            update = promote(q) * update
-        else:
-            update = (promote(q) @ update).triu()
-        out.append(update)
-    return out
+def _update_lb(ell: Tensor, lb_state: Tensor, beta: Tensor) -> Tensor:
+    ell = promote(ell)
+    ell = ell.maximum(promote(lb_state) + (ell - promote(lb_state)) * (1 - beta))
+    copy_stochastic_(lb_state, ell)
+    return ell
 
 
 @decorator
@@ -2965,13 +2993,59 @@ def psgd_update_precond(
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
 
     A, conjB = psgd_calc_A_and_conjB(G, Q, V)
-    terms = [(compiled_einsum(exprG, A, A), compiled_einsum(exprG, conjB, conjB)) for exprG in exprGs]
-    del A, conjB, V
-    updates = _psgd_default_preconditioner_grad(terms, Q)
-    _psgd_precond_update_(
-        updates, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
+    del V
+
+    for oq_i, q, exprG, lb_state in zip(oq, Q, exprGs, running_lower_bound):
+        term1 = promote(compiled_einsum(exprG, A, A))
+        term2 = promote(compiled_einsum(exprG, conjB, conjB))
+
+        if q.ndim < 2:
+            ell = _update_lb((term1 + term2).max(), lb_state, lower_bount_beta)
+            update = promote(q) * (term1 - term2)
+        else:
+            ell = _update_lb(max_eigenvalue_spd(term1 + term2, power_iter=power_iter), lb_state, lower_bount_beta)
+            update = (term1 - term2).triu() @ promote(q)
+            if store_triu_as_line:
+                update = triu_to_line([update])[0][1]
+
+        real_oq = oq_i[1] if isinstance(oq_i, tuple) else oq_i
+        copy_stochastic_(real_oq, promote(real_oq) - update / ell * precond_lr)
     return None
+
+
+@decorator
+def psgd_pro_update_precond(
+    G: Tensor,
+    precond_lr: float,
+    Q: List[Tensor],
+    running_lower_bound: List[Tensor],
+    lower_bount_beta: float,
+    power_iter: int,
+    dampening: float,
+) -> None:
+    """Update Kronecker product preconditioner Q with Q0.5EQ1.5 (PRO) method."""
+    psgd_balance_Q(Q)
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+    precond_lr, lower_bount_beta = scalar_guard(precond_lr, lower_bount_beta, G)
+
+    damping = dampening + torch.finfo(G.dtype).eps * G.abs()
+    Pg = psgd_precond_grad(G + damping * torch.randn_like(G), Q)
+
+    total_numel = G.numel()
+    for q, exprG, lb_state in zip(Q, exprGs, running_lower_bound):
+        term1 = promote(compiled_einsum(exprG, Pg, Pg))
+        q_ = promote(q)
+
+        if q.ndim < 2:
+            term2 = total_numel / max(1, q.numel())
+            ell = _update_lb(term1.max() + term2, lb_state, lower_bount_beta)
+            copy_stochastic_(q, q_ - q_ * (term1 - term2) / ell * precond_lr)
+        else:
+            term2 = total_numel / q.shape[0]
+            ell = _update_lb(max_eigenvalue_spd(term1, power_iter=power_iter) + term2, lb_state, lower_bount_beta)
+            copy_stochastic_(q, q_ - (term1 @ q_ - term2 * q_) / ell * precond_lr)
+            procrustes_step(q)
+    del Pg
 
 
 @decorator_knowngood

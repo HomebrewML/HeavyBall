@@ -1023,6 +1023,82 @@ class NewtonHybrid2PSGDKron(ForeachCachedNewtonPSGD):
     hvp_interval = 2
 
 
+class PSGDPRO(C.BaseOpt):
+    """
+    PSGD with Q0.5EQ1.5 (PRO/Procrustes) preconditioner update.
+    Solve-free alternative to standard PSGD-Kron (EQ method).
+    Reference: https://github.com/lixilinx/psgd_torch
+    """
+
+    cached: bool = False
+    exp_avg_input: bool = True
+
+    def __init__(
+        self,
+        params,
+        lr=0.001,
+        beta=None,
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+        preconditioner_update_probability=C.use_default,
+        max_size_triangular=2048,
+        min_ndim_triangular=2,
+        memory_save_mode=None,
+        momentum_into_precond_update=True,
+        warmup_steps: int = 0,
+        merge_dims: bool = False,
+        split: bool = False,
+        foreach: bool = True,
+        q_dtype="float32",
+        stochastic_schedule: bool = False,
+        storage_dtype: str = "float32",
+        mars: bool = False,
+        caution: bool = False,
+        mars_gamma: float = 0.0025,
+        cached: Optional[bool] = C.use_default,
+        exp_avg_input: Optional[bool] = C.use_default,
+        gradient_clipping: C.str_or_fn = C.use_default,
+        update_clipping: C.str_or_fn = C.use_default,
+        precond_grad_accum: bool = False,
+        lower_bound_beta: float = 0.9,
+        dampening: float = 2**-13,
+        precond_update_power_iterations: int = 2,
+        precond_init_scale=None,
+        precond_init_scale_scale: float = 1,
+        precond_init_scale_power: Optional[float] = None,
+        precond_lr: float = 0.1,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
+        **kwargs,
+    ):
+        cached = C.default(cached, self.cached)
+        exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
+        update_clipping = C.default(update_clipping, utils.trust_region_clip_)
+
+        params, defaults = C._build_defaults(locals())
+        defaults["store_triu_as_line"] = False
+        defaults["inverse_free"] = False
+
+        self.precond_schedule = C.default(
+            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
+        )
+
+        super().__init__(
+            params,
+            defaults,
+            foreach,
+            gradient_clipping,
+            update_clipping,
+            False,
+            fns=(
+                *(C.exp_avg,) * exp_avg_input,
+                functools.partial(C.scale_by_psgd_pro, cached=cached),
+            ),
+        )
+
+
 class ForeachPSGDLRA(C.BaseOpt):
     """
     Originally from Evan Walters and Omead Pooladzandi, 2024

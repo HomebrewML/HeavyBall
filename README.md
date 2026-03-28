@@ -70,7 +70,7 @@ Muon, MuonLaProp, OrthoLaProp, LaPropOrtho
 SOAP, PaLMSOAP, PrecondScheduleSOAP, PrecondSchedulePaLMSOAP, SOAPNAdam, SOAPAdEMAMix, ForeachSOLP
 
 **PSGD (Kronecker):**
-PSGDKron, CachedPSGDKron, DelayedPSGD, CachedDelayedPSGDKron, PurePSGD, NewtonPSGDKron, NewtonHybrid2PSGDKron
+PSGDPRO, PSGDKron, CachedPSGDKron, DelayedPSGD, CachedDelayedPSGDKron, PurePSGD, NewtonPSGDKron, NewtonHybrid2PSGDKron
 
 `Newton`-PSGD requires a closure passed to `step()`.
 
