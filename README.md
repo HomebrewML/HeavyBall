@@ -153,7 +153,7 @@ opt = SOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
 ## Building Custom Optimizers
 
 Every built-in optimizer is a chain of `FunctionTransform`s, an API also available for building custom optimizers.
-`Branch` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
+`Parallel` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
 updates.
 
 ```python
@@ -168,7 +168,7 @@ class GraftedAdam(C.BaseOpt):
                  weight_decay=0, warmup_steps=0, multi_tensor=True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         warmup_steps=warmup_steps)
-        branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
+        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
         super().__init__(params, defaults, multi_tensor, fns=(branch,))
 ```
 

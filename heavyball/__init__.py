@@ -624,8 +624,6 @@ class SOAP(C.BaseOpt):
         max_precond_dim: int = 2048,  #
         merge_dims: bool = True,
         precondition_1d: bool = False,
-        normalize_grads: bool = False,
-        correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
         multi_tensor: bool = True,
@@ -639,7 +637,6 @@ class SOAP(C.BaseOpt):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        stochastic_schedule: bool = False,
         precond_grad_accum: bool = False,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
@@ -683,8 +680,6 @@ class SOAPNAdam(C.BaseOpt):
         max_precond_dim: int = 2048,
         merge_dims: bool = True,
         precondition_1d: bool = False,
-        normalize_grads: bool = False,
-        correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
         multi_tensor: bool = True,
@@ -698,7 +693,6 @@ class SOAPNAdam(C.BaseOpt):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        stochastic_schedule: bool = False,
         precond_grad_accum: bool = False,
         momentum_decay: float = 4e-3,
         decoupled_weight_decay: bool = False,
@@ -744,8 +738,6 @@ class SOAPAdEMAMix(C.BaseOpt):
         max_precond_dim: int = 2048,
         merge_dims: bool = True,
         precondition_1d: bool = False,
-        normalize_grads: bool = False,
-        correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
         multi_tensor: bool = True,
@@ -759,7 +751,6 @@ class SOAPAdEMAMix(C.BaseOpt):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        stochastic_schedule: bool = False,
         precond_grad_accum: bool = False,
         alpha: float = 2.0,
         beta3_warmup: int | None = None,
@@ -853,8 +844,6 @@ class SOLP(C.BaseOpt):
         max_precond_dim: int = 2048,  #
         merge_dims: bool = True,
         precondition_1d: bool = False,
-        normalize_grads: bool = False,
-        correct_bias: bool = True,
         warmup_steps: int = 0,
         split: bool = False,
         multi_tensor: bool = True,
@@ -868,7 +857,6 @@ class SOLP(C.BaseOpt):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        stochastic_schedule: bool = False,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
         ecc: str | None = None,
@@ -978,7 +966,6 @@ class PSGDKron(C.BaseOpt):
     delayed: bool = False
     cached: bool = False
     exp_avg_input: bool = True
-    quad: bool = False
 
     def __init__(
         self,
@@ -998,7 +985,6 @@ class PSGDKron(C.BaseOpt):
         store_triu_as_line: bool = True,
         multi_tensor: bool = True,
         q_dtype="float32",
-        stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -1008,11 +994,9 @@ class PSGDKron(C.BaseOpt):
         exp_avg_input: Optional[bool] = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,  #
-        adaptive: bool = False,
-        ortho_method: Optional[str] = None,  # If None, no orthogonalization
+        ortho_method: Optional[str] = None,
         precond_grad_accum: bool = False,
-        lower_bound_beta: float = 0.9,  # 0.0 recovers pre-2.0.0 PSGD
-        inverse_free: bool = C.use_default,
+        lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
         precond_update_power_iterations: int = 2,
         # expert parameters
@@ -1034,11 +1018,6 @@ class PSGDKron(C.BaseOpt):
         cached = C.default(cached, self.cached)
         exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
         update_clipping = C.default(update_clipping, utils.trust_region_clip_)
-        inverse_free = C.default(inverse_free, self.quad)
-        if inverse_free:
-            raise ValueError(
-                "inverse_free (i.e., PSGD-QUAD) is not supported at the moment. Consider using https://github.com/evanatyourservice/quad_torch"
-            )
 
         params, defaults = C._build_defaults(locals())
 
@@ -1087,7 +1066,6 @@ class PSGDPRO(C.BaseOpt):
         split: bool = False,
         multi_tensor: bool = True,
         q_dtype="float32",
-        stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -1116,7 +1094,6 @@ class PSGDPRO(C.BaseOpt):
 
         params, defaults = C._build_defaults(locals())
         defaults["store_triu_as_line"] = False
-        defaults["inverse_free"] = False
 
         self.precond_schedule = C.default(
             defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
@@ -1162,7 +1139,6 @@ class PSGDLRA(C.BaseOpt):
         warmup_steps: int = 0,
         multi_tensor: bool = True,  # True: global LRA across all params. False: independent per-param LRA.
         q_dtype="float32",
-        stochastic_schedule: bool = False,
         storage_dtype: str = "float32",
         mars: bool = False,
         caution: bool = False,
@@ -1171,8 +1147,8 @@ class PSGDLRA(C.BaseOpt):
         exp_avg_input: Optional[bool] = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
-        eps: float = 1e-8,  #
-        precond_grad_accum: bool = False,  # expert parameters
+        eps: float = 1e-8,
+        precond_grad_accum: bool = False,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,

@@ -15,7 +15,6 @@ from heavyball.chainable import FunctionTransform
 _SKIP_GET_OPTIM = {
     "AdEMAMix",
     "SOAPAdEMAMix",
-    "SOAPAdEMAMix",
     "SplitOpt",
     "SAMWrapper",
 }

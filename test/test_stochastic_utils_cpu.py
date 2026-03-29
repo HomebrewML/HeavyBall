@@ -1,8 +1,6 @@
-import os
-
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-
+import pytest
 import torch
+from torch._dynamo import config
 
 import heavyball
 from heavyball.utils import (
@@ -13,7 +11,15 @@ from heavyball.utils import (
     stochastic_divide_with_eps_,
 )
 
-heavyball.utils.atan2_scale = 1024.0
+config.cache_size_limit = 128
+
+
+@pytest.fixture(autouse=True)
+def _restore_atan2_scale():
+    orig = heavyball.utils.atan2_scale
+    heavyball.utils.atan2_scale = 1024.0
+    yield
+    heavyball.utils.atan2_scale = orig
 
 
 def _average_stochastic_round(source: torch.Tensor, trials: int = 512) -> torch.Tensor:

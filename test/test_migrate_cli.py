@@ -169,7 +169,6 @@ def test_cli_migrates_legacy_checkpoint(runner, tmp_path):
             assert view_state["is_initialized"] == [0]
 
         assert "heavyball" in migrated_state
-        assert migrated_state["heavyball"]["inner_group"]["stochastic_schedule"] is None
         assert "Migrated checkpoint written to" in result.stdout
     finally:
         for name in list(sys.modules):

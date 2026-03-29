@@ -2,7 +2,6 @@ import contextlib
 import copy
 import functools
 import math
-import random
 from collections.abc import Iterable as _Iterable
 from typing import Iterable, List, Literal, Optional, Union
 
@@ -25,12 +24,6 @@ def _key_in_state(state, key):
     return True
 
 
-def _inplace_guard_(state, key, template_fn):
-    key_not_in_state = not _key_in_state(state, key)
-    if key_not_in_state:
-        template_fn()
-    return key_not_in_state
-
 
 def _guard_in_state(state, key, template_fn):
     if not _key_in_state(state, key):
@@ -45,7 +38,6 @@ class FunctionTransform:
         self.fn = fn
         self.fn_name = self.get_fn().__name__
         self.transform_idx = None
-        self.is_initialized = False
         self.names = names
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
@@ -55,7 +47,7 @@ class FunctionTransform:
         raise NotImplementedError
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
-        states = [state(p) for p in param]
+        states = state if isinstance(state, list) else [state(p) for p in param]
         skip_update = False
         for st, a in zip(states, zip(update, grad, param, *args)):
             if self.transform_idx not in st.get("is_initialized", set()):
@@ -77,9 +69,11 @@ class FunctionTransform:
             return self.fn.get_fn()
         return self.fn
 
+    def _build_val_names(self):
+        self._val_names = {name: f"{self.fn_name}_{name}_{self.transform_idx}" for name in self.names}
+
     def val_name(self, name):
-        assert self.transform_idx is not None
-        return f"{self.fn_name}_{name}_{self.transform_idx}"
+        return self._val_names[name]
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.fn}, transform_idx={self.transform_idx})"
@@ -155,7 +149,7 @@ class Route:
                 continue
             group["caution"] = caution
             if fns is not None:
-                u, skip = _inner_chain(state, group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns)
+                u, skip = _inner_chain(_sel(state, idx), group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns)
             else:
                 u, skip = _sel(update, idx), False
             results.append((u, skip, idx))
@@ -271,12 +265,11 @@ class ZeroGuard(FunctionTransform):
         if ecc is None:
             return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
 
-        states = [state(p) for p in param]
         names = [self.val_name(n) for n in self.names]
-        primary_vars = [[st[vn] for st in states] for vn in names]
+        primary_vars = [[st[vn] for st in state] for vn in names]
         with contextlib.ExitStack() as stack:
             for vn, plist in zip(names, primary_vars):
-                corrs = [st[vn + "::ecc"] for st in states]
+                corrs = [st[vn + "::ecc"] for st in state]
                 stack.enter_context(ecc.attached(plist, corrs))
             return self.fn(state, group, update, grad, param, *args, *primary_vars, **kwargs)
 
@@ -346,17 +339,6 @@ class GeneralGuard(FunctionTransform):
         super().__init__(fn, names)
         self.init_fn = init_fn
         self.skip_first = skip_first
-        self.named_to_anonymous = None
-        self.anonymous_to_named = None
-
-    def _map(self, state_fn, param, mapping):
-        for p in param:
-            state = state_fn(p)
-            for name, mapped in mapping.items():
-                if mapped in state:
-                    raise ValueError(f"Name {name} already mapped to {mapped}")
-                if name in state:
-                    state[mapped] = state.pop(name)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
         self.init_fn(state, group, update, grad, param, **kwargs)
@@ -370,12 +352,19 @@ class GeneralGuard(FunctionTransform):
 
 
 class NoState(FunctionTransform):
+    needs_init = False
+
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         return self.fn(group, update, grad, param, *args, **kwargs)
 
 
 class NoStateNoMultiTensor(FunctionTransform):
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        states = state if isinstance(state, list) else [state(p) for p in param]
+        for st in states:
+            if "is_initialized" not in st:
+                st["is_initialized"] = set()
+            st["is_initialized"].add(self.transform_idx)
         updates = []
         skip_update = False
         for a in zip(update, grad, param, *args):
@@ -398,6 +387,8 @@ def _view_preserve_ecc(src, target):
 
 
 class SqueezeGrad(FunctionTransform):
+    needs_init = False
+
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         original_shapes = [u.shape for u in update]
         update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
@@ -427,6 +418,32 @@ class TagGuard(FunctionTransform):
         return self.fn(state, group, update, grad, param, *args, **kwargs)
 
 
+class WarmupGuard(FunctionTransform):
+    def __init__(self, fn, warmup_fns):
+        super().__init__(fn, names=[])
+        self.warmup_fns = warmup_fns
+        self.warmup_key = None
+
+    def _build_val_names(self):
+        super()._build_val_names()
+        self.warmup_key = f"_warmup_{self.transform_idx}"
+
+    def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        states = state if isinstance(state, list) else [state(p) for p in param]
+        warmup_step = min(st.get(self.warmup_key, 0) for st in states)
+        if warmup_step < len(self.warmup_fns):
+            fn = self.warmup_fns[warmup_step]
+            for st, a in zip(states, zip(update, grad, param, *args)):
+                fn(st, group, *a, **kwargs)
+                st[self.warmup_key] = st.get(self.warmup_key, 0) + 1
+            raise SkipUpdate from None
+        for st in states:
+            if "is_initialized" not in st:
+                st["is_initialized"] = set()
+            st["is_initialized"].add(self.transform_idx)
+        return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+
 needs_full_param = functools.partial(TagGuard, needs_full_param=True)
 
 
@@ -440,6 +457,10 @@ def copy_guard(index, *names):
 
 def general_guard(*names, init_fn, skip_first: bool = True):
     return functools.partial(GeneralGuard, names=names, init_fn=init_fn, skip_first=skip_first)
+
+
+def warmup_guard(*warmup_fns):
+    return functools.partial(WarmupGuard, warmup_fns=list(warmup_fns))
 
 
 def no_state(fn):
@@ -700,7 +721,7 @@ def orthogonalize_grad_to_param(group, update, grad, param):
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
     # Compute weight_sum once per step, not per param in no-multi_tensor mode.
-    if group.get("_sf_step") != group["step"]:
+    if group.get("_sf_step") is not group["step"]:
         weight = abs(group["lr"]) ** group["weight_lr_power"] * max(group["step"], 1) ** group["r"]
         group["weight_sum"] = group.get("weight_sum", 0) + weight
         group["_sf_step"] = group["step"]
@@ -738,28 +759,21 @@ def update_by_msam(group, update, grad, param, z, exp_avg):
     raise SkipUpdate from None
 
 
+def _adopt_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq):
+    utils.scale_by_exp_avg_sq_([exp_avg_sq], [update], 0, group["eps"])
+
+
+def _adopt_warmup_2(state, group, update, grad, param, exp_avg, exp_avg_sq):
+    u = utils.promote(update)
+    easq = utils.promote(exp_avg_sq)
+    utils.copy_stochastic_(exp_avg, u / easq.sqrt().clamp_(min=group["eps"]))
+    utils.scale_by_exp_avg_sq_([exp_avg_sq], [update], utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"])
+
+
 @zero_guard("exp_avg", "exp_avg_sq")
+@warmup_guard(_adopt_warmup_1, _adopt_warmup_2)
 @no_state
 def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
-    if group["step"] == 1:
-        utils.scale_by_exp_avg_sq_(exp_avg_sq, update, 0, group["eps"])
-        raise SkipUpdate from None
-
-    if group["step"] == 2:
-        update = utils.promote(update)
-        easq = utils.promote(exp_avg_sq)
-        [
-            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
-            for ea, u, easq_ in zip(exp_avg, update, easq)
-        ]
-        utils.scale_by_exp_avg_sq_(
-            exp_avg_sq,
-            update,
-            utils.beta_debias(utils.get_beta2(group), group["step"]),
-            group["eps"],
-        )
-        raise SkipUpdate from None
-
     utils.fused_adopt_(
         param,
         update,
@@ -777,14 +791,15 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     raise SkipUpdate from None
 
 
+def _suds_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
+    utils.copy_stochastic_(fisher_approx, update / update.norm().clamp(min=1e-8))
+
+
 @needs_full_param
 @zero_guard("exp_avg", "exp_avg_sq", "fisher_approx")
+@warmup_guard(_suds_warmup_1)
 @no_state_no_multi_tensor
 def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
-    if group["step"] == 1:
-        utils.copy_stochastic_(fisher_approx, update / update.norm().clamp(min=1e-8))
-        raise SkipUpdate from None
-
     precond_update, w = utils.eigvecs_product_rank1(update.flatten(), fisher_approx.flatten().to(update.dtype))
     precond_update = utils.adam_(
         exp_avg,
@@ -817,27 +832,9 @@ def scale_by_unscaled_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
+@warmup_guard(_adopt_warmup_1, _adopt_warmup_2)
 @no_state
 def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
-    if group["step"] == 1:
-        utils.scale_by_exp_avg_sq_(exp_avg_sq, update, 0, group["eps"])
-        raise SkipUpdate from None
-
-    if group["step"] == 2:
-        update = utils.promote(update)
-        easq = utils.promote(exp_avg_sq)
-        [
-            utils.copy_stochastic_(ea, u / easq_.sqrt().clamp_(min=group["eps"]))
-            for ea, u, easq_ in zip(exp_avg, update, easq)
-        ]
-        utils.scale_by_exp_avg_sq_(
-            exp_avg_sq,
-            update,
-            utils.beta_debias(utils.get_beta2(group), group["step"]),
-            group["eps"],
-        )
-        raise SkipUpdate from None
-
     return utils.adopt(
         update,
         exp_avg_sq,
@@ -863,9 +860,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
     state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
-    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)  # torch casts int to float in ckpt load
-    if group["adaptive"]:
-        state["velocity"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
+    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
 
@@ -907,21 +902,6 @@ def _init_psgd_lra(state, group, update, grad, param, cached: bool = False, prob
     )
 
 
-def precond_schedule(group, prob: Union[callable, float, None] = None, name: str = "cumulative_prob"):
-    step = group["step"]
-    if "precondition_frequency" in group:
-        return step > 0 and step % group["precondition_frequency"] == 0
-    if isinstance(step, torch.Tensor):
-        utils.warn_once("Preconditioner schedule is not supported with torch.Tensor step.")
-        rng = random.Random(0x172381)
-    else:
-        rng = random.Random(0x172381 ^ step)
-    if "precond_scheduler" in group:
-        return utils.precond_schedule(step, group["precond_scheduler"], rng)
-    if prob is not None:
-        return utils.psgd_should_update(group, prob, rng, name=name)
-    raise ValueError("No preconditioner update schedule specified.")
-
 
 @needs_full_param
 @no_state_no_multi_tensor
@@ -948,7 +928,7 @@ def nesterov_ema(group, updates, grads, params, momentum):  # equivalent to Grok
 
 
 def _store_init_norm(state, group, update, grad, param):
-    state["init_norm"] = param.float().norm()
+    state["init_norm"] = param.to(_storage_dtype(group)).norm()
 
 
 @needs_full_param
@@ -960,7 +940,7 @@ def update_by_hyperball(group, update, grad, param, init_norm):
 
 
 def _store_std(state, group, update, grad, param):
-    state["init_std"] = torch.std(param)
+    state["init_std"] = torch.std(param.to(_storage_dtype(group)))
 
 
 @needs_full_param
@@ -1145,7 +1125,6 @@ def _update_psgd_precond(
     param,
     grad,
     Q,
-    velocity,
     running_lower_bound,
     step,
     prob: Optional[callable] = None,
@@ -1160,8 +1139,6 @@ def _update_psgd_precond(
         vector, hessian_vector = param.vector, param.hessian_vector
         del param.vector
         del param.hessian_vector
-    elif group["inverse_free"]:
-        vector, hessian_vector = None, grad
     else:
         vector, hessian_vector = utils.dampen_grad(grad, group["dampening"])
 
@@ -1170,7 +1147,6 @@ def _update_psgd_precond(
         group["precond_lr"],
         Q,
         group["store_triu_as_line"],
-        velocity,
         utils.get_beta2(group),
         group["ortho_method"],
         vector,
@@ -1189,9 +1165,9 @@ def _update_psgd_precond(
     if precond is not None:
         return precond
     if not should_use_cache or not cached:
-        return None  # caching adds extra ops and is not worth the overhead when we precondition at every step
+        return None
 
-    Q_resolved = utils.line_to_triu(Q, group["inverse_free"]) if group["store_triu_as_line"] else Q
+    Q_resolved = utils.line_to_triu(Q) if group["store_triu_as_line"] else Q
     for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
         if c_ is None:
             c_ = (
@@ -1263,7 +1239,7 @@ def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
         out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         out = utils.psgd_precond_grad(
-            preconds=Q, store_triu_as_line=group["store_triu_as_line"], symmetric_output=group["inverse_free"], **kwargs
+            preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs
         )
     group["caution"] = False  # we already cautioned here - shouldn't do it again
     return out
@@ -1282,7 +1258,7 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
         utils.fused_psgd_precond_grad(
-            preconds=Q, store_triu_as_line=group["store_triu_as_line"], symmetric_output=group["inverse_free"], **kwargs
+            preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs
         )
 
 
@@ -1351,7 +1327,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
 @needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def scale_by_psgd(
     group,
@@ -1361,20 +1337,19 @@ def scale_by_psgd(
     update_to_precond,
     Q,
     Q_cache,
-    velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
 @needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def scale_by_delayed_psgd(
     group,
@@ -1384,26 +1359,22 @@ def scale_by_delayed_psgd(
     update_to_precond,
     Q,
     Q_cache,
-    velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    if group.get("inverse_free", False):
-        precond = None
-    else:
-        precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
-    new = _update_psgd_precond(
-        cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob
+    precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
+    _update_psgd_precond(
+        cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob
     )
-    return new if precond is None else precond
+    return precond
 
 
 @needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def update_by_psgd(
     group,
@@ -1413,13 +1384,12 @@ def update_by_psgd(
     update_to_precond,
     Q,
     Q_cache,
-    velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     raise SkipUpdate from None
 
@@ -1439,7 +1409,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 @needs_full_param
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def update_by_delayed_psgd(
     group,
@@ -1449,14 +1419,13 @@ def update_by_delayed_psgd(
     update_to_precond,
     Q,
     Q_cache,
-    velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
     step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     raise SkipUpdate from None
 
 
@@ -1680,7 +1649,7 @@ def _inner_chain(state, group, update, grad, param, *fns):
     return update, skip_update
 
 
-def chain(state: Union[callable, dict], group, grad, param, *fns):
+def chain(state: list, group, grad, param, *fns):
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
 
     ecc = ECCConfig.from_group(group, key="param_ecc")
@@ -1691,8 +1660,7 @@ def chain(state: Union[callable, dict], group, grad, param, *fns):
         utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
         return
 
-    states = [state(p) for p in param]
-    corrs = [st["param::ecc"] for st in states]
+    corrs = [st["param::ecc"] for st in state]
     with ecc.attached(param, corrs):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
@@ -1731,6 +1699,7 @@ def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
     for ft in _walk_fns(new_fns):
         if not retain or ft.transform_idx is None:
             ft.transform_idx, offset = offset, offset + 1
+        ft._build_val_names()
 
     return new_fns
 
@@ -1754,8 +1723,9 @@ class ChainOpt(utils.StatefulOptimizer):
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base, multi_tensor)
         self.fns = fns
+        self._eager_chain = self._run_chain
         if self.compile_step:
-            self._chain = torch.compile(self._chain, fullgraph=True)
+            self._run_chain = torch.compile(self._run_chain, fullgraph=True)
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
 
@@ -1846,9 +1816,19 @@ class ChainOpt(utils.StatefulOptimizer):
         self._fns = value
         self._set_indices(retain=True)
         self._needs_gather = any(getattr(ft, "needs_full_param", False) for ft in _walk_fns(self._fns))
+        self._transform_ids = frozenset(
+            ft.transform_idx for ft in _walk_fns(self._fns)
+            if ft.transform_idx is not None and getattr(ft, "needs_init", True)
+        )
 
     def _set_indices(self, retain=True):
         self._fns = set_indices(self.fns, retain)
+
+    def _find_val_name(self, name):
+        for ft in _walk_fns(self._fns):
+            if name in ft._val_names:
+                return ft._val_names[name]
+        raise KeyError(f"No transform stores '{name}'")
 
     def _step(self, group):
         if "base_lr" not in group:
@@ -1881,29 +1861,14 @@ class ChainOpt(utils.StatefulOptimizer):
 
         for param in p:
             state = self.state_(param)
-            if "step" in state:
-                step = state["step"]
-            elif self.compile_step:
-                step = utils.scalar_guard(0, param)
-            else:
-                step = 0
+            step = state.get("step", 0)
+            if not isinstance(step, torch.Tensor):
+                step = torch.tensor(step, dtype=torch.int64, device=param.device)
+                state["step"] = step
             break
 
         group["step"] = state["step"] = step = step + 1
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / max(step, group["warmup_steps"] + 1)
-
-        if isinstance(step, torch.Tensor):
-            _orig_floats = {}
-            for k, v in group.items():
-                if isinstance(v, float):
-                    _orig_floats[k] = v
-                    group[k] = torch.tensor(v, dtype=torch.float64, device=step.device)
-                elif isinstance(v, tuple) and any(isinstance(x, float) for x in v):
-                    _orig_floats[k] = v
-                    group[k] = tuple(
-                        torch.tensor(x, dtype=torch.float64, device=step.device) if isinstance(x, float) else x
-                        for x in v
-                    )
 
         if not group["multi_tensor"] or len(p) == 1:
             for param, grad in zip(p, g):
@@ -1911,35 +1876,36 @@ class ChainOpt(utils.StatefulOptimizer):
         else:
             self._chain(group, g, p, caution)
 
-        if isinstance(step, torch.Tensor):
-            group.update(_orig_floats)
-
         group["caution"] = caution
         group["lr"] = group["prev_lr"]
         group["step"] = None
 
-    def _chain(self, group, g, p, caution):
-        chain(self.state_, group, g, p, *self.fns)
+    def _run_chain(self, state, group, g, p, caution):
+        chain(state, group, g, p, *self.fns)
         group["caution"] = caution
+
+    def _needs_init(self, state):
+        ids = self._transform_ids
+        return ids and any(not ids.issubset(st.get("is_initialized", set())) for st in state)
+
+    def _needs_eager(self, group, state):
+        if self._needs_init(state):
+            return True
+        if group.get("is_preconditioning", False):
+            return True
+        if group.get("ecc") or group.get("param_ecc"):
+            return True
+        return False
+
+    def _chain(self, group, g, p, caution):
+        state = [self.state_(pi) for pi in p]
+        fn = self._run_chain
+        if self.compile_step and self._needs_eager(group, state):
+            fn = self._eager_chain
+        fn(state, group, g, p, caution)
 
 
 str_or_fn = Union[str, callable, None, Literal[use_default]]
-
-
-def _get_clip_fn(name: str_or_fn, default_val: str_or_fn):
-    name = default(name, default_val)
-    if callable(name):
-        return name
-    elif name not in (
-        "l2_clip_",
-        "rmsnorm_clip_",
-        "trust_region_clip_",
-        "a_law_compress",
-        "mu_law_compress",
-        "softsign_compress",
-    ):
-        raise ValueError(f"Clipping function {name} not found")
-    return getattr(utils, name)
 
 
 def default(a, b):
@@ -1978,23 +1944,17 @@ class BaseOpt(ChainOpt):
     Base Optimizer
 
     compile_step: bool = False
-    Whether to change some internals to try to make the optimizer compilable
-    This does not compile the step by itself and breaks some optimizers loudly (e.g. SOAP)
+    Whether to torch.compile the optimizer step (fullgraph=True).
+    Initialization runs eagerly on the first step; subsequent steps are compiled.
 
     promote: bool = False
-    Whether to promote the gradients to fp32 before applying the optimizer
-    Improves update quality for low-precision parameters, but increases costs
-    Compiling the optimizer step would reduce memory and compute. Alternatively, `multi_tensor=False` decreases memory at the cost of runtime
+    Whether to promote the gradients to fp32 before applying the optimizer.
 
     gradient_clipping: str_or_fn = None
-    The function to use for clipping the incoming gradients, before any other transformations.
-    This is syntactic sugar, equivalent to manually passing the function as the first element of the optimizer chain.
+    Clipping function applied to incoming gradients before any other transforms.
 
     update_clipping: str_or_fn = None
-    The function to use for clipping the outgoing updates before applying them, after all other transformations.
-    This will turn off fused updates.
-    This is syntactic sugar, equivalent to manually passing the function as the last element of the optimizer chain.
-
+    Clipping function applied to outgoing updates. Disables fused updates.
     """
 
     gradient_clipping: str_or_fn = None
@@ -2059,28 +2019,29 @@ class BaseOpt(ChainOpt):
 
 class ScheduleFree(BaseOpt):
     def eval(self):
+        z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode")
+            group["train_mode"] = train_mode = not group.get("train_mode", True)
             beta1 = utils.get_beta1(group)
             if beta1 > 0 and not train_mode:
                 for p in group["params"]:
                     state = self.state_(p)
-                    if "z" in state:
-                        # Set p.data to x
-                        z = utils.promote(state["z"])
+                    if z_key in state:
+                        z = utils.promote(state[z_key])
                         p32 = utils.promote(p.data)
                         p32.lerp_(end=z, weight=1 - 1 / beta1)
                         utils.copy_stochastic_(p.data, p32)
 
     def train(self):
+        z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode")
+            group["train_mode"] = train_mode = not group.get("train_mode", False)
             beta1 = utils.get_beta1(group)
             if beta1 > 0 and train_mode:
                 for p in group["params"]:
                     state = self.state_(p)
-                    if "z" in state:
-                        z = utils.promote(state["z"])
+                    if z_key in state:
+                        z = utils.promote(state[z_key])
                         p32 = utils.promote(p.data)
                         p32.lerp_(end=z, weight=1 - beta1)
                         utils.copy_stochastic_(p.data, p32)
@@ -2088,23 +2049,25 @@ class ScheduleFree(BaseOpt):
 
 class MSAM(BaseOpt):
     def eval(self):
+        z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode")
+            group["train_mode"] = train_mode = not group.get("train_mode", True)
             if not train_mode:
                 for p in group["params"]:
                     state = self.state_(p)
-                    if "z" in state:
+                    if z_key in state:
                         p_copy = p.data.clone()
-                        utils.copy_stochastic_(p.data, state["z"])
-                        utils.copy_stochastic_(state["z"], p_copy)
+                        utils.copy_stochastic_(p.data, state[z_key])
+                        utils.copy_stochastic_(state[z_key], p_copy)
 
     def train(self):
+        z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode")
+            group["train_mode"] = train_mode = not group.get("train_mode", False)
             if train_mode:
                 for p in group["params"]:
                     state = self.state_(p)
-                    if "z" in state:
+                    if z_key in state:
                         p_copy = p.data.clone()
-                        utils.copy_stochastic_(p.data, state["z"])
-                        utils.copy_stochastic_(state["z"], p_copy)
+                        utils.copy_stochastic_(p.data, state[z_key])
+                        utils.copy_stochastic_(state[z_key], p_copy)

@@ -130,7 +130,7 @@ def test_param_ecc_convergence(combined):
     kw = {"param_ecc": "bf16+8"}
     if combined:
         kw["ecc"] = "bf16+8"
-    m1, o1 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2)
+    m1, o1 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, **kw)
     losses_ecc = _train(m1, o1, data, target, 200)
     p = list(m1.parameters())[0]
     assert p.dtype == torch.bfloat16
@@ -302,7 +302,7 @@ def _measure_peak(cls, n, lr, ecc=None, param_ecc=None, steps=3):
         kw["ecc"] = ecc
     if param_ecc:
         kw["param_ecc"] = param_ecc
-    opt = cls([p], lr=lr)
+    opt = cls([p], lr=lr, **kw)
 
     for _ in range(steps):
         p.grad = torch.randn_like(p)

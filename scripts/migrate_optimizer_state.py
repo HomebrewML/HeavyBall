@@ -104,7 +104,7 @@ def _collect_transform_mappings(optimizer) -> List[TransformMapping]:
                 stack.append(current.fn)
             elif isinstance(current, functools.partial):  # type: ignore[name-defined]
                 stack.append(current.func)
-            elif isinstance(current, C.Branch):
+            elif isinstance(current, C.Parallel):
                 for branch in current.branches:
                     stack.extend(branch)
             elif isinstance(current, (list, tuple)):

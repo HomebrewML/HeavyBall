@@ -38,7 +38,7 @@ class GraftedAdam(C.BaseOpt):
             weight_decay=weight_decay,
             warmup_steps=warmup_steps,
         )
-        branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=_graft)
+        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=_graft)
         super().__init__(params, defaults, multi_tensor, fns=(branch,))
 
 

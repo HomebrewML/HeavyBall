@@ -1293,7 +1293,6 @@ class StatefulOptimizer(torch.optim.Optimizer):
     compile_step: bool = False
     hessian_approx: bool = False
     precond_schedule: Union[Callable, float, None] = None
-    stochastic_schedule: bool | Literal[use_default] = use_default
     finite_differences: bool = False
     fallback_to_finite_differences: bool = True
     _fallback_enabled: bool = False
@@ -1318,17 +1317,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
         self.mapping = {}
         self.mapping_inverse = {}
 
-        if self.stochastic_schedule is use_default:
-            stochastic_schedule = None
-            for group in self.param_groups:
-                new = group.get("stochastic_schedule", stochastic_schedule)
-                if stochastic_schedule is not None and new != stochastic_schedule:
-                    raise ValueError("All parameter groups must have the same stochastic_schedule.")
-                stochastic_schedule = new
-            self.stochastic_schedule = stochastic_schedule
-
-        self.inner_group = {"stochastic_schedule": self.stochastic_schedule}
-        self.precond_rng = random.Random(0x12312)
+        self.inner_group = {}
         self._is_preconditioning = None
 
         if self.hessian_approx and self.compile_step:
@@ -1340,22 +1329,24 @@ class StatefulOptimizer(torch.optim.Optimizer):
     def _store_stats(self, state_dict: dict[str, any]):
         state_dict["heavyball"] = {
             "inner_group": self.inner_group,
-            "precond_rng": pickle.dumps(self.precond_rng),
             "use_ema": self.use_ema,
             "ema_decay": self.ema_decay,
             "compile_step": self.compile_step,
             "hessian_approx": self.hessian_approx,
             "precond_schedule": pickle.dumps(self.precond_schedule),
-            "stochastic_schedule": self.stochastic_schedule,
             "fallback_to_finite_differences": self.fallback_to_finite_differences,
             "_fallback_enabled": self._fallback_enabled,
             "hvp_interval": self.hvp_interval,
         }
 
+    _REMOVED_STATS = frozenset({"stochastic_schedule", "precond_rng"})
+
     def _load_stats(self, state_dict):
         sd = state_dict.pop("heavyball", {})
         for k, v in sd.items():
-            if k in ("precond_rng", "precond_schedule"):
+            if k in self._REMOVED_STATS:
+                continue
+            if k in ("precond_schedule",):
                 v = pickle.loads(v)
             setattr(self, k, v)
 
@@ -1603,7 +1594,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
         if self.precond_schedule is None:
             self._is_preconditioning = False
         else:
-            self._is_preconditioning = psgd_should_update(self.inner_group, self.precond_schedule, self.precond_rng)
+            self._is_preconditioning = psgd_should_update(self.inner_group, self.precond_schedule)
         loss = self._handle_closure(closure)
 
         if self.use_ema:
@@ -2861,10 +2852,10 @@ def min_singular_value(
 
 
 @decorator_knowngood
-def _balance_to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
+def _balance_to_triu(Q: "TriuOrLine"):
     if isinstance(Q[0], tuple):
         psgd_balance_Q([o[1] for o in Q])
-        return line_to_triu(Q, symmetric_output)
+        return line_to_triu(Q)
     psgd_balance_Q(Q)
     return Q
 
@@ -2980,7 +2971,6 @@ def psgd_update_precond(
     precond_lr: float,
     oq: "TriuOrLine",
     store_triu_as_line: bool,
-    velocity: Optional[List[Tensor]],
     beta2: float,
     ortho_method: Optional[str],
     V: Tensor,
@@ -3176,64 +3166,9 @@ def _psgd_precond_update_(
 
 
 @decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], numel: int):
-    """
-    I: Identity
-    U: Update / gg / target
-    Q: q, preconditioner
-    scale: scalar scale
-    ---
-    U = T * scale - I
-    F = I - U  # = 2I - U * scale
-    O = F @ Q @ F - Q
-    """
-    out = []
-    for gg, q in zip(GG, Q):
-        if gg.ndim < 2:
-            scale = max(1, gg.numel()) / numel
-            target = promote(gg)
-            update = target * scale - 1
-            out.append(q - (1 - update) * q * (1 - update))
-        else:
-            scale = gg.size(0) / numel
-            gg = 2 * torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) - gg * scale
-            update = q - casted_einsum("ab,cd,bc", gg, gg, q)
-            out.append(update + update.T)  # make matrix symmetric
-    return out
 
 
 @decorator
-def inverse_free_psgd_update_precond(
-    G: Tensor,
-    precond_lr: float,
-    oq: List[Tensor],
-    store_triu_as_line: bool,
-    velocity: Optional[List[Tensor]],
-    beta2: float,
-    ortho_method: Optional[str],
-    V: None,
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: float,
-    power_iter: int,
-) -> Tensor:
-    """Update Kronecker product preconditioner Q with pair (V, G)."""
-    assert V is None
-    assert ortho_method is None
-    assert velocity is None
-    del V, ortho_method, velocity
-
-    Q = _balance_to_triu(oq, True)
-    precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-
-    G = psgd_precond_grad(G, Q)
-    terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-    matmuled = _psgd_quad_preconditioner_grad(terms, Q, G.numel())
-    _psgd_precond_update_(
-        matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
-    return G
-
 
 @decorator_knowngood
 def _clip(x, norm, clip_at, eps=1e-8):
@@ -3495,15 +3430,13 @@ def triu_to_line(Q_list: List[Tensor]):
 
 
 @decorator_knowngood
-def line_to_triu(Q_list: List[Tuple[Optional[List[int]], Tensor]], symmetric_output: bool = False):
+def line_to_triu(Q_list: List[Tuple[Optional[List[int]], Tensor]]):
     new = []
     for shape, q in Q_list:
         if shape is not None:
             x, y = torch.triu_indices(*shape, device=q.device)
             q_mat = torch.zeros(shape, device=q.device, dtype=q.dtype)
             q_mat[x, y] = q
-            if symmetric_output:
-                q_mat[y, x] = q
             q = q_mat
         new.append(q)
     return new
@@ -3518,14 +3451,10 @@ def warn_once(msg):
         _warned.add(msg)
 
 
-def psgd_should_update(
-    group, prob: Union[float, callable], rng: Optional[random.Random] = None, name: str = "cumulative_prob"
-):
+def psgd_should_update(group, prob: Union[float, callable], name: str = "cumulative_prob"):
     group[f"{name}_prob_step"] = group.get(f"{name}_prob_step", 0) + 1
     if not isinstance(prob, float):
         prob = prob(group[f"{name}_prob_step"])
-    if group["stochastic_schedule"]:
-        return rng.random() < prob
     cumulative_prob = group.get(name, 0)
     group[name] = cumulative_prob + prob
     return int(group[name]) > int(cumulative_prob)
@@ -3587,12 +3516,11 @@ def psgd_precond_grad(
     caution: bool = False,
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
-    symmetric_output: bool = False,
 ):
     if caution:
         ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
-        preconds = line_to_triu(preconds, symmetric_output)
+        preconds = line_to_triu(preconds)
     args = [promote(q) for q in preconds]
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
     return compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
@@ -3608,7 +3536,6 @@ def _compilable_fused_psgd_precond_grad(
     caution,
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
-    symmetric_output: bool = False,
 ):
     precond = psgd_precond_grad(
         ea,
@@ -3616,7 +3543,6 @@ def _compilable_fused_psgd_precond_grad(
         caution=caution,
         grad=grad,
         store_triu_as_line=store_triu_as_line,
-        symmetric_output=symmetric_output,
     )
     update_param_(param, precond, lr, decay, caution=False, grad=grad)
 
@@ -3630,11 +3556,10 @@ def fused_psgd_precond_grad(
     caution,
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
-    symmetric_output: bool = False,
 ):
     lr, decay = scalar_guard(lr, decay, param[0])
     _compilable_fused_psgd_precond_grad(
-        ea, param, lr, grad, decay, caution, preconds, store_triu_as_line, symmetric_output
+        ea, param, lr, grad, decay, caution, preconds, store_triu_as_line
     )
 
 

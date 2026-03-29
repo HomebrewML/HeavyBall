@@ -40,6 +40,9 @@ from heavyball.utils import (
 
 # Ensure Torch dynamo stays disabled on CI runners without GPU support.
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+from torch._dynamo import config
+
+config.cache_size_limit = 128
 _SAVED_COMPILE_MODE = heavyball.utils.compile_mode
 heavyball.utils.compile_mode = None
 
@@ -173,9 +176,9 @@ def test_triu_line_roundtrip_on_cpu():
         torch.arange(9, dtype=torch.float32).reshape(3, 3),
     ]
     packed = triu_to_line(tensors)
-    restored = line_to_triu(packed, symmetric_output=True)
+    restored = line_to_triu(packed)
     for original, rebuilt in zip(tensors, restored, strict=True):
-        assert torch.allclose(rebuilt, torch.triu(original) + torch.triu(original, diagonal=1).T)
+        assert torch.allclose(rebuilt, torch.triu(original))
 
 
 def test_warn_once_only_emits_single_warning(monkeypatch):
@@ -192,21 +195,12 @@ def test_warn_once_only_emits_single_warning(monkeypatch):
 
 
 def test_psgd_should_update_accumulates_probability():
-    group = {"stochastic_schedule": False}
+    group = {}
     outcomes = [psgd_should_update(group, 0.4) for _ in range(4)]
     assert outcomes[:2] == [False, False]
     assert outcomes[2] is True
     assert outcomes[3] in (False, True)
     assert group["cumulative_prob_prob_step"] == 4
-
-
-def test_psgd_should_update_stochastic_schedule_uses_rng():
-    rng = random.Random(123)
-    group = {"stochastic_schedule": True}
-    calls = [psgd_should_update(group, 0.5, rng=rng) for _ in range(5)]
-    rng = random.Random(123)
-    expected = [rng.random() < 0.5 for _ in range(5)]
-    assert calls == expected
 
 
 def test_stochastic_math_helpers_match_expected_results(n=1024):
@@ -226,7 +220,8 @@ def test_stochastic_math_helpers_match_expected_results(n=1024):
     stochastic_add_divide_(c, b, alpha=1.0, divisor=2.0)
     assert torch.allclose(c.float(), (a + b * 1) / 2)
 
-    orig = heavyball.utils.default_division_backend
+    orig_backend = heavyball.utils.default_division_backend
+    orig_scale = heavyball.utils.atan2_scale
     try:
         heavyball.utils.atan2_scale = 1024
         for backend in heavyball.utils.DivisionBackend:
@@ -235,7 +230,8 @@ def test_stochastic_math_helpers_match_expected_results(n=1024):
             stochastic_divide_with_eps_(c, b)
             assert torch.allclose(c.float(), a / b), f"Backend {backend} failed"
     finally:
-        heavyball.utils.default_division_backend = orig
+        heavyball.utils.default_division_backend = orig_backend
+        heavyball.utils.atan2_scale = orig_scale
 
 
 def test_stochastic_math_accuracy():

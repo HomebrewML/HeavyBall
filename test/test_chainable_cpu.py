@@ -36,7 +36,7 @@ def test_branch_merges_multiple_paths():
     def merge_fn(outputs):
         return [sum(vals) / len(vals) for vals in zip(*outputs)]
 
-    branch = C.Branch([[double], [negate]], merge_fn)
+    branch = C.Parallel([[double], [negate]], merge_fn)
 
     update = [torch.ones(2)]
     grad = [torch.ones(2)]
