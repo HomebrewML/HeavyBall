@@ -1886,7 +1886,12 @@ class ChainOpt(utils.StatefulOptimizer):
 
     def _needs_init(self, state):
         ids = self._transform_ids
-        return ids and any(not ids.issubset(st.get("is_initialized", set())) for st in state)
+        if not ids:
+            return False
+        all_initialized = set()
+        for st in state:
+            all_initialized.update(st.get("is_initialized", ()))
+        return not ids.issubset(all_initialized)
 
     def _needs_eager(self, group, state):
         if self._needs_init(state):

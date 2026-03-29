@@ -82,7 +82,7 @@ informed choice.
 ### Case Study: Escaping the Saddle Point
 
 An optimizer’s inability to navigate a saddle point is a classic example of a silent failure. A key test of an
-optimizer's robustness is its ability to navigate a saddle point—a region that is a minimum in one direction but a
+optimizer's robustness is its ability to navigate a saddle point - a region that is a minimum in one direction but a
 maximum in another. The gradient approaches zero at the center, trapping first-order methods that rely solely on the
 gradient.
 
@@ -95,7 +95,7 @@ optimizer may be unreliable in these settings.
 ## Conclusion
 
 The HeavyBall Benchmark represents a necessary shift in how we evaluate optimizers, moving from a culture of
-score-chasing to one of deep, diagnostic understanding. These hidden failures aren’t rare edge cases—they’re a routine
+score-chasing to one of deep, diagnostic understanding. These hidden failures aren’t rare edge cases - they’re a routine
 source of wasted compute and disappointing models. By making them explicit, the benchmark equips researchers and
 practitioners with a detailed map of an optimizer's capabilities. By clearly identifying hidden failure modes,
 practitioners can confidently choose, tune, or reconsider their optimization strategies, ultimately leading to more

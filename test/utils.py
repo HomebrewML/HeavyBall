@@ -34,7 +34,7 @@ def _deduplicate_by_chain(names):
     """Keep one optimizer per unique chain of functions.
 
     Two optimizers that differ only by multi_tensor=True/False have identical
-    chains and test the same code paths — keep whichever appears first.
+    chains and test the same code paths, keep whichever appears first.
     """
     seen = set()
     out = []

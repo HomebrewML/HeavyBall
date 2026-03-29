@@ -108,7 +108,7 @@ def test_ecc_populated_rne():
     p, ecc, _ = _train_linear("max-autotune-no-cudagraphs", rne=True)
     assert ecc is not None, "param::ecc not found in optimizer state"
     assert ecc.any(), (
-        "param::ecc all zeros with RNE rounding under compile — Inductor likely folded the f32->bf16->f32 roundtrip"
+        "param::ecc all zeros with RNE rounding under compile, Inductor likely folded the f32->bf16->f32 roundtrip"
     )
     clean()
 

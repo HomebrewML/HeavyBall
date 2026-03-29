@@ -96,7 +96,6 @@ def main(epochs: int, batch: int, log_interval: int = 16):
         lr=1e-4,
         mars=True,
         lower_bound_beta=0.9,
-        inverse_free=True,
         precond_update_power_iterations=6,
         store_triu_as_line=False,
     )

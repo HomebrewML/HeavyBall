@@ -362,7 +362,7 @@ def test_ecc_live_path_nonzero_correction():
     p = list(m.parameters())[0]
     st, ecc_keys = _ecc_keys(o, p)
     for ek in ecc_keys:
-        assert st[ek].any(), f"ECC correction '{ek}' is all zeros — stochastic_round_ likely mutating source"
+        assert st[ek].any(), f"ECC correction '{ek}' is all zeros - stochastic_round_ likely mutating source"
     del m, o
     clean()
 

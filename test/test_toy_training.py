@@ -29,10 +29,8 @@ EXTRA_KWARGS = {
 
 def _optimizer_params():
     params = []
-    for name in sorted(dir(heavyball)):
-        if name.startswith("_"):
-            continue
-        attr = getattr(heavyball, name)
+    for name in sorted(heavyball.__all__):
+        attr = getattr(heavyball, name, None)
         if not isinstance(attr, type) or not issubclass(attr, optim.Optimizer):
             continue
         if attr is optim.Optimizer:

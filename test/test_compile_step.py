@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import heavyball
+from heavyball.chainable import ChainOpt, WarmupGuard, _walk_fns
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -81,3 +82,33 @@ def test_compile_step_matches_eager(opt_name, opt_cls):
     for p_ref, p_test in zip(model_ref.parameters(), model_test.parameters()):
         diff = (p_ref.data - p_test.data).abs().max().item()
         assert diff < 1e-4, f"compile_step diverged: max_diff={diff}"
+
+
+def _max_warmup(opt):
+    return max((len(ft.warmup_fns) for ft in _walk_fns(opt.fns) if isinstance(ft, WarmupGuard)), default=0)
+
+
+@pytest.mark.parametrize("opt_name,opt_cls", _optimizer_params())
+def test_needs_init_clears(opt_name, opt_cls):
+    """_needs_init must become False after max_warmup + 1 steps for all ChainOpt optimizers.
+
+    Catches bugs where Route-based or warmup_guard-based optimizers permanently
+    force eager mode because different params accumulate different is_initialized
+    sets that never individually cover _transform_ids.
+    """
+    if not issubclass(opt_cls, ChainOpt):
+        pytest.skip("not a ChainOpt")
+
+    kwargs = dict(EXTRA_KWARGS.get(opt_name, {}))
+    model = _make_model()
+    opt = opt_cls(model.parameters(), **kwargs)
+    n = _max_warmup(opt) + 1
+
+    _run_steps(model, opt, n=n)
+
+    for group in opt.param_groups:
+        state = [opt.state_(p) for p in group["params"]]
+        assert not opt._needs_init(state), (
+            f"{opt_name}: _needs_init stuck True after {n} steps | "
+            f"compile_step will never engage"
+        )

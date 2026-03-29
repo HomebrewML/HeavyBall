@@ -3102,8 +3102,8 @@ def eigvecs_product_rank1(
     using the Householder reflector with first column v. Never materializes V.
 
     Args:
-        G: shape (..., d) — gradient row(s) you want to rotate into eigenbasis.
-        v: shape (d,)      — current unit direction (top eigenvector of P).
+        G: shape (..., d) - gradient row(s) you want to rotate into eigenbasis.
+        v: shape (d,)     - current unit direction (top eigenvector of P).
         w: optional Householder vector w; pass to reuse across calls.
 
     Returns:

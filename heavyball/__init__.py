@@ -598,7 +598,30 @@ class MuonLaProp(C.BaseOpt):
         )
 
 
-class SOAP(C.BaseOpt):
+class SOAPBase(C.BaseOpt):
+    use_precond_schedule: bool = False
+
+    def _build_soap_defaults(self, locals_dict, fns):
+        use_precond_schedule = C.default(locals_dict["use_precond_schedule"], self.use_precond_schedule)
+        params, defaults = C._build_defaults(locals_dict)
+        if use_precond_schedule:
+            del defaults["precondition_frequency"]
+            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
+        else:
+            del defaults["precond_scheduler"]
+            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
+        super().__init__(
+            params,
+            defaults,
+            locals_dict["multi_tensor"],
+            locals_dict["gradient_clipping"],
+            locals_dict["update_clipping"],
+            locals_dict.get("palm", False),
+            fns=fns,
+        )
+
+
+class SOAP(SOAPBase):
     """
     SOAP
 
@@ -609,8 +632,6 @@ class SOAP(C.BaseOpt):
             https://arxiv.org/abs/2409.11321
             https://github.com/nikhilvyas/SOAP
     """
-
-    use_precond_schedule: bool = False
 
     def __init__(
         self,
@@ -644,30 +665,10 @@ class SOAP(C.BaseOpt):
         param_ecc: str | None = None,
         **kwargs,
     ):
-        use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
-
-        params, defaults = C._build_defaults(locals())
-
-        if use_precond_schedule:
-            del defaults["precondition_frequency"]
-            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
-        else:
-            del defaults["precond_scheduler"]
-            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            palm,  #
-            fns=(C.scale_by_soap,),
-        )
+        self._build_soap_defaults(locals(), fns=(C.scale_by_soap,))
 
 
-class SOAPNAdam(C.BaseOpt):
-    use_precond_schedule: bool = False
-
+class SOAPNAdam(SOAPBase):
     def __init__(
         self,
         params,
@@ -702,30 +703,10 @@ class SOAPNAdam(C.BaseOpt):
         param_ecc: str | None = None,
         **kwargs,
     ):
-        use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
-
-        params, defaults = C._build_defaults(locals())
-
-        if use_precond_schedule:
-            del defaults["precondition_frequency"]
-            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
-        else:
-            del defaults["precond_scheduler"]
-            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            palm,
-            fns=(C.scale_by_soap_nadam,),
-        )
+        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_nadam,))
 
 
-class SOAPAdEMAMix(C.BaseOpt):
-    use_precond_schedule: bool = False
-
+class SOAPAdEMAMix(SOAPBase):
     def __init__(
         self,
         params,
@@ -761,25 +742,7 @@ class SOAPAdEMAMix(C.BaseOpt):
         param_ecc: str | None = None,
         **kwargs,
     ):
-        use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
-
-        params, defaults = C._build_defaults(locals())
-
-        if use_precond_schedule:
-            del defaults["precondition_frequency"]
-            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
-        else:
-            del defaults["precond_scheduler"]
-            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            palm,
-            fns=(C.scale_by_soap_ademamix,),
-        )
+        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_ademamix,))
 
 
 class SignLaProp(C.BaseOpt):
@@ -818,7 +781,7 @@ class SignLaProp(C.BaseOpt):
         )
 
 
-class SOLP(C.BaseOpt):
+class SOLP(SOAPBase):
     """
     SOLP
 
@@ -829,8 +792,6 @@ class SOLP(C.BaseOpt):
             https://arxiv.org/abs/2409.11321
             https://github.com/nikhilvyas/SOAP
     """
-
-    use_precond_schedule: bool = False
 
     def __init__(
         self,
@@ -863,25 +824,7 @@ class SOLP(C.BaseOpt):
         param_ecc: str | None = None,
         **kwargs,
     ):
-        use_precond_schedule = C.default(use_precond_schedule, self.use_precond_schedule)
-
-        params, defaults = C._build_defaults(locals())
-
-        if use_precond_schedule:
-            del defaults["precondition_frequency"]
-            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
-        else:
-            del defaults["precond_scheduler"]
-            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            palm,  #
-            fns=(C.scale_by_soap_laprop,),
-        )
+        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_laprop,))
 
 
 class OrthoLaProp(C.BaseOpt):
@@ -956,7 +899,37 @@ class LaPropOrtho(C.BaseOpt):
         )
 
 
-class PSGDKron(C.BaseOpt):
+class PSGDBase(C.BaseOpt):
+    delayed: bool = False
+    cached: bool = False
+    exp_avg_input: bool = True
+
+    def _build_psgd_defaults(self, locals_dict, fns, *, default_update_clipping=utils.trust_region_clip_, extra_defaults=None):
+        exp_avg_input = C.default(locals_dict.get("exp_avg_input", C.use_default), self.exp_avg_input)
+        update_clipping = C.default(locals_dict["update_clipping"], default_update_clipping)
+
+        locals_dict = {**locals_dict, "exp_avg_input": exp_avg_input, "update_clipping": update_clipping}
+        params, defaults = C._build_defaults(locals_dict)
+
+        self.precond_schedule = C.default(
+            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
+        )
+
+        if extra_defaults:
+            defaults.update(extra_defaults)
+
+        super().__init__(
+            params,
+            defaults,
+            locals_dict["multi_tensor"],
+            locals_dict["gradient_clipping"],
+            update_clipping,
+            False,
+            fns=(*(C.exp_avg,) * exp_avg_input, *fns),
+        )
+
+
+class PSGDKron(PSGDBase):
     """
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
@@ -1016,30 +989,13 @@ class PSGDKron(C.BaseOpt):
     ):
         delayed = C.default(delayed, self.delayed)
         cached = C.default(cached, self.cached)
-        exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        update_clipping = C.default(update_clipping, utils.trust_region_clip_)
-
-        params, defaults = C._build_defaults(locals())
-
-        self.precond_schedule = C.default(
-            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
-        )
-
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            False,  #
-            fns=(
-                *(C.exp_avg,) * exp_avg_input,
-                functools.partial(C.scale_by_delayed_psgd if delayed else C.scale_by_psgd, cached=cached),
-            ),
+        self._build_psgd_defaults(
+            locals(),
+            fns=(functools.partial(C.scale_by_delayed_psgd if delayed else C.scale_by_psgd, cached=cached),),
         )
 
 
-class PSGDPRO(C.BaseOpt):
+class PSGDPRO(PSGDBase):
     """
     PSGD with Q0.5EQ1.5 (PRO/Procrustes) preconditioner update.
     Solve-free alternative to standard PSGD-Kron (EQ method).
@@ -1089,31 +1045,15 @@ class PSGDPRO(C.BaseOpt):
         **kwargs,
     ):
         cached = C.default(cached, self.cached)
-        exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        update_clipping = C.default(update_clipping, None)
-
-        params, defaults = C._build_defaults(locals())
-        defaults["store_triu_as_line"] = False
-
-        self.precond_schedule = C.default(
-            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
-        )
-
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            False,
-            fns=(
-                *(C.exp_avg,) * exp_avg_input,
-                functools.partial(C.scale_by_psgd_pro, cached=cached),
-            ),
+        self._build_psgd_defaults(
+            locals(),
+            fns=(functools.partial(C.scale_by_psgd_pro, cached=cached),),
+            default_update_clipping=None,
+            extra_defaults={"store_triu_as_line": False},
         )
 
 
-class PSGDLRA(C.BaseOpt):
+class PSGDLRA(PSGDBase):
     """
     Originally from Evan Walters and Omead Pooladzandi, 2024
     Modified under Creative Commons Attribution 4.0 International
@@ -1164,31 +1104,18 @@ class PSGDLRA(C.BaseOpt):
         **kwargs,
     ):
         delayed = C.default(delayed, self.delayed)
-        exp_avg_input = C.default(exp_avg_input, self.exp_avg_input)
-        update_clipping = C.default(update_clipping, utils.trust_region_clip_)
-
-        params, defaults = C._build_defaults(locals())
-
-        self.precond_schedule = C.default(
-            defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
-        )
 
         if rank is None:
             utils.warn_once(
                 f"{rank=}. It will be set to log2(param_count). This requires `params` to be of type list. Currently, {type(params)=}"
             )
             params = list(params)
-            defaults["rank"] = max(1, round(math.log2(sum(p.numel() for p in params))))
-            utils.warn_once(f"rank was set to {defaults['rank']}")
+            rank = max(1, round(math.log2(sum(p.numel() for p in params))))
+            utils.warn_once(f"rank was set to {rank}")
 
-        super().__init__(
-            params,
-            defaults,
-            multi_tensor,
-            gradient_clipping,
-            update_clipping,
-            False,  #
-            fns=(*(C.exp_avg,) * exp_avg_input, C.scale_by_delayed_psgd_lra if delayed else C.scale_by_psgd_lra),
+        self._build_psgd_defaults(
+            locals(),
+            fns=(C.scale_by_delayed_psgd_lra if delayed else C.scale_by_psgd_lra,),
         )
 
 
@@ -1288,4 +1215,5 @@ class SAMWrapper(torch.optim.Optimizer):
 
 
 capture_param_shapes = utils.capture_param_shapes
-__all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer)]
+_BASE_CLASSES = {SOAPBase, PSGDBase}
+__all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer) and v not in _BASE_CLASSES]

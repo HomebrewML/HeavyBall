@@ -1,24 +1,63 @@
 #!/usr/bin/env python3
 """
-Utility to migrate HeavyBall 1.x optimizer state dicts to the 2.0.0 layout.
+Utility to migrate HeavyBall optimizer state dicts to the current (3.x) layout.
 
-The script rewrites per-parameter state keys to the new transform-indexed names,
-reshapes state storage so each parameter-view owns its own dictionary, and
-injects the HeavyBall-specific metadata block expected by 2.0.0 optimizers.
+Supports two migration paths:
+- 1.x → 3.x: rewrites per-parameter state keys, reshapes storage, fixes param groups and metadata
+- 2.x → 3.x: renames foreach→multi_tensor in param groups, strips stale metadata
+
+Version auto-detection:
+- 1.x: flat per-parameter state (not nested by view index)
+- 2.x: nested state with 'foreach' in param groups
+- 3.x: nested state with 'multi_tensor' in param groups (already current)
 """
 
 from __future__ import annotations
 
 import functools
 import importlib
-import pickle
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import typer
+
+_CLASS_RENAMES = {
+    "ForeachAdamW": "AdamW",
+    "ForeachNAdam": "NAdam",
+    "ForeachAdEMAMix": "AdEMAMix",
+    "ForeachAdamC": "AdamC",
+    "ForeachRMSprop": "RMSprop",
+    "ForeachSFAdamW": "SFAdamW",
+    "ForeachADOPT": "ADOPT",
+    "ForeachMuon": "Muon",
+    "ForeachLaProp": "LaProp",
+    "ForeachSOAP": "SOAP",
+    "ForeachSOAPNAdam": "SOAPNAdam",
+    "ForeachSOAPAdEMAMix": "SOAPAdEMAMix",
+    "ForeachSignLaProp": "SignLaProp",
+    "ForeachSOLP": "SOLP",
+    "ForeachPSGDKron": "PSGDKron",
+    "ForeachPSGDLRA": "PSGDLRA",
+    # Deleted subclasses → parent (all were __init__-only default overrides)
+    "PaLMForeachSFAdamW": "SFAdamW",
+    "PaLMForeachSOAP": "SOAP",
+    "PrecondScheduleForeachSOAP": "SOAP",
+    "PrecondSchedulePaLMForeachSOAP": "SOAP",
+    "ForeachPurePSGD": "PSGDKron",
+    "ForeachCachedPSGDKron": "PSGDKron",
+    "ForeachCachedDelayedPSGDKron": "PSGDKron",
+    "ForeachDelayedPSGD": "PSGDKron",
+    "ForeachCachedNewtonPSGD": "PSGDKron",
+    "NewtonHybrid2PSGDKron": "PSGDKron",
+    "ForeachDelayedPSGDLRA": "PSGDLRA",
+    "ForeachNewtonPSGDLRA": "PSGDLRA",
+    "NewtonHybrid2PSGDLRA": "PSGDLRA",
+}
+
+_REMOVED_GROUP_KEYS = frozenset({"stochastic_schedule"})
+_REMOVED_META_KEYS = frozenset({"stochastic_schedule", "precond_rng"})
 
 
 @dataclass
@@ -28,16 +67,37 @@ class TransformMapping:
     transform_idx: int
 
 
+def _resolve_class_name(class_name: str) -> str:
+    return _CLASS_RENAMES.get(class_name, class_name)
+
+
 def _load_optimizer_class(qualified_name: str):
     if "." in qualified_name:
         module_name, class_name = qualified_name.rsplit(".", 1)
     else:
         module_name, class_name = "heavyball", qualified_name
+    class_name = _resolve_class_name(class_name)
     module = importlib.import_module(module_name)
     try:
         return getattr(module, class_name)
     except AttributeError as exc:
-        raise ValueError(f"Optimizer class '{qualified_name}' not found") from exc
+        raise ValueError(f"Optimizer class '{module_name}.{class_name}' not found") from exc
+
+
+def _detect_version(state_dict: Dict[str, Any]) -> int:
+    nested = False
+    for entry in state_dict.get("state", {}).values():
+        if isinstance(entry, dict):
+            nested = any(isinstance(v, dict) for v in entry.values())
+            if not nested:
+                return 1
+            break
+
+    groups = state_dict.get("param_groups", [])
+    has_multi_tensor = any(isinstance(g, dict) and "multi_tensor" in g for g in groups)
+    if nested:
+        return 3 if has_multi_tensor else 2
+    return 3 if has_multi_tensor else 1
 
 
 def _guess_tensor_meta(state_entry: Dict[str, Any]) -> Tuple[Tuple[int, ...], torch.dtype]:
@@ -69,8 +129,9 @@ def _build_dummy_parameters(state: Dict[int, Dict[str, Any]], param_groups: Sequ
 def _normalise_group_options(group: Dict[str, Any]) -> Dict[str, Any]:
     options: Dict[str, Any] = {}
     for key, value in group.items():
-        if key == "params":
+        if key == "params" or key in _REMOVED_GROUP_KEYS:
             continue
+        key = "multi_tensor" if key == "foreach" else key
         if isinstance(value, list) and key in {"betas", "weight_decay_steps"}:
             options[key] = tuple(value)
         else:
@@ -107,6 +168,12 @@ def _collect_transform_mappings(optimizer) -> List[TransformMapping]:
             elif isinstance(current, C.Parallel):
                 for branch in current.branches:
                     stack.extend(branch)
+            elif isinstance(current, C.Route):
+                for _, fns in current.routes:
+                    if fns:
+                        stack.extend(fns)
+                if current.default:
+                    stack.extend(current.default)
             elif isinstance(current, (list, tuple)):
                 stack.extend(current)
 
@@ -180,7 +247,24 @@ def _migrate_single_state(entry: Dict[str, Any], mappings: List[TransformMapping
     return migrated
 
 
-def migrate_state_dict(old_state: Dict[str, Any], optimizer_class: str) -> Dict[str, Any]:
+def _migrate_v2_to_v3(state_dict: Dict[str, Any]) -> None:
+    for group in state_dict.get("param_groups", []):
+        if not isinstance(group, dict):
+            continue
+        if "foreach" in group:
+            group["multi_tensor"] = group.pop("foreach")
+        for key in _REMOVED_GROUP_KEYS:
+            group.pop(key, None)
+
+    hb = state_dict.get("heavyball", {})
+    for key in _REMOVED_META_KEYS:
+        hb.pop(key, None)
+    inner = hb.get("inner_group", {})
+    for key in _REMOVED_META_KEYS:
+        inner.pop(key, None)
+
+
+def _migrate_v1_state(old_state: Dict[str, Any], optimizer_class: str) -> Dict[str, Any]:
     opt_cls = _load_optimizer_class(optimizer_class)
     optimizer, _ = _instantiate_optimizer(opt_cls, old_state)
     template = optimizer.state_dict()
@@ -199,11 +283,19 @@ def migrate_state_dict(old_state: Dict[str, Any], optimizer_class: str) -> Dict[
 
     heavyball_meta = migrated.setdefault("heavyball", template.get("heavyball", {}))
     if "inner_group" not in heavyball_meta:
-        heavyball_meta["inner_group"] = {"stochastic_schedule": None}
-    if "stochastic_schedule" not in heavyball_meta:
-        heavyball_meta["stochastic_schedule"] = None
-    if "precond_rng" not in heavyball_meta:
-        heavyball_meta["precond_rng"] = pickle.dumps(random.Random(0x12312))
+        heavyball_meta["inner_group"] = {}
+    return migrated
+
+
+def migrate_state_dict(old_state: Dict[str, Any], optimizer_class: str) -> Dict[str, Any]:
+    version = _detect_version(old_state)
+    if version == 1:
+        migrated = _migrate_v1_state(old_state, optimizer_class)
+    elif version == 2:
+        migrated = dict(old_state)
+    else:
+        return dict(old_state)
+    _migrate_v2_to_v3(migrated)
     return migrated
 
 
@@ -221,7 +313,7 @@ def _resolve_state_container(root: Dict[str, Any], key_path: Sequence[str]) -> D
 app = typer.Typer(help="Utilities for migrating HeavyBall optimizer checkpoints.")
 
 
-@app.command(help="Migrate a HeavyBall optimizer state dict to the 2.0.0 layout.")
+@app.command(help="Migrate a HeavyBall optimizer state dict to the current (3.x) layout.")
 def migrate(
     checkpoint: Path = typer.Argument(
         ...,
@@ -234,7 +326,7 @@ def migrate(
     ),
     optimizer_class: str = typer.Argument(
         ...,
-        help="Optimizer class to instantiate (e.g., heavyball.AdamW)",
+        help="Optimizer class name (e.g., heavyball.AdamW). Old names like ForeachAdamW are resolved automatically.",
     ),
     state_key: str = typer.Option(
         "optimizer",
