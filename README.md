@@ -204,10 +204,11 @@ HeavyBall includes a diagnostic benchmark suite via [LightBench](https://github.
 for silent optimizer failures across difficulty levels. Results and methodology are documented
 in [docs/benchmark.md](docs/benchmark.md).
 
-## Migrating from 1.x
+## Migrating
 
-See the [2.0.0 migration notes](docs/heavyball2.md) for a full checklist, and `scripts/migrate_optimizer_state.py` for
-checkpoint conversion.
+**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes, removed kwargs, and checkpoint conversion.
+
+**From 1.x** See the [2.0.0 migration notes](docs/heavyball2.md), then follow the 3.0.0 guide.
 
 ## Contributing
 

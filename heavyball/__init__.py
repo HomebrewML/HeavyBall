@@ -30,7 +30,7 @@ class SGD(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.heavyball_momentum,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.heavyball_momentum,))
 
 
 class AdamW(C.BaseOpt):
@@ -58,7 +58,7 @@ class AdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adam,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_adam,))
 
 
 class NAdam(C.BaseOpt):
@@ -88,7 +88,7 @@ class NAdam(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_nadam,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_nadam,))
 
 
 class AdEMAMix(C.BaseOpt):
@@ -120,7 +120,7 @@ class AdEMAMix(C.BaseOpt):
             raise ValueError("AdEMAMix expects betas with three coefficients.")
 
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
 
 
 class UnscaledAdamW(C.BaseOpt):
@@ -149,7 +149,7 @@ class UnscaledAdamW(C.BaseOpt):
     ):
         params, defaults = C._build_defaults(locals())
         super().__init__(
-            params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
+            params, defaults, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
         )
 
 
@@ -179,7 +179,7 @@ class SUDSAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.scale_by_suds,))
 
 
 class Scion(C.BaseOpt):
@@ -222,7 +222,7 @@ class Scion(C.BaseOpt):
         defaults.pop("momentum", None)
 
         super().__init__(
-            params, defaults, multi_tensor, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
+            params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
         )
 
 
@@ -258,7 +258,7 @@ class AdamC(C.BaseOpt):
             max_lr = lr
 
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
 
 
 class RMSprop(C.BaseOpt):
@@ -295,7 +295,6 @@ class RMSprop(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -331,7 +330,6 @@ class HyperBallAdamW(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -372,7 +370,6 @@ class MuonAdamW(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -413,7 +410,6 @@ class SFAdamW(C.ScheduleFree):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -452,7 +448,6 @@ class MSAMLaProp(C.MSAM):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -485,7 +480,7 @@ class ADOPT(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_adopt,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_adopt,))
 
 
 class Muon(C.BaseOpt):
@@ -526,7 +521,6 @@ class Muon(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -559,7 +553,7 @@ class LaProp(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(params, defaults, multi_tensor, gradient_clipping, update_clipping, palm, fns=(C.update_by_laprop,))
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_laprop,))
 
 
 class MuonLaProp(C.BaseOpt):
@@ -590,7 +584,6 @@ class MuonLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -613,7 +606,6 @@ class SOAPBase(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            locals_dict["multi_tensor"],
             locals_dict["gradient_clipping"],
             locals_dict["update_clipping"],
             locals_dict.get("palm", False),
@@ -773,7 +765,6 @@ class SignLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -855,7 +846,6 @@ class OrthoLaProp(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -891,7 +881,6 @@ class LaPropOrtho(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            multi_tensor,
             gradient_clipping,
             update_clipping,
             palm,
@@ -921,7 +910,6 @@ class PSGDBase(C.BaseOpt):
         super().__init__(
             params,
             defaults,
-            locals_dict["multi_tensor"],
             locals_dict["gradient_clipping"],
             update_clipping,
             False,
@@ -1139,7 +1127,7 @@ class SplitOpt(utils.StatefulOptimizer):
                 all_params.extend(params)
         if not self.optimizers:
             raise ValueError("No optimizers created")
-        super().__init__(all_params, {}, multi_tensor=True)
+        super().__init__(all_params, {"multi_tensor": True})
 
     def _step(self, group):
         pass

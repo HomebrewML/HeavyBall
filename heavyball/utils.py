@@ -1306,13 +1306,14 @@ class StatefulOptimizer(torch.optim.Optimizer):
         "hessian_approx",
     )
 
-    def __init__(self, params, defaults, multi_tensor: bool = True, use_ema: bool = False):
+    def __init__(self, params, defaults, use_ema: bool = False):
         for attr in self._INSTANCE_ATTRS:
             if attr in defaults:
                 val = defaults.pop(attr)
                 if val is not use_default:
                     setattr(self, attr, val)
-        super().__init__(params, {**defaults, "multi_tensor": multi_tensor})
+        defaults.setdefault("multi_tensor", True)
+        super().__init__(params, defaults)
         self.use_ema = use_ema
         self.mapping = {}
         self.mapping_inverse = {}

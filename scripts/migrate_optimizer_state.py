@@ -24,6 +24,7 @@ import torch
 import typer
 
 _CLASS_RENAMES = {
+    # Foreach* internal names → canonical 3.x names
     "ForeachAdamW": "AdamW",
     "ForeachNAdam": "NAdam",
     "ForeachAdEMAMix": "AdEMAMix",
@@ -54,6 +55,19 @@ _CLASS_RENAMES = {
     "ForeachDelayedPSGDLRA": "PSGDLRA",
     "ForeachNewtonPSGDLRA": "PSGDLRA",
     "NewtonHybrid2PSGDLRA": "PSGDLRA",
+    # 2.x public aliases that pointed to Foreach* classes (now removed)
+    "PaLMSOAP": "SOAP",
+    "PaLMSFAdamW": "SFAdamW",
+    "PalmForEachSoap": "SOAP",
+    "PrecondScheduleSOAP": "SOAP",
+    "PrecondSchedulePaLMSOAP": "SOAP",
+    "PurePSGD": "PSGDKron",
+    "DelayedPSGD": "PSGDKron",
+    "CachedPSGDKron": "PSGDKron",
+    "CachedDelayedPSGDKron": "PSGDKron",
+    "NewtonPSGDKron": "PSGDKron",
+    "DelayedPSGDLRA": "PSGDLRA",
+    "NewtonPSGDLRA": "PSGDLRA",
 }
 
 _REMOVED_GROUP_KEYS = frozenset({"stochastic_schedule"})

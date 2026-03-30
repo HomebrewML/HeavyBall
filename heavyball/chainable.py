@@ -2,6 +2,7 @@ import contextlib
 import copy
 import functools
 import math
+import warnings
 from collections.abc import Iterable as _Iterable
 from typing import Iterable, List, Literal, Optional, Union
 
@@ -180,12 +181,34 @@ def _storage_dtype(group):
 
 _PASSTHROUGH_KWARGS = {"orig_shapes"}
 
+_RENAMED_KWARGS = {"foreach": "multi_tensor"}
+
+_REMOVED_KWARGS = frozenset({
+    "stochastic_schedule",
+    "normalize_grads",
+    "correct_bias",
+    "inverse_free",
+    "adaptive",
+})
+
 
 def _build_defaults(locals_dict):
     d = locals_dict.copy()
     d.pop("self")
     params = d.pop("params")
     kwargs = d.pop("kwargs")
+
+    for old, new in _RENAMED_KWARGS.items():
+        if old in kwargs:
+            warnings.warn(f"'{old}' was renamed to '{new}' in HeavyBall 3.0. "
+                          f"Pass '{new}' instead.", FutureWarning, stacklevel=4)
+            d[new] = kwargs.pop(old)
+
+    hit = _REMOVED_KWARGS & kwargs.keys()
+    if hit:
+        raise TypeError(f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. "
+                        f"See docs/heavyball3.md for migration details.")
+
     d.update(kwargs)
     unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
     if unknown:
@@ -1725,14 +1748,14 @@ class ChainOpt(utils.StatefulOptimizer):
         "eps": 1e-8,
     }
 
-    def __init__(self, params, defaults, multi_tensor: bool, *fns):
+    def __init__(self, params, defaults, *fns):
         orig = defaults.pop("orig_shapes", None)
         self._orig_shapes = (
             {k: _ShapeInfo(v) if isinstance(v, tuple) else v for k, v in orig.items()} if orig is not None else None
         )
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
-        super().__init__(params, base, multi_tensor)
+        super().__init__(params, base)
         self.fns = fns
         self._eager_chain = self._run_chain
         if self.compile_step:
@@ -1993,7 +2016,6 @@ class BaseOpt(ChainOpt):
         self,
         params,
         defaults,
-        multi_tensor: bool = True,
         gradient_clipping: str_or_fn = None,
         update_clipping: str_or_fn = None,
         palm: bool = use_default,
@@ -2041,7 +2063,7 @@ class BaseOpt(ChainOpt):
         if default(update_clipping, self.update_clipping) is not None:
             fns = fns + (apply_to_idx(update_clipping, 2),)
 
-        super().__init__(params, defaults, multi_tensor, *fns)
+        super().__init__(params, defaults, *fns)
 
 
 class ScheduleFree(BaseOpt):
