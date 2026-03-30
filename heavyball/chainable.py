@@ -277,45 +277,50 @@ class ZeroGuard(FunctionTransform):
 class PrecondGradAccumGuard(FunctionTransform):
     def __init__(self, fn):
         super().__init__(fn, ["precond_grad_accum"])
-        self.steps_taken = 0
-        self.pass_through = None
+        self.steps_taken_key = None
 
-    def _accum(self, state, new):
-        self.steps_taken += 1
+    def _build_val_names(self):
+        super()._build_val_names()
+        self.steps_taken_key = f"_{self.fn_name}_steps_taken_{self.transform_idx}"
+
+    def _accum(self, group, state, new):
+        group[self.steps_taken_key] = group.get(self.steps_taken_key, 0) + 1
         utils.stochastic_add_(state, new)
 
-    def _reset(self, state):
-        if self.steps_taken != 0:
-            self.steps_taken = 0
+    def _reset(self, group, state):
+        if group.get(self.steps_taken_key, 0) != 0:
+            group[self.steps_taken_key] = 0
             utils.zero_(state)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
-        if self.pass_through is None:
-            self.pass_through = not group.get("precond_grad_accum", False)
-        if self.pass_through is False:
-            for name in self.names:
-                _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
+        if not group.get("precond_grad_accum", False):
+            return
+        for name in self.names:
+            _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         base_grad = update if group.get("momentum_into_precond_update", True) else grad
-        if self.pass_through:
+        if not group.get("precond_grad_accum", False):
             return self.fn(state, group, update, grad, param, *args, base_grad, **kwargs)
 
         (vars,) = vars
+        steps_taken = group.get(self.steps_taken_key, 0)
+        accum_state = None
         if group["is_preconditioning"]:
-            if self.steps_taken:
-                self._accum(vars, base_grad)
-                utils.stochastic_multiply_(vars, 1 / self.steps_taken)
+            if steps_taken:
+                self._accum(group, vars, base_grad)
+                utils.stochastic_multiply_(vars, 1 / group[self.steps_taken_key])
+                accum_state = vars
             else:
                 vars = base_grad
         else:
-            self._accum(vars, base_grad)
+            self._accum(group, vars, base_grad)
             vars = base_grad
         try:
             out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
         finally:
-            if group["is_preconditioning"]:
-                self._reset(vars)
+            if accum_state is not None:
+                self._reset(group, accum_state)
 
         return out
 
@@ -1481,6 +1486,12 @@ def palm_beta2(state, group, update, grad, param):
 
 
 def apply_to_idx(fn, idx):
+    name = fn
+    if isinstance(fn, str):
+        fn = getattr(utils, fn, None)
+        if fn is None or not callable(fn):
+            raise ValueError(f"Unknown function '{name}'")
+
     def _fn(state, group, update, grad, param):
         args = [state, group, update, grad, param]
         return fn(args[idx])
@@ -1859,15 +1870,26 @@ class ChainOpt(utils.StatefulOptimizer):
             return
         p, g = zip(*vals)
 
-        for param in p:
-            state = self.state_(param)
-            step = state.get("step", 0)
-            if not isinstance(step, torch.Tensor):
-                step = torch.tensor(step, dtype=torch.int64, device=param.device)
-                state["step"] = step
-            break
-
-        group["step"] = state["step"] = step = step + 1
+        step = group.get("_group_step")
+        if step is None:
+            for param in group["params"]:
+                param_state = self.state.get(param)
+                if not isinstance(param_state, dict):
+                    continue
+                for idx_state in param_state.values():
+                    if isinstance(idx_state, dict) and "step" in idx_state:
+                        step = idx_state["step"]
+                        break
+                if step is not None:
+                    break
+            else:
+                step = 0
+        if isinstance(step, torch.Tensor):
+            step = step.to(device=p[0].device, dtype=torch.int64)
+        else:
+            step = torch.tensor(step, dtype=torch.int64, device=p[0].device)
+        group["_group_step"] = group["step"] = step = step + 1
+        self.state_(p[0])["step"] = step
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / max(step, group["warmup_steps"] + 1)
 
         if not group["multi_tensor"] or len(p) == 1:
@@ -2024,55 +2046,44 @@ class BaseOpt(ChainOpt):
 
 class ScheduleFree(BaseOpt):
     def eval(self):
-        z_key = self._find_val_name("z")
-        for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode", True)
-            beta1 = utils.get_beta1(group)
-            if beta1 > 0 and not train_mode:
-                for p in group["params"]:
-                    state = self.state_(p)
-                    if z_key in state:
-                        z = utils.promote(state[z_key])
-                        p32 = utils.promote(p.data)
-                        p32.lerp_(end=z, weight=1 - 1 / beta1)
-                        utils.copy_stochastic_(p.data, p32)
+        return self.train(False)
 
-    def train(self):
+    def train(self, mode: bool = True):
         z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode", False)
+            train_mode = group.get("train_mode", True)
+            if train_mode == mode:
+                continue
+            group["train_mode"] = mode
             beta1 = utils.get_beta1(group)
-            if beta1 > 0 and train_mode:
-                for p in group["params"]:
-                    state = self.state_(p)
-                    if z_key in state:
-                        z = utils.promote(state[z_key])
-                        p32 = utils.promote(p.data)
-                        p32.lerp_(end=z, weight=1 - beta1)
-                        utils.copy_stochastic_(p.data, p32)
+            if beta1 <= 0:
+                continue
+            weight = 1 - beta1 if mode else 1 - 1 / beta1
+            for p in group["params"]:
+                state = self.state_(p)
+                if z_key in state:
+                    z = utils.promote(state[z_key])
+                    p32 = utils.promote(p.data)
+                    p32.lerp_(end=z, weight=weight)
+                    utils.copy_stochastic_(p.data, p32)
+        return self
 
 
 class MSAM(BaseOpt):
     def eval(self):
-        z_key = self._find_val_name("z")
-        for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode", True)
-            if not train_mode:
-                for p in group["params"]:
-                    state = self.state_(p)
-                    if z_key in state:
-                        p_copy = p.data.clone()
-                        utils.copy_stochastic_(p.data, state[z_key])
-                        utils.copy_stochastic_(state[z_key], p_copy)
+        return self.train(False)
 
-    def train(self):
+    def train(self, mode: bool = True):
         z_key = self._find_val_name("z")
         for group in self.param_groups:
-            group["train_mode"] = train_mode = not group.get("train_mode", False)
-            if train_mode:
-                for p in group["params"]:
-                    state = self.state_(p)
-                    if z_key in state:
-                        p_copy = p.data.clone()
-                        utils.copy_stochastic_(p.data, state[z_key])
-                        utils.copy_stochastic_(state[z_key], p_copy)
+            train_mode = group.get("train_mode", True)
+            if train_mode == mode:
+                continue
+            group["train_mode"] = mode
+            for p in group["params"]:
+                state = self.state_(p)
+                if z_key in state:
+                    p_copy = p.data.clone()
+                    utils.copy_stochastic_(p.data, state[z_key])
+                    utils.copy_stochastic_(state[z_key], p_copy)
+        return self

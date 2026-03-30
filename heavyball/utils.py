@@ -1590,6 +1590,19 @@ class StatefulOptimizer(torch.optim.Optimizer):
         self._fallback_enabled = True
         return self._handle_closure(closure)
 
+    def _cleanup_temporary_tensors(self):
+        for real, views in self.mapping.items():
+            fmt = getattr(real, "_restore_memory_format", None)
+            if fmt is not None:
+                del self.mapping_inverse[_tensor_key(real)]
+                real.data = real.data.to(memory_format=fmt)
+                self.mapping_inverse[_tensor_key(real)] = (real, 0)
+                del real._restore_memory_format
+            for tensor in (real, *views):
+                for key in ("grad", "vector", "hessian_vector", "orig"):
+                    if hasattr(tensor, key):
+                        setattr(tensor, key, None)
+
     def step(self, closure: Optional[Callable] = None):
         if self.precond_schedule is None:
             self._is_preconditioning = False
@@ -1601,22 +1614,14 @@ class StatefulOptimizer(torch.optim.Optimizer):
             self.ema_update()
         # we assume that parameters are constant and that there are no excessive recompiles
         with torch.no_grad(), torch._dynamo.utils.disable_cache_limit():
-            for group in self.param_groups:
-                if "param_count" not in group:
-                    group["param_count"] = sum(p.numel() for p in group["params"])
-                group["is_preconditioning"] = self._is_preconditioning
-                self._step(group)
-                for real, views in self.mapping.items():
-                    fmt = getattr(real, "_restore_memory_format", None)
-                    if fmt is not None:
-                        del self.mapping_inverse[_tensor_key(real)]
-                        real.data = real.data.to(memory_format=fmt)
-                        self.mapping_inverse[_tensor_key(real)] = (real, 0)
-                        del real._restore_memory_format
-                    for tensor in (real, *views):
-                        for key in ("grad", "vector", "hessian_vector", "orig"):
-                            if hasattr(tensor, key):
-                                setattr(tensor, key, None)
+            try:
+                for group in self.param_groups:
+                    if "param_count" not in group:
+                        group["param_count"] = sum(p.numel() for p in group["params"])
+                    group["is_preconditioning"] = self._is_preconditioning
+                    self._step(group)
+            finally:
+                self._cleanup_temporary_tensors()
         return loss
 
 
