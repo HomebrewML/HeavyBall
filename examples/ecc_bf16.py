@@ -19,11 +19,11 @@ LOG_EVERY = 500
 CONFIGS = {
     "naive_fp32": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
     "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
-    "heavyball_fp32": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
-    "heavyball_bf16": lambda p: heavyball.ForeachAdamW(
+    "heavyball_fp32": lambda p: heavyball.AdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
+    "heavyball_bf16": lambda p: heavyball.AdamW(
         p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, storage_dtype="bfloat16"
     ),
-    "ecc_bf16+8": lambda p: heavyball.ForeachAdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, ecc="bf16+8"),
+    "ecc_bf16+8": lambda p: heavyball.AdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, ecc="bf16+8"),
 }
 
 COLORS = {

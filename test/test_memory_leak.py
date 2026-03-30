@@ -34,7 +34,7 @@ class LayerNorm2dParam(nn.Module):
 
 
 def test_memory(
-    opt: str = "NewtonHybrid2PSGDKron",
+    opt: str = "PSGDKron",
     size: int = 64,
     depth: int = 2,
     mars: bool = False,

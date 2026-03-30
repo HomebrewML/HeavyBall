@@ -17,14 +17,13 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
-_EXTRA_KWARGS = {"ForeachAdamC": {"max_lr": 0.0025}}
+_EXTRA_KWARGS = {"AdamC": {"max_lr": 0.0025}}
 _MODEL_SEED = 42
 _DATA_SEED = 0xABCD
 
 # LRA builds one preconditioner over all grads, under FSDP each rank only has a subset
 _FSDP_SKIP = {
-    "ForeachPSGDLRA": "LRA preconditioner scope differs under FSDP",
-    "ForeachDelayedPSGDLRA": "LRA preconditioner scope differs under FSDP",
+    "PSGDLRA": "LRA preconditioner scope differs under FSDP",
 }
 
 # torch.compile(dynamic=False) specializes on list length → different kernels per rank
@@ -39,16 +38,14 @@ _SPLIT_OPTS = [n for n in REPRESENTATIVE_OPTS if n not in _FSDP_SKIP]
 _INTEGRATION_OPTS = [
     n
     for n in [
-        "ForeachAdamW",
-        "ForeachSOAP",
-        "ForeachMuon",
-        "ForeachPSGDKron",
-        "ForeachPurePSGD",
+        "AdamW",
+        "SOAP",
+        "Muon",
+        "PSGDKron",
         "Scion",
-        "ForeachLaProp",
+        "LaProp",
         "MuonLaProp",
-        "ForeachSOAPNAdam",
-        "ForeachCachedPSGDKron",
+        "SOAPNAdam",
     ]
     if n in REPRESENTATIVE_OPTS and n not in _FSDP_SKIP
 ]

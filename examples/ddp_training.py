@@ -2,8 +2,8 @@
 
 Launch with torchrun:
     torchrun --nproc_per_node=2 examples/ddp_training.py
-    torchrun --nproc_per_node=2 examples/ddp_training.py --opt ForeachSOAP
-    torchrun --nproc_per_node=2 examples/ddp_training.py --opt ForeachMuon --lr 0.01
+    torchrun --nproc_per_node=2 examples/ddp_training.py --opt SOAP
+    torchrun --nproc_per_node=2 examples/ddp_training.py --opt Muon --lr 0.01
 
 All HeavyBall optimizers work transparently with DDP
 """
@@ -38,7 +38,7 @@ def make_model():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opt", default="ForeachAdamW")
+    parser.add_argument("--opt", default="AdamW")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)

@@ -55,29 +55,25 @@ training, and SAM.
 <summary>Full list</summary>
 
 **First-order:**
-AdamW, NAdam, RMSprop, ADOPT, ForeachAdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, ForeachAdamC, SUDSAdamW
+AdamW, NAdam, RMSprop, ADOPT, AdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, AdamC, SUDSAdamW
 
 **Schedule-Free:**
-SFAdamW, PaLMSFAdamW
+SFAdamW
 
 Schedule-Free optimizers override `.eval()` and `.train()` to swap between training and evaluation parameter states.
 Call `opt.eval()` before validation and `opt.train()` before resuming training.
 
 **Orthogonal:**
-Muon, MuonLaProp, OrthoLaProp, LaPropOrtho
+Muon, MuonAdamW, MuonLaProp, HyperBallAdamW, OrthoLaProp, LaPropOrtho
 
 **Shampoo-based (SOAP):**
-SOAP, PaLMSOAP, PrecondScheduleSOAP, PrecondSchedulePaLMSOAP, SOAPNAdam, SOAPAdEMAMix, ForeachSOLP
+SOAP, SOAPNAdam, SOAPAdEMAMix, SOLP
 
 **PSGD (Kronecker):**
-PSGDKron, CachedPSGDKron, DelayedPSGD, CachedDelayedPSGDKron, PurePSGD, NewtonPSGDKron, NewtonHybrid2PSGDKron
-
-`Newton`-PSGD requires a closure passed to `step()`.
+PSGDKron, PSGDPRO
 
 **PSGD (Low-Rank):**
-PSGDLRA, DelayedPSGDLRA, NewtonPSGDLRA, NewtonHybrid2PSGDLRA
-
-`Newton`-PSGD requires a closure passed to `step()`.
+PSGDLRA
 
 **SAM:**
 SAMWrapper, MSAMLaProp
@@ -157,7 +153,7 @@ opt = SOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
 ## Building Custom Optimizers
 
 Every built-in optimizer is a chain of `FunctionTransform`s, an API also available for building custom optimizers.
-`Branch` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
+`Parallel` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
 updates.
 
 ```python
@@ -169,11 +165,11 @@ def graft(outputs, eps=1e-8):
 
 class GraftedAdam(C.BaseOpt):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, warmup_steps=0, foreach=True):
+                 weight_decay=0, warmup_steps=0, multi_tensor=True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         warmup_steps=warmup_steps)
-        branch = C.Branch(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
-        super().__init__(params, defaults, foreach, fns=(branch,))
+        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
+        super().__init__(params, defaults, multi_tensor, fns=(branch,))
 ```
 
 Custom optimizers that inherit from `BaseOpt` get ECC, MARS, caution, clipping, warmup, and stochastic rounding
@@ -208,10 +204,11 @@ HeavyBall includes a diagnostic benchmark suite via [LightBench](https://github.
 for silent optimizer failures across difficulty levels. Results and methodology are documented
 in [docs/benchmark.md](docs/benchmark.md).
 
-## Migrating from 1.x
+## Migrating
 
-See the [2.0.0 migration notes](docs/heavyball2.md) for a full checklist, and `scripts/migrate_optimizer_state.py` for
-checkpoint conversion.
+**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes, removed kwargs, and checkpoint conversion.
+
+**From 1.x** See the [2.0.0 migration notes](docs/heavyball2.md), then follow the 3.0.0 guide.
 
 ## Contributing
 

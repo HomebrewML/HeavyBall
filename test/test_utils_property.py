@@ -22,6 +22,9 @@ from heavyball.utils import (
 
 # Ensure torch.compile stays disabled on CPU-only CI runners.
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+from torch._dynamo import config
+
+config.cache_size_limit = 128
 
 
 heavyball.utils.compile_mode = None

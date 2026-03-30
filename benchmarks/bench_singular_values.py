@@ -113,7 +113,7 @@ def print_pareto(rows):
                 f"{key[0]:<8} {key[1]:<5} {key[2]:>3}  {min(rerrs):>10.6f}  {max(rerrs):>10.6f}  {errs:>6}  {len(items):>5}"
             )
         else:
-            print(f"{key[0]:<8} {key[1]:<5} {key[2]:>3}  {'—':>10}  {'—':>10}  {errs:>6}  {len(items):>5}")
+            print(f"{key[0]:<8} {key[1]:<5} {key[2]:>3}  {'-':>10}  {'-':>10}  {errs:>6}  {len(items):>5}")
 
 
 def main():

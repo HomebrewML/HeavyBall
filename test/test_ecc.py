@@ -14,13 +14,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 ULP_MODES = ["bf16+8", "bf16+16", "fp16+8", "fp16+16"]
 
 _OPTIMIZERS = [
-    (heavyball.ForeachAdamW, 5e-2, {}),
-    (heavyball.ForeachADOPT, 5e-2, {}),
-    (heavyball.ForeachNAdam, 1e-2, {}),
-    (heavyball.ForeachLaProp, 5e-2, {}),
-    (heavyball.ForeachAdEMAMix, 5e-2, {"betas": (0.9, 0.999, 0.9999)}),
-    (heavyball.ForeachRMSprop, 1e-2, {}),
-    (heavyball.PaLMForeachSFAdamW, 1e-2, {}),
+    (heavyball.AdamW, 5e-2, {}),
+    (heavyball.ADOPT, 5e-2, {}),
+    (heavyball.NAdam, 1e-2, {}),
+    (heavyball.LaProp, 5e-2, {}),
+    (heavyball.AdEMAMix, 5e-2, {"betas": (0.9, 0.999, 0.9999)}),
+    (heavyball.RMSprop, 1e-2, {}),
+    (heavyball.SFAdamW, 1e-2, {}),
 ]
 
 
@@ -125,12 +125,12 @@ def test_ecc_convergence(opt_cls, lr, extra_kw, mode):
 def test_param_ecc_convergence(combined):
     set_torch()
     data, target = _problem()
-    m0, o0 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2)
+    m0, o0 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2)
     losses_base = _train(m0, o0, data, target, 200)
     kw = {"param_ecc": "bf16+8"}
     if combined:
         kw["ecc"] = "bf16+8"
-    m1, o1 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, **kw)
+    m1, o1 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, **kw)
     losses_ecc = _train(m1, o1, data, target, 200)
     p = list(m1.parameters())[0]
     assert p.dtype == torch.bfloat16
@@ -148,7 +148,7 @@ def test_state_layout_and_invariants(mode):
     cfg = ECCConfig(mode)
     torch.manual_seed(42)
     model = nn.Linear(32, 16, bias=False, device="cuda")
-    opt = heavyball.ForeachAdamW(model.parameters(), lr=1e-2, ecc=mode)
+    opt = heavyball.AdamW(model.parameters(), lr=1e-2, ecc=mode)
     x = torch.randn(4, 32, device="cuda")
     for _ in range(3):
         model(x).sum().backward()
@@ -174,7 +174,7 @@ def test_ademamix_three_vars():
     set_torch()
     torch.manual_seed(42)
     model = nn.Linear(64, 32, bias=False, device="cuda")
-    opt = heavyball.ForeachAdEMAMix(model.parameters(), lr=5e-2, betas=(0.9, 0.999, 0.9999), ecc="bf16+8")
+    opt = heavyball.AdEMAMix(model.parameters(), lr=5e-2, betas=(0.9, 0.999, 0.9999), ecc="bf16+8")
     x = torch.randn(4, 64, device="cuda")
     for _ in range(10):
         model(x).sum().backward()
@@ -193,7 +193,7 @@ def test_ademamix_three_vars():
 
 def test_combined_ecc_dtypes():
     set_torch()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 32, 16, 1e-2, ecc="bf16+16", param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 32, 16, 1e-2, ecc="bf16+16", param_ecc="bf16+8")
     data, target = _problem(in_dim=32, out_dim=16, n=8)
     _train(m, o, data, target, 100)
     p = list(m.parameters())[0]
@@ -211,7 +211,7 @@ def test_shapes_and_bias():
     set_torch()
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(32, 16, bias=True), nn.Linear(16, 4, bias=False)).cuda()
-    opt = heavyball.ForeachAdamW(model.parameters(), lr=1e-2, ecc="bf16+8")
+    opt = heavyball.AdamW(model.parameters(), lr=1e-2, ecc="bf16+8")
     data, target = torch.randn(16, 32, device="cuda"), torch.randn(16, 4, device="cuda")
     losses = _train(model, opt, data, target, 50)
     for p in model.parameters():
@@ -225,9 +225,9 @@ def test_shapes_and_bias():
 def test_foreach_false():
     set_torch()
     data, target = _problem(in_dim=32, out_dim=4, n=16)
-    m_fe, o_fe = _model_opt(heavyball.ForeachAdamW, 32, 4, 1e-2, ecc="bf16+8", foreach=True)
+    m_fe, o_fe = _model_opt(heavyball.AdamW, 32, 4, 1e-2, ecc="bf16+8", multi_tensor=True)
     losses_fe = _train(m_fe, o_fe, data, target, 50)
-    m_nf, o_nf = _model_opt(heavyball.ForeachAdamW, 32, 4, 1e-2, ecc="bf16+8", foreach=False)
+    m_nf, o_nf = _model_opt(heavyball.AdamW, 32, 4, 1e-2, ecc="bf16+8", multi_tensor=False)
     losses_nf = _train(m_nf, o_nf, data, target, 50)
     assert losses_nf[-1] < losses_nf[0] * 0.5
     assert 0.3 < losses_nf[-1] / max(losses_fe[-1], 1e-12) < 3.0
@@ -239,7 +239,7 @@ def test_param_groups():
     set_torch()
     torch.manual_seed(42)
     m1, m2 = nn.Linear(16, 8, bias=False, device="cuda"), nn.Linear(8, 4, bias=False, device="cuda")
-    opt = heavyball.ForeachAdamW(
+    opt = heavyball.AdamW(
         [
             {"params": m1.parameters(), "ecc": "bf16+8"},
             {"params": m2.parameters()},
@@ -261,7 +261,7 @@ def test_zero_gradients():
     set_torch()
     torch.manual_seed(42)
     p = nn.Parameter(torch.randn(16, 8, device="cuda"))
-    opt = heavyball.ForeachAdamW([p], lr=1e-2, ecc="bf16+8")
+    opt = heavyball.AdamW([p], lr=1e-2, ecc="bf16+8")
     for _ in range(10):
         p.grad = torch.zeros_like(p)
         opt.step()
@@ -276,10 +276,10 @@ def test_state_save_restore():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt, sd_model = deepcopy(o.state_dict()), deepcopy(m.state_dict())
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, ecc="bf16+8")
     m2.load_state_dict(sd_model)
     o2.load_state_dict(sd_opt)
     losses_after = _train(m2, o2, data, target, 10)
@@ -326,9 +326,9 @@ def _measure_peak(cls, n, lr, ecc=None, param_ecc=None, steps=3):
 @pytest.mark.parametrize(
     "cls,lr",
     [
-        (heavyball.ForeachAdamW, 1e-3),
-        (heavyball.PaLMForeachSFAdamW, 1e-2),
-        (heavyball.ForeachRMSprop, 1e-2),
+        (heavyball.AdamW, 1e-3),
+        (heavyball.SFAdamW, 1e-2),
+        (heavyball.RMSprop, 1e-2),
     ],
     ids=["AdamW", "SFAdamW", "RMSprop"],
 )
@@ -346,7 +346,7 @@ def test_ecc_peak_memory(cls, lr, mode):
 @pytest.mark.parametrize("combined", [False, True], ids=["param_only", "state+param"])
 def test_param_ecc_peak_memory(combined):
     n = 2**24
-    cls, lr = heavyball.PaLMForeachSFAdamW, 1e-2
+    cls, lr = heavyball.SFAdamW, 1e-2
     pre_base, peak_base = _measure_peak(cls, n, lr)
     ecc = "bf16+8" if combined else None
     pre_ecc, peak_ecc = _measure_peak(cls, n, lr, ecc=ecc, param_ecc="bf16+8")
@@ -357,19 +357,19 @@ def test_param_ecc_peak_memory(combined):
 def test_ecc_live_path_nonzero_correction():
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.ForeachAdamW, 16, 8, 5e-2, ecc="bf16+8")
+    m, o = _model_opt(heavyball.AdamW, 16, 8, 5e-2, ecc="bf16+8")
     _train(m, o, data, target, 20)
     p = list(m.parameters())[0]
     st, ecc_keys = _ecc_keys(o, p)
     for ek in ecc_keys:
-        assert st[ek].any(), f"ECC correction '{ek}' is all zeros — stochastic_round_ likely mutating source"
+        assert st[ek].any(), f"ECC correction '{ek}' is all zeros - stochastic_round_ likely mutating source"
     del m, o
     clean()
 
 
 def test_lerp_returns_valid_fp32():
     set_torch()
-    m, o = _model_opt(heavyball.ForeachAdamW, 16, 8, 5e-2, ecc="bf16+8")
+    m, o = _model_opt(heavyball.AdamW, 16, 8, 5e-2, ecc="bf16+8")
     data, target = _problem()
     _train(m, o, data, target, 10)
     p = list(m.parameters())[0]
@@ -398,7 +398,7 @@ def test_param_ecc_merge_dims():
         nn.Flatten(),
         nn.Linear(64, 8, bias=False),
     ).cuda()
-    opt = heavyball.ForeachSOAP(model.parameters(), lr=1e-3, param_ecc="bf16+8")
+    opt = heavyball.SOAP(model.parameters(), lr=1e-3, param_ecc="bf16+8")
     conv_p = list(model.parameters())[0]
     assert conv_p.dtype == torch.bfloat16
     st = _flat_state(opt, conv_p)
@@ -417,7 +417,7 @@ def test_param_ecc_merge_dims():
 
 def test_param_ecc_dtype_at_construction():
     set_torch()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     p = list(m.parameters())[0]
     assert p.dtype == torch.bfloat16, "param should be bf16 immediately after construction"
     st = _flat_state(o, p)
@@ -431,11 +431,11 @@ def test_param_ecc_save_restore():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt, sd_model = deepcopy(o.state_dict()), deepcopy(m.state_dict())
 
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     m2.load_state_dict(sd_model)
     o2.load_state_dict(sd_opt)
     p2 = list(m2.parameters())[0]
@@ -452,7 +452,7 @@ def test_param_ecc_partial_state_restore():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt = deepcopy(o.state_dict())
     sd_model = deepcopy(m.state_dict())
@@ -460,7 +460,7 @@ def test_param_ecc_partial_state_restore():
         for idx_state in param_state.values():
             if isinstance(idx_state, dict):
                 idx_state.pop("param::ecc", None)
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     m2.load_state_dict(sd_model)
     o2.load_state_dict(sd_opt)
     st2 = _flat_state(o2, list(m2.parameters())[0])
@@ -478,12 +478,12 @@ def test_param_ecc_empty_state_restore():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt = deepcopy(o.state_dict())
     sd_model = deepcopy(m.state_dict())
     sd_opt["state"] = {}
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     m2.load_state_dict(sd_model)
     o2.load_state_dict(sd_opt)
     p2 = list(m2.parameters())[0]
@@ -508,7 +508,7 @@ def test_param_ecc_merged_view_partial_restore():
         nn.Flatten(),
         nn.Linear(64, 8, bias=False),
     ).cuda()
-    opt = heavyball.ForeachSOAP(model.parameters(), lr=1e-3, param_ecc="bf16+8")
+    opt = heavyball.SOAP(model.parameters(), lr=1e-3, param_ecc="bf16+8")
     data = torch.randn(4, 3, 8, 8, device="cuda")
     target = torch.randn(4, 8, device="cuda")
     conv_p = list(model.parameters())[0]
@@ -529,7 +529,7 @@ def test_param_ecc_merged_view_partial_restore():
         nn.Flatten(),
         nn.Linear(64, 8, bias=False),
     ).cuda()
-    opt2 = heavyball.ForeachSOAP(model2.parameters(), lr=1e-3, param_ecc="bf16+8")
+    opt2 = heavyball.SOAP(model2.parameters(), lr=1e-3, param_ecc="bf16+8")
     model2.load_state_dict(sd_model)
     opt2.load_state_dict(sd_opt)
     conv_p2 = list(model2.parameters())[0]
@@ -549,7 +549,7 @@ def test_param_ecc_merged_view_partial_restore():
 def test_optimizer_kwargs_not_in_param_groups():
     set_torch()
     p = torch.nn.Parameter(torch.randn(4, 4, device="cuda"))
-    o = heavyball.ForeachAdamW([p], lr=1e-3, compile_step=True, promote=True)
+    o = heavyball.AdamW([p], lr=1e-3, compile_step=True, promote=True)
     assert o.compile_step is True
     assert o.promote is True
     assert "compile_step" not in o.param_groups[0]
@@ -564,7 +564,7 @@ def test_param_ecc_load_order_model_before_optimizer():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt = deepcopy(o.state_dict())
     sd_model = deepcopy(m.state_dict())
@@ -573,7 +573,7 @@ def test_param_ecc_load_order_model_before_optimizer():
             if isinstance(idx_state, dict):
                 idx_state.pop("param::ecc", None)
     # model-first: load model, then optimizer
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     m2.load_state_dict(sd_model)
     o2.load_state_dict(sd_opt)
     p2 = list(m2.parameters())[0]
@@ -594,7 +594,7 @@ def test_param_ecc_load_order_optimizer_before_model():
 
     set_torch()
     data, target = _problem()
-    m, o = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     _train(m, o, data, target, 10)
     sd_opt = deepcopy(o.state_dict())
     sd_model = deepcopy(m.state_dict())
@@ -603,7 +603,7 @@ def test_param_ecc_load_order_optimizer_before_model():
             if isinstance(idx_state, dict):
                 idx_state.pop("param::ecc", None)
     # optimizer-first: load optimizer, then model
-    m2, o2 = _model_opt(heavyball.PaLMForeachSFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
     o2.load_state_dict(sd_opt)
     m2.load_state_dict(sd_model)
     p2 = list(m2.parameters())[0]

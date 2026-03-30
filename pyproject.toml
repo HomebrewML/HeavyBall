@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heavyball"
-description = "Compile-first PyTorch optimizer library — AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more with torch.compile fusion and composable features"
-version = "2.3.2"
+description = "Compile-first PyTorch optimizer library - AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more with torch.compile fusion and composable features"
+version = "3.0.0"
 authors = [{ name = "HeavyBall Authors", email = "github.heavyball@nestler.sh" }]
 classifiers = ["Intended Audience :: Developers",
     "Intended Audience :: Science/Research",

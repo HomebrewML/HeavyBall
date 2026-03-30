@@ -101,7 +101,7 @@ def test_ademamix_matches_reference_math():
     alpha_warmup = 4
 
     param = torch.nn.Parameter(initial.clone())
-    optimizer = heavyball.ForeachAdEMAMix(
+    optimizer = heavyball.AdEMAMix(
         [param],
         lr=lr,
         betas=betas,
@@ -110,7 +110,7 @@ def test_ademamix_matches_reference_math():
         alpha=alpha,
         beta3_warmup=beta3_warmup,
         alpha_warmup=alpha_warmup,
-        foreach=False,
+        multi_tensor=False,
     )
 
     for grad in grads:
@@ -149,7 +149,7 @@ def test_soap_ademamix_projects_gradients_into_eigenbasis():
     torch.manual_seed(7)
 
     param = torch.nn.Parameter(torch.randn(2, 2))
-    optimizer = heavyball.ForeachSOAPAdEMAMix([param], lr=0.01, foreach=False)
+    optimizer = heavyball.SOAPAdEMAMix([param], lr=0.01, multi_tensor=False)
 
     # First call initializes the SOAP preconditioner state without applying an update.
     param.grad = torch.randn_like(param)

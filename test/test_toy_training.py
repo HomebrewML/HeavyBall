@@ -23,16 +23,14 @@ def _flatten_tensors(tensors: Iterable[torch.Tensor]):
 
 
 EXTRA_KWARGS = {
-    "ForeachAdamC": {"max_lr": 0.0025},
+    "AdamC": {"max_lr": 0.0025},
 }
 
 
 def _optimizer_params():
     params = []
-    for name in sorted(dir(heavyball)):
-        if name.startswith("_"):
-            continue
-        attr = getattr(heavyball, name)
+    for name in sorted(heavyball.__all__):
+        attr = getattr(heavyball, name, None)
         if not isinstance(attr, type) or not issubclass(attr, optim.Optimizer):
             continue
         if attr is optim.Optimizer:
@@ -62,15 +60,15 @@ def toy_training_results(request):
 
     sig = inspect.signature(optimizer_cls.__init__)
     kwargs = dict(EXTRA_KWARGS.get(optimizer_name, {}))
-    if "foreach" in sig.parameters:
-        kwargs["foreach"] = True
+    if "multi_tensor" in sig.parameters:
+        kwargs["multi_tensor"] = True
 
     if optimizer_name == "SAMWrapper":
         inner_kwargs = {}
-        inner_sig = inspect.signature(heavyball.ForeachAdamW.__init__)
-        if "foreach" in inner_sig.parameters:
-            inner_kwargs["foreach"] = True
-        inner_optimizer = heavyball.ForeachAdamW(param_list, **inner_kwargs)
+        inner_sig = inspect.signature(heavyball.AdamW.__init__)
+        if "multi_tensor" in inner_sig.parameters:
+            inner_kwargs["multi_tensor"] = True
+        inner_optimizer = heavyball.AdamW(param_list, **inner_kwargs)
         optimizer = optimizer_cls(param_list, wrapped_optimizer=inner_optimizer, **kwargs)
     else:
         optimizer = optimizer_cls(param_list, **kwargs)
