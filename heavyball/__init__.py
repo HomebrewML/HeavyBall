@@ -148,9 +148,7 @@ class UnscaledAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        super().__init__(
-            params, defaults, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,)
-        )
+        super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.scale_by_unscaled_adam,))
 
 
 class SUDSAdamW(C.BaseOpt):
@@ -221,9 +219,7 @@ class Scion(C.BaseOpt):
         defaults["scale"] = scale
         defaults.pop("momentum", None)
 
-        super().__init__(
-            params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm)
-        )
+        super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm))
 
 
 class AdamC(C.BaseOpt):
@@ -333,10 +329,13 @@ class HyperBallAdamW(C.BaseOpt):
             gradient_clipping,
             update_clipping,
             palm,
-            fns=(C.scale_by_exp_avg_sq, C.route(
-                (lambda p: p.ndim >= 2, C.update_by_hyperball),
-                default=C.apply_update,
-            )),
+            fns=(
+                C.scale_by_exp_avg_sq,
+                C.route(
+                    (lambda p: p.ndim >= 2, C.update_by_hyperball),
+                    default=C.apply_update,
+                ),
+            ),
         )
 
 
@@ -373,10 +372,12 @@ class MuonAdamW(C.BaseOpt):
             gradient_clipping,
             update_clipping,
             palm,
-            fns=(C.route(
-                (lambda p: p.ndim >= 2, (ema, C.orthogonalize_update)),
-                default=C.scale_by_adam,
-            ),),
+            fns=(
+                C.route(
+                    (lambda p: p.ndim >= 2, (ema, C.orthogonalize_update)),
+                    default=C.scale_by_adam,
+                ),
+            ),
         )
 
 
@@ -893,7 +894,9 @@ class PSGDBase(C.BaseOpt):
     cached: bool = False
     exp_avg_input: bool = True
 
-    def _build_psgd_defaults(self, locals_dict, fns, *, default_update_clipping=utils.trust_region_clip_, extra_defaults=None):
+    def _build_psgd_defaults(
+        self, locals_dict, fns, *, default_update_clipping=utils.trust_region_clip_, extra_defaults=None
+    ):
         exp_avg_input = C.default(locals_dict.get("exp_avg_input", C.use_default), self.exp_avg_input)
         update_clipping = C.default(locals_dict["update_clipping"], default_update_clipping)
 
@@ -1204,4 +1207,8 @@ class SAMWrapper(torch.optim.Optimizer):
 
 capture_param_shapes = utils.capture_param_shapes
 _BASE_CLASSES = {SOAPBase, PSGDBase}
-__all__ = [k for k, v in globals().items() if isinstance(v, type) and issubclass(v, torch.optim.Optimizer) and v not in _BASE_CLASSES]
+__all__ = [
+    k
+    for k, v in globals().items()
+    if isinstance(v, type) and issubclass(v, torch.optim.Optimizer) and v not in _BASE_CLASSES
+]

@@ -216,9 +216,17 @@ _DETECT_CASES = [
     ("flat_neither", {"state": _flat_state((2,)), "param_groups": [{}]}, 1),
     ("flat_multi_group", {"state": _flat_state((2,), (3,)), "param_groups": [{"foreach": True}, {}]}, 1),
     ("nested_foreach", {"state": _nested_state((2,)), "param_groups": [{"foreach": True}]}, 2),
-    ("nested_foreach_multi_group", {"state": _nested_state((2,), (3,)), "param_groups": [{"foreach": True}, {"foreach": True}]}, 2),
+    (
+        "nested_foreach_multi_group",
+        {"state": _nested_state((2,), (3,)), "param_groups": [{"foreach": True}, {"foreach": True}]},
+        2,
+    ),
     ("nested_multi_tensor", {"state": _nested_state((2,)), "param_groups": [{"multi_tensor": True}]}, 3),
-    ("nested_multi_tensor_multi_group", {"state": _nested_state((2,), (3,)), "param_groups": [{"multi_tensor": True}, {}]}, 3),
+    (
+        "nested_multi_tensor_multi_group",
+        {"state": _nested_state((2,), (3,)), "param_groups": [{"multi_tensor": True}, {}]},
+        3,
+    ),
     ("empty_state_multi_tensor", {"state": {}, "param_groups": [{"multi_tensor": True}]}, 3),
     ("empty_state_foreach", {"state": {}, "param_groups": [{"foreach": True}]}, 1),
     ("empty_state_bare", {"state": {}, "param_groups": [{}]}, 1),
@@ -246,7 +254,11 @@ _NORM_CASES = [
     ("empty_group", {}, {}),
     ("params_only", {"params": [0]}, {}),
     ("all_removed", {"params": [0], "stochastic_schedule": None}, {}),
-    ("kitchen_sink", {"params": [0, 1], "foreach": True, "stochastic_schedule": True, "lr": 0.01, "betas": [0.9, 0.99]}, {"multi_tensor": True, "lr": 0.01, "betas": (0.9, 0.99)}),
+    (
+        "kitchen_sink",
+        {"params": [0, 1], "foreach": True, "stochastic_schedule": True, "lr": 0.01, "betas": [0.9, 0.99]},
+        {"multi_tensor": True, "lr": 0.01, "betas": (0.9, 0.99)},
+    ),
 ]
 
 

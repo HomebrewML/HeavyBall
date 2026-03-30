@@ -7,11 +7,10 @@ import inspect
 import itertools
 import math
 import pickle
-import random
 import re
 import string
 import warnings
-from typing import Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -3172,10 +3171,7 @@ def _psgd_precond_update_(
 
 
 @decorator_knowngood
-
-
 @decorator
-
 @decorator_knowngood
 def _clip(x, norm, clip_at, eps=1e-8):
     x32 = promote(x)
@@ -3564,9 +3560,7 @@ def fused_psgd_precond_grad(
     store_triu_as_line: bool = False,
 ):
     lr, decay = scalar_guard(lr, decay, param[0])
-    _compilable_fused_psgd_precond_grad(
-        ea, param, lr, grad, decay, caution, preconds, store_triu_as_line
-    )
+    _compilable_fused_psgd_precond_grad(ea, param, lr, grad, decay, caution, preconds, store_triu_as_line)
 
 
 @decorator_knowngood

@@ -48,6 +48,7 @@ def _make_model():
 def _run_steps(model, optimizer, n=5, seed=0xDEADBEEF):
     torch.manual_seed(seed)
     for _ in range(n):
+
         def closure():
             optimizer.zero_grad(set_to_none=True)
             data = torch.randn(4, 8, device=DEVICE)
@@ -109,6 +110,5 @@ def test_needs_init_clears(opt_name, opt_cls):
     for group in opt.param_groups:
         state = [opt.state_(p) for p in group["params"]]
         assert not opt._needs_init(state), (
-            f"{opt_name}: _needs_init stuck True after {n} steps | "
-            f"compile_step will never engage"
+            f"{opt_name}: _needs_init stuck True after {n} steps | compile_step will never engage"
         )

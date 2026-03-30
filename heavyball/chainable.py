@@ -25,7 +25,6 @@ def _key_in_state(state, key):
     return True
 
 
-
 def _guard_in_state(state, key, template_fn):
     if not _key_in_state(state, key):
         state[key] = template_fn()
@@ -150,7 +149,9 @@ class Route:
                 continue
             group["caution"] = caution
             if fns is not None:
-                u, skip = _inner_chain(_sel(state, idx), group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns)
+                u, skip = _inner_chain(
+                    _sel(state, idx), group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns
+                )
             else:
                 u, skip = _sel(update, idx), False
             results.append((u, skip, idx))
@@ -183,13 +184,15 @@ _PASSTHROUGH_KWARGS = {"orig_shapes"}
 
 _RENAMED_KWARGS = {"foreach": "multi_tensor"}
 
-_REMOVED_KWARGS = frozenset({
-    "stochastic_schedule",
-    "normalize_grads",
-    "correct_bias",
-    "inverse_free",
-    "adaptive",
-})
+_REMOVED_KWARGS = frozenset(
+    {
+        "stochastic_schedule",
+        "normalize_grads",
+        "correct_bias",
+        "inverse_free",
+        "adaptive",
+    }
+)
 
 
 def _build_defaults(locals_dict):
@@ -200,14 +203,16 @@ def _build_defaults(locals_dict):
 
     for old, new in _RENAMED_KWARGS.items():
         if old in kwargs:
-            warnings.warn(f"'{old}' was renamed to '{new}' in HeavyBall 3.0. "
-                          f"Pass '{new}' instead.", FutureWarning, stacklevel=4)
+            warnings.warn(
+                f"'{old}' was renamed to '{new}' in HeavyBall 3.0. Pass '{new}' instead.", FutureWarning, stacklevel=4
+            )
             d[new] = kwargs.pop(old)
 
     hit = _REMOVED_KWARGS & kwargs.keys()
     if hit:
-        raise TypeError(f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. "
-                        f"See docs/heavyball3.md for migration details.")
+        raise TypeError(
+            f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. See docs/heavyball3.md for migration details."
+        )
 
     d.update(kwargs)
     unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
@@ -795,7 +800,9 @@ def _adopt_warmup_2(state, group, update, grad, param, exp_avg, exp_avg_sq):
     u = utils.promote(update)
     easq = utils.promote(exp_avg_sq)
     utils.copy_stochastic_(exp_avg, u / easq.sqrt().clamp_(min=group["eps"]))
-    utils.scale_by_exp_avg_sq_([exp_avg_sq], [update], utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"])
+    utils.scale_by_exp_avg_sq_(
+        [exp_avg_sq], [update], utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"]
+    )
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -928,7 +935,6 @@ def _init_psgd_lra(state, group, update, grad, param, cached: bool = False, prob
         getattr(param, "vector", None),
         dtype=getattr(torch, group["q_dtype"]),
     )
-
 
 
 @needs_full_param
@@ -1266,9 +1272,7 @@ def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
     if group.get("is_cached", False) and Q_cache[0] is not None:
         out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
-        out = utils.psgd_precond_grad(
-            preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs
-        )
+        out = utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
     group["caution"] = False  # we already cautioned here - shouldn't do it again
     return out
 
@@ -1285,9 +1289,7 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
     if group.get("is_cached", False) and Q_cache[0] is not None:
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
-        utils.fused_psgd_precond_grad(
-            preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs
-        )
+        utils.fused_psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
 
 
 def _update_lra(
@@ -1393,9 +1395,7 @@ def scale_by_delayed_psgd(
     prob: Optional[callable] = None,
 ):
     precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
-    _update_psgd_precond(
-        cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob
-    )
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     return precond
 
 
@@ -1851,7 +1851,8 @@ class ChainOpt(utils.StatefulOptimizer):
         self._set_indices(retain=True)
         self._needs_gather = any(getattr(ft, "needs_full_param", False) for ft in _walk_fns(self._fns))
         self._transform_ids = frozenset(
-            ft.transform_idx for ft in _walk_fns(self._fns)
+            ft.transform_idx
+            for ft in _walk_fns(self._fns)
             if ft.transform_idx is not None and getattr(ft, "needs_init", True)
         )
 
