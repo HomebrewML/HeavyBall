@@ -543,18 +543,15 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
 
 
 @decorator_knowngood
-def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
-    assert (
-        G.ndim >= 2
-    )  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7, power_iter: int = -1):
+    # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    assert G.ndim >= 2
     assert steps == 5
-    G = G.clone()
+    G = G / G.norm(dim=(-2, -1)).clamp(min=eps)  # free if fused with casting
     x = G if G.dtype == torch.float64 else stochastic_round_(G)
     if G.size(-2) > G.size(-1):
         x = x.mT
 
-    # X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    stochastic_divide_with_eps_(x, G.norm(dim=(-2, -1)), eps)  # ensure top singular value <= 1
     # Perform the NS iterations
     for a, b, c in [
         (4.0848, -6.8946, 2.9270),
@@ -608,12 +605,10 @@ def msign(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
     assert G.ndim >= 2
     should_transpose: bool = G.size(-2) > G.size(-1)
 
+    G = G / G.norm(dim=(-2, -1)).clamp(min=eps)  # free if fused with casting
     x = G if G.dtype == torch.float64 else stochastic_round_(G)
     if should_transpose:
         x = x.mT
-
-    # x = x / (x.norm(dim=(-2, -1), keepdim=True) * 1.01 + eps)
-    stochastic_divide_with_eps_(x, x.norm(dim=(-2, -1)) * 1.01, eps)
 
     for step in range(steps):
         a, b, c = ABC_LIST_STABLE[step] if step < len(ABC_LIST_STABLE) else ABC_LIST_STABLE[-1]
@@ -2927,17 +2922,17 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
 
 
 @decorator_knowngood
-def procrustes_step(Q: Tensor, max_step_size: float = 1 / 8) -> None:
+def procrustes_step(Q: Tensor, power_iter, max_step_size: float = 1 / 8) -> Tensor:
     Q_ = promote(Q)
     R = (Q_.T - Q_).contiguous()
-    R_norm = max_singular_value(R, power_iter=2) + torch.finfo(R.dtype).smallest_normal
+    R_norm = max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal
     R = R / R_norm
     RQ = R @ Q_
     RRQ = R @ RQ
     tr_RQ = RQ.diagonal().sum()
     tr_RRQ = RRQ.diagonal().sum()
-    a = torch.where(tr_RRQ < 0, torch.clamp(-tr_RQ / tr_RRQ, max=max_step_size), max_step_size)
-    copy_stochastic_(Q, Q_ + a * (RQ + 0.5 * a * RRQ))
+    a = torch.where(tr_RRQ < 0, (-tr_RQ / tr_RRQ).clamp(max=max_step_size), max_step_size)
+    return Q_ + a * RQ + 0.5 * a * a * RRQ
 
 
 @decorator_knowngood
@@ -3164,19 +3159,19 @@ def psgd_pro_update_precond(
 
     total_numel = G.numel()
     for q, exprG, lb_state in zip(Q, exprGs, running_lower_bound):
-        term1 = compiled_einsum(exprG, Pg, Pg)
+        covariance_PP = compiled_einsum(exprG, Pg, Pg)
         q_ = promote(q)
 
         if q.ndim < 2:
-            term2 = total_numel / max(1, q.numel())
-            ell = _update_lb(term1.max() + term2, lb_state, lower_bount_beta)
-            copy_stochastic_(q, q_ - q_ * (term1 - term2) / ell * precond_lr)
+            target_energy = total_numel / max(1, q.numel())
+            ell = _update_lb(covariance_PP.max() + target_energy, lb_state, lower_bount_beta)
+            copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell * precond_lr)
         else:
-            term2 = total_numel / q.shape[0]
-            ell = _update_lb(max_eigenvalue_spd(term1, power_iter=power_iter) + term2, lb_state, lower_bount_beta)
-            copy_stochastic_(q, q_ - (term1 @ q_ - term2 * q_) / ell * precond_lr)
-            procrustes_step(q)
-    del Pg
+            target_energy = total_numel / q.shape[0]
+            ell = max_eigenvalue_spd(covariance_PP, power_iter=power_iter)
+            ell = _update_lb(ell + target_energy, lb_state, lower_bount_beta)
+            q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell * precond_lr
+            copy_stochastic_(q, procrustes_step(q_, power_iter=power_iter))
 
 
 @decorator_knowngood
