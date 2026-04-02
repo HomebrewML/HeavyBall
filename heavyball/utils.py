@@ -2921,8 +2921,6 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
     return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone()).squeeze()
 
 
-
-
 @decorator_knowngood
 def clamped_max_singular_value(
     A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
@@ -3136,7 +3134,7 @@ def psgd_pro_update_precond(
     lower_bount_beta: float,
     power_iter: int,
     dampening: float,
-max_step_size: float = 1/8
+    max_step_size: float = 1 / 8,
 ) -> None:
     """Update Kronecker product preconditioner Q with Q0.5EQ1.5 (PRO) method."""
     psgd_balance_Q(Q)
