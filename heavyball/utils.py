@@ -2921,18 +2921,6 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
     return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone()).squeeze()
 
 
-@decorator_knowngood
-def procrustes_step(Q: Tensor, power_iter, max_step_size: float = 1 / 8) -> Tensor:
-    Q_ = promote(Q)
-    R = (Q_.T - Q_).contiguous()
-    R_norm = max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal
-    R = R / R_norm
-    RQ = R @ Q_
-    RRQ = R @ RQ
-    tr_RQ = RQ.diagonal().sum()
-    tr_RRQ = RRQ.diagonal().sum()
-    a = torch.where(tr_RRQ < 0, (-tr_RQ / tr_RRQ).clamp(max=max_step_size), max_step_size)
-    return Q_ + a * RQ + 0.5 * a * a * RRQ
 
 
 @decorator_knowngood
@@ -3148,6 +3136,7 @@ def psgd_pro_update_precond(
     lower_bount_beta: float,
     power_iter: int,
     dampening: float,
+max_step_size: float = 1/8
 ) -> None:
     """Update Kronecker product preconditioner Q with Q0.5EQ1.5 (PRO) method."""
     psgd_balance_Q(Q)
@@ -3166,12 +3155,23 @@ def psgd_pro_update_precond(
             target_energy = total_numel / max(1, q.numel())
             ell = _update_lb(covariance_PP.max() + target_energy, lb_state, lower_bount_beta)
             copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell * precond_lr)
-        else:
-            target_energy = total_numel / q.shape[0]
-            ell = max_eigenvalue_spd(covariance_PP, power_iter=power_iter)
-            ell = _update_lb(ell + target_energy, lb_state, lower_bount_beta)
-            q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell * precond_lr
-            copy_stochastic_(q, procrustes_step(q_, power_iter=power_iter))
+            continue
+
+        target_energy = total_numel / q.shape[0]
+        ell = max_eigenvalue_spd(covariance_PP, power_iter=power_iter)
+        ell = _update_lb(ell + target_energy, lb_state, lower_bount_beta)
+        q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell * precond_lr
+
+        # procrustes_step
+        R = (q_.T - q_).contiguous()
+        R_norm = max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal
+        R = R / R_norm
+        RQ = R @ q_
+        RRQ = R @ RQ
+        tr_RQ = RQ.diagonal().sum()
+        tr_RRQ = RRQ.diagonal().sum()
+        a = torch.where(tr_RRQ < 0, (-tr_RQ / tr_RRQ).clamp(max=max_step_size), max_step_size)
+        copy_stochastic_(q, q_ + a * RQ + 0.5 * a * a * RRQ)
 
 
 @decorator_knowngood
