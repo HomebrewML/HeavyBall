@@ -744,16 +744,14 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
     :param GG: List of accumulated gradient outer products.
     :param Q: List of current eigenbases (updated in-place to Q_new).
     :param exp_avg: Exponential moving average in the old eigenspace (updated in-place if provided).
+        Pass nothing (or only `None` entries) to refresh Q without rotating any state.
     """
-    if not exp_avg:
-        return
-
-    ref = exp_avg[0]
-    if ref.dim() == 0:  # preconditioning doesn't make sense here
-        Q.clear()
-        return
-
     if isinstance(Q, list) and not Q:
+        return
+
+    ref = exp_avg[0] if exp_avg else None
+    if ref is not None and ref.dim() == 0:  # preconditioning doesn't make sense here
+        Q.clear()
         return
 
     if ref is not None and ref.dim() != len(Q):
@@ -778,7 +776,8 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
 
     if ref is None:
         for q, q_new in zip(Q, new_qs):
-            copy_stochastic_(q, q_new)
+            if q is not None:
+                copy_stochastic_(q, q_new)
         return
 
     assert ref.ndim < 13, "ref.ndim must be less than 13"
@@ -1145,6 +1144,28 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
         stochastic_lerp_(m, outer, 1 - beta)
 
 
+@decorator_knowngood
+def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Optional[Tensor]], eps: float):
+    out = promote(grad)
+    for idx, (q, m) in enumerate(zip(Q, GG)):
+        if q is None or m is None:
+            continue
+        q32, m32 = promote(q), promote(m)
+        d = ((q32.T @ m32) * q32.T).sum(dim=1).clamp_min(eps).rsqrt()
+        shape = [1] * out.ndim
+        shape[idx] = -1
+        out = out * d.view(shape)
+    return out.to(grad.dtype)
+
+
+def kl_shampoo_precondition(grad, Q, GG, eps):
+    """KL-Shampoo Kronecker preconditioner (arXiv:2509.03378).
+
+    Applies ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T to grad, with d_i = diag(Q[i].T @ GG[i] @ Q[i]).
+    """
+    return project(_kl_shampoo_kron_scale(project(grad, Q, back=False), Q, GG, eps), Q, back=True)
+
+
 def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     def _fn(*args):
         return tree_map(fn, *args)
@@ -1241,9 +1262,13 @@ def update_preconditioner(grad, Q, GG, exp_avg, max_precond_dim, precondition_1d
         get_orthogonal_matrix_QR(GG, Q, *exp_avg)
 
 
-def init_preconditioner(grad, state, max_precond_dim, precondition_1d):
+def init_preconditioner(grad, state, max_precond_dim, precondition_1d, init_factor: float = 0.0):
     """
     Initializes the preconditioner matrices (L and R in the paper).
+
+    If init_factor > 0, GG starts as init_factor * I per side (uniform-eigval seed used by KL-Shampoo
+    to avoid the rank-1 explosion: 1/sqrt(eps) along null directions). Otherwise, seeds with one
+    outer product of grad (standard SOAP behavior).
     """
     state["GG"] = []  # Will hold all the preconditioner matrices (L and R in the paper).
     if grad.numel() > 1 and (grad.ndim > 1 or precondition_1d):
@@ -1251,12 +1276,15 @@ def init_preconditioner(grad, state, max_precond_dim, precondition_1d):
             if sh > max_precond_dim or sh == 1:
                 # via @francois-rozet: https://github.com/HomebrewML/HeavyBall/commit/8b86be04967e2d095136d5603724f488f2d46592#diff-a430393dd0a6ee393944a9ed16416115c175de2414cf4a96e647197697f265e9R621
                 state["GG"].append(None)
+            elif init_factor > 0:
+                state["GG"].append(torch.eye(sh, device=grad.device, dtype=grad.dtype) * init_factor)
             else:
                 state["GG"].append(torch.zeros(sh, sh, device=grad.device, dtype=grad.dtype))
     else:
         state["GG"].append(None)
 
-    update_ggt(grad, state["GG"], max_precond_dim, precondition_1d, 0)
+    if init_factor <= 0:
+        update_ggt(grad, state["GG"], max_precond_dim, precondition_1d, 0)
     state["Q"] = get_orthogonal_matrix(state["GG"])
 
 

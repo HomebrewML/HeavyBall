@@ -737,6 +737,60 @@ class KLSOAP(SOAPBase):
         self._build_soap_defaults(locals(), fns=(C.scale_by_kl_soap,))
 
 
+class KLShampoo(SOAPBase):
+    """
+    KL-Shampoo
+
+    Shampoo with KL-corrected Kronecker factor accumulation, applied directly as
+    ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T to a momentum-EMA gradient. Unlike KL-SOAP,
+    no Adam runs in the projected space, and the eigenvalues d_i = diag(Q[i].T @ GG[i] @ Q[i])
+    are the preconditioner. GG is seeded with init_factor * I to keep the first preconditioner
+    uniform (= 1/sqrt(init_factor) * I) instead of exploding along the rank-1 null space.
+
+    Sources:
+        KL-Shampoo:
+            Understanding and Improving Shampoo and SOAP via Kullback-Leibler Minimization
+            Wu Lin, Scott C. Lowe, Felix Dangel, Runa Eschenhagen, Zikun Xu, Roger B. Grosse
+            https://arxiv.org/abs/2509.03378
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 3e-3,
+        betas=(0.9, 0.95),
+        shampoo_beta: float = 0.95,
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        precondition_frequency: int = 2,
+        max_precond_dim: int = 2048,
+        merge_dims: bool = True,
+        precondition_1d: bool = False,
+        warmup_steps: int = 0,
+        split: bool = False,
+        multi_tensor: bool = True,
+        mars: bool = False,
+        caution: bool = False,
+        mars_gamma: float = 0.0025,
+        palm: bool = C.use_default,
+        precond_scheduler=(1 / 3, 9),
+        beta2_scale: float = 0.8,
+        use_precond_schedule: bool = C.use_default,
+        gradient_clipping: C.str_or_fn = C.use_default,
+        update_clipping: C.str_or_fn = C.use_default,
+        storage_dtype: str = "float32",
+        precond_grad_accum: bool = False,
+        compile_step: bool = C.use_default,
+        promote: bool = C.use_default,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
+        orig_shapes: ShapeMap | None = None,
+        init_factor: float = 0.1,
+        **kwargs,
+    ):
+        self._build_soap_defaults(locals(), fns=(C.scale_by_kl_shampoo,))
+
+
 class SOAPNAdam(SOAPBase):
     def __init__(
         self,

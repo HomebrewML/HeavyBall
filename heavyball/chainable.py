@@ -1073,7 +1073,9 @@ def scion_auto_norm(group, update, grad, param, scion_state):
 
 
 def _init_soap(state, group, update, grad, param):
-    utils.init_preconditioner(grad, state, group["max_precond_dim"], group["precondition_1d"])
+    utils.init_preconditioner(
+        grad, state, group["max_precond_dim"], group["precondition_1d"], group.get("init_factor", 0.0)
+    )
 
 
 def _apply_soap_preconditioner(group, update, Q, GG, *references, use_kl: bool = False, eps=1e-8):
@@ -1129,6 +1131,17 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg, use_kl=True, eps=group["eps"])
+    return precond
+
+
+@needs_full_param
+@zero_guard("exp_avg")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
+    utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
+    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
+    _apply_soap_preconditioner(group, update, Q, GG, use_kl=True, eps=group["eps"])
     return precond
 
 

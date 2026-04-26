@@ -84,6 +84,8 @@ _EXPECT_NO_GATHER = {
 # Optimizers whose chains use shape-dependent or global-reduction ops must need gather
 _EXPECT_GATHER = {
     "SOAP",
+    "KLSOAP",
+    "KLShampoo",
     "SOAPNAdam",
     "SOAPAdEMAMix",
     "SOLP",
