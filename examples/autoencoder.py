@@ -17,65 +17,40 @@ import heavyball
 heavyball.utils.set_torch()
 
 
-class Residual(nn.Sequential):
-    def forward(self, input):
-        out = super().forward(input)
-        return out + F.interpolate(input, out.shape[2:])
-
-
-class Block(nn.Sequential):
-    def __init__(
-        self,
-        in_features: int,
-        intermediate: int,
-        out_features: int,
-        kernel: int,
-        stride: int,
-        up: bool,
-        depth: int,
-    ):
-        padding = kernel // 2
-        layers = [nn.Conv2d(in_features, intermediate, kernel_size=kernel, padding=padding)]
-
-        for _ in range(depth):
-            layers.append(
-                Residual(
-                    nn.Upsample(scale_factor=stride) if up else nn.MaxPool2d(stride),
-                    nn.BatchNorm2d(intermediate),
-                    nn.ReLU(),
-                    nn.Conv2d(intermediate, intermediate, kernel_size=kernel, padding=padding),
-                )
-            )
-
-        layers.append(nn.ReLU())
-        layers.append(nn.Conv2d(intermediate, out_features, kernel_size=kernel, padding=padding))
-
-        super().__init__(*layers)
-
-
 class Autoencoder(nn.Module):
-    def __init__(self, kernel: int = 3, stride: int = 2, hidden: int = 1, intermediate: int = 128):
-        super(Autoencoder, self).__init__()
-        self.enc = Block(1, intermediate, hidden, kernel, stride, False, 3)
-        self.dec = Block(hidden, intermediate, 1, kernel, stride, True, 3)
+    def __init__(self, d=1024, widths=(768, 384, 160, 96), latent=24):
+        super().__init__()
+        enc, dec = [], []
+        prev = d
+        for w in widths:
+            enc += [nn.Linear(prev, w), nn.LayerNorm(w), nn.GELU()]
+            prev = w
+        enc.append(nn.Linear(prev, latent))
+
+        prev = latent
+        for w in reversed(widths):
+            dec += [nn.Linear(prev, w), nn.LayerNorm(w), nn.GELU()]
+            prev = w
+        dec.append(nn.Linear(prev, d))
+
+        self.enc = nn.Sequential(*enc)
+        self.dec = nn.Sequential(*dec)
 
     def forward(self, x):
-        x = self.enc(x).sigmoid()
-        # label = x > torch.rand_like(x)
-        # x = label.detach().float() + x - x.detach()
-        out = self.dec(x)
-        return out
+        shape = x.shape
+        x = x.flatten(1)
+        x = self.dec(self.enc(x))
+        return x.view(shape)
 
 
 class RandomPad(nn.Module):
     def __init__(self, amount: int):
         super().__init__()
         self.amount = amount
-        self.rng = np.random.default_rng(0x12312)
 
     def forward(self, inp):
         new = []
-        xs, ys = np.split((np.random.randint(0, self.amount, size=2 * inp.size(0)) * self.amount).round(), 2)
+        xs, ys = np.split(np.random.randint(0, self.amount + 1, size=2 * inp.size(0)), 2)
         for val, x, y in zip(inp, xs, ys):
             padded = F.pad(val, (x, self.amount - x, y, self.amount - y))
             new.append(padded)
@@ -83,21 +58,18 @@ class RandomPad(nn.Module):
 
 
 def main(epochs: int, batch: int, log_interval: int = 16):
-    # Setup tensorboard logging
     torch.manual_seed(0x12783)
     np.random.seed(0x12783)
     random.seed(0x12783)
-    log_dir = os.path.join("runs", f"soap_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    log_dir = os.path.join("runs", f"psgdpro_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     writer = SummaryWriter(log_dir)
 
     model = torch.compile(Autoencoder().cuda(), mode="default")
-    optimizer = heavyball.PSGDKron(
+    optimizer = heavyball.PSGDPRO(
         model.parameters(),
-        lr=1e-4,
-        mars=True,
-        lower_bound_beta=0.9,
+        lr=1e-3,
         precond_update_power_iterations=6,
-        store_triu_as_line=False,
+        store_triu_as_line=False, cached=True
     )
 
     transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32)])
@@ -107,15 +79,15 @@ def main(epochs: int, batch: int, log_interval: int = 16):
     train = torch.stack(train).cuda() / 255.0
     eval_batch = torch.stack(test) / 255.0
 
-    transform = RandomPad(4)
-    eval_batch = transform(eval_batch)
-    eval_batch_cuda = eval_batch.cuda()
+    pad = RandomPad(4)
+    eval_batch_raw = eval_batch
+    eval_batch_cuda = F.pad(eval_batch, (2, 2, 2, 2)).cuda()
     step = 0
     total_loss = 0
 
     for epoch in range(epochs):
         train = train[torch.randperm(train.size(0))].contiguous()
-        batches = transform(train)
+        batches = pad(train)
         batches = batches[: batches.size(0) // batch * batch]
         batches = batches.view(-1, batch, *batches.shape[1:])
 
@@ -144,7 +116,7 @@ def main(epochs: int, batch: int, log_interval: int = 16):
         with torch.no_grad():
             model.eval()
             samples = model(eval_batch_cuda)
-            comparison = torch.cat([eval_batch, samples.cpu()], dim=0)
+            comparison = torch.cat([eval_batch_raw, samples.cpu()[:, :, 2:-2, 2:-2]], dim=0)
             grid = make_grid(comparison, nrow=8, normalize=True, padding=2)
             writer.add_image("reconstructions", grid, epoch)
             model.train()
