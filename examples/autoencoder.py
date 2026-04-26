@@ -66,10 +66,7 @@ def main(epochs: int, batch: int, log_interval: int = 16):
 
     model = torch.compile(Autoencoder().cuda(), mode="default")
     optimizer = heavyball.PSGDPRO(
-        model.parameters(),
-        lr=1e-3,
-        precond_update_power_iterations=6,
-        store_triu_as_line=False, cached=True
+        model.parameters(), lr=1e-3, precond_update_power_iterations=6, store_triu_as_line=False, cached=True
     )
 
     transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32)])

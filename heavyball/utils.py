@@ -2829,24 +2829,21 @@ def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = N
     Rayleigh quotient of row with the largest norm + optional power iterations
     """
     x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
-    x_norm = promote(x_norm)
+    x_norm = promote(x_norm).clamp(min=torch.finfo(torch.float32).tiny)
 
-    def _inner():
-        A = A_outer
-        x = A.index_select(0, max_idx).flatten().contiguous()
-        A = stochastic_round_(A / x_norm)
-        x = x / x_norm
+    A = A_outer
+    x = A.index_select(0, max_idx).flatten().contiguous()
+    A = stochastic_round_(A / x_norm)
+    x = x / x_norm
 
-        def _mv(x):
-            return promote(A.T.mv(A.mv(x.to(A.dtype))))
+    def _mv(x):
+        return promote(A.T.mv(A.mv(x.to(A.dtype))))
 
-        for _ in range(iterations):
-            # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-            x = F.normalize(_mv(x), dim=0)
-        out = (promote(x) @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
-        return out.squeeze().clone()
-
-    return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
+    for _ in range(iterations):
+        # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
+        x = F.normalize(_mv(x), dim=0)
+    out = (promote(x) @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
+    return out.squeeze()
 
 
 @decorator_knowngood
@@ -2904,30 +2901,25 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
     if A_outer.ndim < 2:
         return A_outer.max()
     x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
-    x_norm = promote(x_norm)
+    x_norm = promote(x_norm).clamp(min=torch.finfo(torch.float32).tiny)
 
-    def _inner():
-        x = A_outer.index_select(0, max_idx).flatten().contiguous()
-        A = promote(A_outer) / x_norm
-        x = x / x_norm
+    x = A_outer.index_select(0, max_idx).flatten().contiguous()
+    A = promote(A_outer) / x_norm
+    x = x / x_norm
 
-        def _mv(x):
-            return promote((x @ A.mT) @ A.mT)
+    def _mv(x):
+        return promote((x @ A.mT) @ A.mT)
 
-        for _ in range(power_iter):
-            x = F.normalize(_mv(x), dim=0)
-        return (x @ _mv(x)).sqrt() * x_norm
-
-    return cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone()).squeeze()
+    for _ in range(power_iter):
+        x = F.normalize(_mv(x), dim=0)
+    return ((x @ _mv(x)).sqrt() * x_norm).squeeze()
 
 
 @decorator_knowngood
 def clamped_max_singular_value(
     A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
 ) -> Tensor:
-    norm = A.norm()  # L2 norm is an upper bound for the spectral norm. If the upper bound is below the minimum, the real value will be too.
-    out = cond(norm > min, lambda: max_singular_value(A, max_svd, use_cholesky, power_iter), lambda: norm.clone())
-    return out.clamp(min=min)
+    return max_singular_value(A, max_svd, use_cholesky, power_iter).clamp(min=min)
 
 
 @decorator_knowngood
@@ -2953,24 +2945,22 @@ def min_singular_value(
 
     row_norms = A.norm(dim=1)
     norm, idx = row_norms.min(dim=0)
-    v = cond(norm > 0, lambda: A.index_select(0, idx).flatten(), lambda: torch.rand_like(A[0]))
+    v = A.index_select(0, idx).flatten()
+    v = v + torch.randn_like(v) * torch.finfo(v.dtype).tiny  # break degeneracy if zero row
 
-    v = v / promote(v.norm())
+    v = v / promote(v.norm().clamp(min=torch.finfo(torch.float32).tiny))
     for _ in range(power_iter):
         v = lambda_upper * v - promote(A.mv(v.to(A.dtype)))
-        v = v / promote(v.norm())
+        v = v / promote(v.norm().clamp(min=torch.finfo(torch.float32).tiny))
     mu_hat = promote(v) @ (lambda_upper * promote(v) - promote(A.mv(v.to(A.dtype))))
 
     lambda_min_hat = lambda_upper - mu_hat
 
-    def _approx():
-        mu = A.trace() / n
-        sigma_square = A.square().sum() / n - mu**2
-        return mu - (sigma_square / (n - 1)).sqrt()
+    mu = A.trace() / n
+    sigma_square = A.square().sum() / n - mu**2
+    approx = mu - (sigma_square / (n - 1)).sqrt()
 
-    return cond(
-        (~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), _approx, lambda: lambda_min_hat.clone()
-    ).squeeze()
+    return torch.where((~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), approx, lambda_min_hat).squeeze()
 
 
 @decorator_knowngood
@@ -3162,14 +3152,12 @@ def psgd_pro_update_precond(
 
         # procrustes_step
         R = (q_.T - q_).contiguous()
-        R_norm = max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal
-        R = R / R_norm
+        R = R / (max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal)
         RQ = R @ q_
         RRQ = R @ RQ
-        tr_RQ = RQ.diagonal().sum()
-        tr_RRQ = RRQ.diagonal().sum()
-        a = torch.where(tr_RRQ < 0, (-tr_RQ / tr_RRQ).clamp(max=max_step_size), max_step_size)
-        copy_stochastic_(q, q_ + a * RQ + 0.5 * a * a * RRQ)
+        c1, c2 = RQ.diagonal().sum(), RRQ.diagonal().sum()
+        a = torch.where(c2 < 0, (-c1 / c2).clamp(min=0, max=0.5), 0.5)
+        copy_stochastic_(q, q_ + a * RQ + (0.5 * a * a) * RRQ)
 
 
 @decorator_knowngood
