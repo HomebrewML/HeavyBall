@@ -1281,7 +1281,7 @@ class _ULPState:
         ls = (_log_ulp(narrow) - 1).float()
         e_norm = _scale_by_exp2(e, -ls)
         scaled = e_norm.clamp(-1.0, 1.0) * self.smax
-        # SR on the int correction — the bits below the correction's resolution.
+        # SR on the int correction (the bits below the correction's resolution)
         # narrow is RNE so |e| ≤ ULP/2, keeping `scaled` in [-smax, smax]; SR
         # adds at most 1 unit of correction (= ULP/(2*smax)) of error and is
         # unbiased on the lowest representable bits.
