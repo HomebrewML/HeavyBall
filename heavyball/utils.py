@@ -1190,7 +1190,7 @@ def stochastic_divide_(
     stochastic_divide_with_eps_(x, y, eps, backend=backend)
 
 
-@decorator
+@decorator_knowngood
 def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
     """
     Simplified by @francois-rozet in commit 704ccc4bab52429f945df421647ec82c54cdd65f
@@ -1207,6 +1207,47 @@ def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
         g1 = g0.replace(b, b.upper())
         outer_product = compiled_einsum(f"{g0},{g1}->{b + b.upper()}", grad, grad)
         stochastic_lerp_(m, outer_product, 1 - beta)
+
+
+@decorator_knowngood
+def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
+    """KL-Shampoo corrected Kronecker factor accumulation (arXiv:2509.03378).
+
+    L <- lerp(L, G @ R^{-1} @ G.T / d_b, 1-beta)
+    R <- lerp(R, G.T @ L^{-1} @ G / d_a, 1-beta)
+
+    Factor inverses approximated via eigenbasis: Q @ diag(lambda^{-1}) @ Q.T.
+    Falls back to standard outer product for non-2D grads or missing eigenbases.
+    """
+    if grad.dim() == 1 and (not precondition_1d or grad.shape[0] > max_precond_dim):
+        return
+
+    if grad.dim() != 2 or not any(isinstance(m, Tensor) and q is not None for m, q in zip(GG, Q)):
+        return update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
+
+    g32 = promote(grad)
+    infos = []
+    for idx, (m, q) in enumerate(zip(GG, Q)):
+        if not isinstance(m, Tensor) or q is None:
+            infos.append(None)
+            continue
+        q32, m32 = promote(q), promote(m)
+        eigvals = ((q32.T @ m32) * q32.T).sum(dim=1)
+        scale = eigvals.clamp_min(eps).reciprocal() / grad.shape[idx]
+        infos.append((g32.T @ q32 if idx == 0 else g32 @ q32, scale))
+
+    for idx, (m, info) in enumerate(zip(GG, reversed(infos))):
+        if not isinstance(m, Tensor):
+            continue
+        if info is None:
+            b = einsum_base[idx]
+            g0 = einsum_base[: grad.dim()]
+            g1 = g0.replace(b, b.upper())
+            outer = compiled_einsum(f"{g0},{g1}->{b + b.upper()}", g32, g32)
+        else:
+            proj, scale = info
+            outer = (proj * scale[None, :]) @ proj.T
+        stochastic_lerp_(m, outer, 1 - beta)
 
 
 def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
@@ -1290,11 +1331,15 @@ def min_dtype(xs: List[Tensor]):
     return torch.float32
 
 
-def update_preconditioner(grad, Q, GG, exp_avg, max_precond_dim, precondition_1d, beta, update_precond):
+def update_preconditioner(grad, Q, GG, exp_avg, max_precond_dim, precondition_1d, beta, update_precond, eps=None):
     """
     Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
+    When eps is provided, uses KL-Shampoo corrected Kronecker factor accumulation.
     """
-    update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
+    if eps is not None:
+        update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps)
+    else:
+        update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
     if update_precond:
         exp_avg = list_guard(exp_avg)
         get_orthogonal_matrix_QR(GG, Q, *exp_avg)

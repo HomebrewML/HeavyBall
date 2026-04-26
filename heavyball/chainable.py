@@ -1076,7 +1076,7 @@ def _init_soap(state, group, update, grad, param):
     utils.init_preconditioner(grad, state, group["max_precond_dim"], group["precondition_1d"])
 
 
-def _apply_soap_preconditioner(group, update, Q, GG, *references):
+def _apply_soap_preconditioner(group, update, Q, GG, *references, eps=None):
     for upd, q, gg, *ref in zip(update, Q, GG, *references):
         utils.update_preconditioner(
             utils.promote(upd),
@@ -1087,6 +1087,7 @@ def _apply_soap_preconditioner(group, update, Q, GG, *references):
             group["precondition_1d"],
             utils.beta_debias(group["shampoo_beta"], group["step"]),
             group["is_preconditioning"],
+            eps=eps,
         )
 
 
@@ -1107,6 +1108,26 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg)
+    return precond
+
+
+@needs_full_param
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.adam_(
+        exp_avg,
+        exp_avg_sq,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+        group["eps"],
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg, eps=group["eps"])
     return precond
 
 
