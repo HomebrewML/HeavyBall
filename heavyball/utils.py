@@ -27,11 +27,14 @@ zeroth_power_mode = "newtonschulz"
 precise_zeroth_power_mode = "qr"
 tiny_bf16 = torch.finfo(torch.bfloat16).tiny
 _cudnn_double_backward_pattern = re.compile(
-    r"the derivative for .* is not implemented\. Double backwards .* To run double backwards")
+    r"the derivative for .* is not implemented\. Double backwards .* To run double backwards"
+)
 _torch_compile_double_backward_pattern = re.compile(r"compile.*does not currently support double backward")
-_fd_error = ("You can accelerate startup by globally enabling finite_differences first "
-             "(via opt.finite_differences=True or by subclassing it)\n"
-             "Original Error: ")
+_fd_error = (
+    "You can accelerate startup by globally enabling finite_differences first "
+    "(via opt.finite_differences=True or by subclassing it)\n"
+    "Original Error: "
+)
 default_division_backend = "eps_clamp"
 atan2_scale = 16.0
 dither_steps = 1
@@ -128,8 +131,17 @@ def compiled_einsum(expr, *args):
 
 
 @decorator_knowngood
-def _compilable_schedule_free_(p: List[Tensor], z: List[Tensor], ckp1: Tensor, update: List[Tensor], lr: Tensor,
-        beta1: Tensor, decay: float, grad: List[Tensor], caution, ):
+def _compilable_schedule_free_(
+    p: List[Tensor],
+    z: List[Tensor],
+    ckp1: Tensor,
+    update: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    decay: float,
+    grad: List[Tensor],
+    caution,
+):
     for op, oz, u_, g_ in zip(p, z, update, grad):
         u_ = u_.view_as(op)
         p_, z_, u_ = map(promote, (op, oz, u_))
@@ -144,9 +156,20 @@ def _compilable_schedule_free_(p: List[Tensor], z: List[Tensor], ckp1: Tensor, u
         copy_stochastic_(oz, z_)
 
 
-def schedule_free_(lr: float, weight_lr_power: float, weight_sum: float, beta1: float, parameters: List[Tensor],
-        z: List[Tensor], update: List[Tensor], grad: List[Tensor], caution: bool = False, r: float = 0.0, step: int = 0,
-        decay: float = 0.0, ):
+def schedule_free_(
+    lr: float,
+    weight_lr_power: float,
+    weight_sum: float,
+    beta1: float,
+    parameters: List[Tensor],
+    z: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    caution: bool = False,
+    r: float = 0.0,
+    step: int = 0,
+    decay: float = 0.0,
+):
     weight = abs(lr) ** weight_lr_power * max(step, 1) ** r
     weight_sum = weight_sum + weight
 
@@ -162,8 +185,18 @@ def schedule_free_(lr: float, weight_lr_power: float, weight_sum: float, beta1: 
 
 
 @decorator_knowngood
-def _compilable_msam(lr: Tensor, beta1: Tensor, param: List[Tensor], z: List[Tensor], update: List[Tensor],
-        grad: List[Tensor], exp_avg: List[Tensor], caution: bool, decay: Tensor, sam_step_size: Tensor, ):
+def _compilable_msam(
+    lr: Tensor,
+    beta1: Tensor,
+    param: List[Tensor],
+    z: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    exp_avg: List[Tensor],
+    caution: bool,
+    decay: Tensor,
+    sam_step_size: Tensor,
+):
     exp_avg32 = _lerp(exp_avg, update, beta1)
     for u_, g_, z_, p_ in zip(exp_avg32, grad, z, param):
         u_ = u_.view_as(z_)
@@ -175,8 +208,18 @@ def _compilable_msam(lr: Tensor, beta1: Tensor, param: List[Tensor], z: List[Ten
         copy_stochastic_(p_, z32_ + u_ / u_.norm().clamp(min=1e-8) * -sam_step_size)
 
 
-def msam_(lr: float, beta1: float, param: List[Tensor], z: List[Tensor], update: List[Tensor], grad: List[Tensor],
-        exp_avg: List[Tensor], caution: bool, weight_decay: float, sam_step_size: float, ):
+def msam_(
+    lr: float,
+    beta1: float,
+    param: List[Tensor],
+    z: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    exp_avg: List[Tensor],
+    caution: bool,
+    weight_decay: float,
+    sam_step_size: float,
+):
     param, z, update, grad, exp_avg = list_guard(param, z, update, grad, exp_avg)
     lr, beta1, weight_decay, sam_step_size = scalar_guard(lr, beta1, weight_decay, sam_step_size, exp_avg[0])
     _compilable_msam(lr, beta1, param, z, update, grad, exp_avg, caution, weight_decay, sam_step_size)
@@ -239,8 +282,9 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
     return new_grads
 
 
-def linear_warmup_scheduler(step: int, alpha_end: float, alpha_start: float = 0.0,
-        warmup: Optional[int] = None) -> float:
+def linear_warmup_scheduler(
+    step: int, alpha_end: float, alpha_start: float = 0.0, warmup: Optional[int] = None
+) -> float:
     if warmup is None or warmup <= 0:
         return alpha_end
     if step < warmup:
@@ -249,8 +293,9 @@ def linear_warmup_scheduler(step: int, alpha_end: float, alpha_start: float = 0.
     return alpha_end
 
 
-def linear_hl_warmup_scheduler(step: int, beta_end: float, beta_start: float, warmup: Optional[int] = None,
-        eps: float = 1e-8) -> float:
+def linear_hl_warmup_scheduler(
+    step: int, beta_end: float, beta_start: float, warmup: Optional[int] = None, eps: float = 1e-8
+) -> float:
     if warmup is None or warmup <= 0:
         return beta_end
 
@@ -268,8 +313,13 @@ def linear_hl_warmup_scheduler(step: int, beta_end: float, beta_start: float, wa
     return beta_end
 
 
-def _compute_ademamix_hparams(betas: tuple[float, float, float], step: int, alpha: float, beta3_warmup: Optional[int],
-        alpha_warmup: Optional[int], ) -> tuple[float, float, float, float]:
+def _compute_ademamix_hparams(
+    betas: tuple[float, float, float],
+    step: int,
+    alpha: float,
+    beta3_warmup: Optional[int],
+    alpha_warmup: Optional[int],
+) -> tuple[float, float, float, float]:
     if len(betas) != 3:
         raise ValueError("AdEMAMix expects betas=(beta1, beta2, beta3).")
     beta1, beta2, beta3_final = betas
@@ -280,7 +330,7 @@ def _compute_ademamix_hparams(betas: tuple[float, float, float], step: int, alph
 
 
 def beta_debias(beta, step):
-    return 1 - (1 - beta) / (1 - beta ** step)
+    return 1 - (1 - beta) / (1 - beta**step)
 
 
 def _nadam_moments(beta1: Tensor, step: Tensor, momentum_decay: float) -> tuple[Tensor, Tensor]:
@@ -292,8 +342,13 @@ def _nadam_moments(beta1: Tensor, step: Tensor, momentum_decay: float) -> tuple[
     return mu, mu_next
 
 
-def _nadam_prepare_weight_decay(update: List[Tensor], param: List[Tensor], grad: List[Tensor] | None,
-        weight_decay: float, decoupled: bool, ) -> float:
+def _nadam_prepare_weight_decay(
+    update: List[Tensor],
+    param: List[Tensor],
+    grad: List[Tensor] | None,
+    weight_decay: float,
+    decoupled: bool,
+) -> float:
     if weight_decay == 0:
         return 0.0
     if decoupled:
@@ -308,16 +363,29 @@ def _nadam_prepare_weight_decay(update: List[Tensor], param: List[Tensor], grad:
     return 0.0
 
 
-def _nadam_finish_weight_decay(update: List[Tensor], param: List[Tensor], weight_decay: float, decoupled: bool, ) -> \
-List[Tensor]:
+def _nadam_finish_weight_decay(
+    update: List[Tensor],
+    param: List[Tensor],
+    weight_decay: float,
+    decoupled: bool,
+) -> List[Tensor]:
     if weight_decay != 0 and not decoupled:
         update = [u_ - p_ * weight_decay for u_, p_ in zip(update, param)]
     return update
 
 
-def _nadam_compute_update(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], mu_product: List[Tensor],
-        update: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, eps: Tensor, mu: Tensor, mu_next: Tensor, ) -> \
-List[Tensor]:
+def _nadam_compute_update(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    mu_product: List[Tensor],
+    update: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    eps: Tensor,
+    mu: Tensor,
+    mu_next: Tensor,
+) -> List[Tensor]:
     exp_avg32 = _lerp(exp_avg, update, beta1)
     beta2_corr = beta_debias(beta2, step)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, update, beta2_corr, eps, [None])
@@ -342,8 +410,13 @@ def eps_sqrt(item, eps):
 
 
 @decorator_knowngood
-def _compilable_exp_avg_sq_(state: List[Tensor], grad: List[Tensor], beta2: Tensor, eps: Tensor,
-        out: None | List[None | Tensor], ):
+def _compilable_exp_avg_sq_(
+    state: List[Tensor],
+    grad: List[Tensor],
+    beta2: Tensor,
+    eps: Tensor,
+    out: None | List[None | Tensor],
+):
     g32 = promote(grad)
     s32 = _lerp(state, [g_ * g_ for g_ in g32], beta2)
 
@@ -397,8 +470,9 @@ def _compilable_agc_(parameters: List[Tensor], gradients: List[Tensor], clip_val
         copy_stochastic_(grad, g32 * scale)
 
 
-def adaptive_gradient_clipping_(parameters: List[Tensor], gradients: List[Tensor], clip_val: float,
-        minimum: float = 1e-3, eps: float = 1e-8):
+def adaptive_gradient_clipping_(
+    parameters: List[Tensor], gradients: List[Tensor], clip_val: float, minimum: float = 1e-3, eps: float = 1e-8
+):
     if clip_val <= 0:
         return gradients
     parameters, gradients = list_guard(parameters, gradients)
@@ -458,11 +532,14 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
 
     # Torch calls these for 2nd-order optimization in HeavyBall, but they are explicitly handled.
     _ignore_warning(
-        "Using backward() with create_graph=True will create a reference cycle between the parameter and its gradient which can cause a memory leak")
+        "Using backward() with create_graph=True will create a reference cycle between the parameter and its gradient which can cause a memory leak"
+    )
     _ignore_warning(
-        "We recommend using autograd.grad when creating the graph to avoid this. If you have to use this function, make sure to reset the .grad fields of your parameters to None after use to break the cycle and avoid the leak")
+        "We recommend using autograd.grad when creating the graph to avoid this. If you have to use this function, make sure to reset the .grad fields of your parameters to None after use to break the cycle and avoid the leak"
+    )
     _ignore_warning(
-        "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead.")
+        "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead."
+    )
 
 
 @decorator_knowngood
@@ -476,8 +553,13 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7, power_iter: int = -1):
         x = x.mT
 
     # Perform the NS iterations
-    for a, b, c in [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012), ]:
+    for a, b, c in [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]:
         s = x @ x.mT
         y = c * s
         y.diagonal(dim1=-2, dim2=-1).add_(b)
@@ -498,17 +580,21 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7, power_iter: int = -1):
 # under the MIT License
 
 # Coefficients are from https://arxiv.org/pdf/2505.16932v3
-ABC_LIST: list[tuple[float, float, float]] = [(8.28721201814563, -23.595886519098837, 17.300387312530933),
+ABC_LIST: list[tuple[float, float, float]] = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
     (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
     (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
     (3.3184196573706015, -2.488488024314874, 0.51004894012372),
     (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
     (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
-    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248), (1.875, -1.25, 0.375), ]
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+]
 
 # safety factor for numerical stability (but exclude last polynomial)
-ABC_LIST_STABLE: list[tuple[float, float, float]] = [(a / 1.01, b / 1.01 ** 3, c / 1.01 ** 5) for (a, b, c) in
-                                                        ABC_LIST[:-1]] + [ABC_LIST[-1]]
+ABC_LIST_STABLE: list[tuple[float, float, float]] = [
+    (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in ABC_LIST[:-1]
+] + [ABC_LIST[-1]]
 
 
 def msign(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
@@ -782,7 +868,7 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
 
     assert ref.ndim < 13, "ref.ndim must be less than 13"
     in_str = einsum_base[: ref.dim()]
-    out_str = einsum_base[ref.dim(): 2 * ref.dim()]
+    out_str = einsum_base[ref.dim() : 2 * ref.dim()]
 
     from_shampoo = ",".join([o + i for m, i, o in zip(Q, in_str, in_str.upper()) if m is not None])
     if not from_shampoo:
@@ -793,8 +879,9 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
 
     subscripts = f"{in_str},{from_shampoo},{to_shampoo}->{out_str}"
     for r in exp_avg:
-        new = compiled_einsum(subscripts, promote(r), *[promote(q) for q in Q if q is not None],
-            *[q for q in new_qs if q is not None])
+        new = compiled_einsum(
+            subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None]
+        )
         copy_stochastic_(r, new)
 
     for q, q_new in zip(Q, new_qs):
@@ -812,7 +899,7 @@ def _transform_projected_state(old_qs: List[Optional[Tensor]], new_qs: List[Opti
 
     assert ref.ndim < 13, "ref.ndim must be less than 13"
     in_str = einsum_base[: ref.dim()]
-    out_str = einsum_base[ref.dim(): 2 * ref.dim()]
+    out_str = einsum_base[ref.dim() : 2 * ref.dim()]
 
     old_basis = ",".join([o + i for q, i, o in zip(old_qs, in_str, in_str.upper()) if q is not None])
     if not old_basis:
@@ -854,7 +941,8 @@ def get_psgd_eigenbasis(Q: List[Tensor], prev: List[Optional[Tensor]]):
             continue
         if old_basis is None:
             raise ValueError(
-                "get_psgd_eigenbasis requires a previous basis for matrix blocks; use init_psgd_eigenbasis")
+                "get_psgd_eigenbasis requires a previous basis for matrix blocks; use init_psgd_eigenbasis"
+            )
 
         q32 = promote(q)
         old_basis32 = promote(old_basis)
@@ -882,8 +970,14 @@ def update_psgd_eigenbasis(Q: List[Tensor], Q_basis: List[Tensor], *states: Tens
         copy_stochastic_(old_basis, new_basis_i)
 
 
-def _stable_symmetric_basis(m: Tensor, max_eps: float = 1e-3, min_eps: float = 1e-30, *, out_device=None,
-        out_dtype=None, ):
+def _stable_symmetric_basis(
+    m: Tensor,
+    max_eps: float = 1e-3,
+    min_eps: float = 1e-30,
+    *,
+    out_device=None,
+    out_dtype=None,
+):
     out_device = m.device if out_device is None else out_device
     out_dtype = m.dtype if out_dtype is None else out_dtype
     m = promote(m.data)
@@ -1031,8 +1125,9 @@ def _compilable_stochastic_add_divide_(x: List[Tensor], y: List[Tensor], alpha: 
         copy_stochastic_(x_, (x32 + y32 * alpha) / divisor)
 
 
-def stochastic_add_divide_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1,
-        divisor: float = 1):
+def stochastic_add_divide_(
+    x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1, divisor: float = 1
+):
     x, y = broadcastable_list_guard(x, y)
     alpha, divisor = scalar_guard(alpha, divisor, x[0])
     _compilable_stochastic_add_divide_(x, y, alpha, divisor)
@@ -1071,16 +1166,26 @@ def _compilable_stochastic_divide_(x: List[Tensor], y: List[Tensor], eps: Tensor
         copy_stochastic_(x_, _apply_division_backend(x32, y32, eps, backend))
 
 
-def stochastic_divide_with_eps_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, eps: float = 1e-6, *,
-        backend: DivisionBackendLike = DivisionBackend.eps_clamp, ):
+def stochastic_divide_with_eps_(
+    x: List[Tensor] | Tensor,
+    y: List[Tensor] | Tensor,
+    eps: float = 1e-6,
+    *,
+    backend: DivisionBackendLike = DivisionBackend.eps_clamp,
+):
     x, y = broadcastable_list_guard(x, y)
     eps = scalar_guard(eps, y[0])
     backend_enum = _normalize_division_backend(backend)
     _compilable_stochastic_divide_(x, y, eps, backend_enum)
 
 
-def stochastic_divide_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, *,
-        backend: DivisionBackendLike = DivisionBackend.eps_clamp, eps: float = 1e-12, ):
+def stochastic_divide_(
+    x: List[Tensor] | Tensor,
+    y: List[Tensor] | Tensor,
+    *,
+    backend: DivisionBackendLike = DivisionBackend.eps_clamp,
+    eps: float = 1e-12,
+):
     stochastic_divide_with_eps_(x, y, eps, backend=backend)
 
 
@@ -1247,8 +1352,9 @@ def min_dtype(xs: List[Tensor]):
     return torch.float32
 
 
-def update_preconditioner(grad, Q, GG, exp_avg, max_precond_dim, precondition_1d, beta, update_precond,
-                          use_kl: bool = False, eps=1e-8):
+def update_preconditioner(
+    grad, Q, GG, exp_avg, max_precond_dim, precondition_1d, beta, update_precond, use_kl: bool = False, eps=1e-8
+):
     """
     Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
     When eps is provided, uses KL-Shampoo corrected Kronecker factor accumulation.
@@ -1300,8 +1406,9 @@ def project(grad, Q, back: bool):
     preconditioners = ",".join([(g + g.upper())[:: -1 if back else 1] for m, g in zip(Q, param) if m is not None])
     if preconditioners:
         out = "".join([c.upper() if c.upper() in preconditioners else c for c in param])
-        out = compiled_einsum(f"{param},{preconditioners}->{out}", promote(grad),
-            *[promote(q) for q in Q if q is not None])
+        out = compiled_einsum(
+            f"{param},{preconditioners}->{out}", promote(grad), *[promote(q) for q in Q if q is not None]
+        )
         grad = out.to(grad.dtype)
     return grad
 
@@ -1389,8 +1496,14 @@ class StatefulOptimizer(torch.optim.Optimizer):
     hvp_interval: int = 1  # grad is faster initially, hvp later
     consume_grad: bool = True
 
-    _INSTANCE_ATTRS = ("compile_step", "finite_differences", "fallback_to_finite_differences", "hvp_interval",
-                       "hessian_approx", "consume_grad",)
+    _INSTANCE_ATTRS = (
+        "compile_step",
+        "finite_differences",
+        "fallback_to_finite_differences",
+        "hvp_interval",
+        "hessian_approx",
+        "consume_grad",
+    )
 
     def __init__(self, params, defaults, use_ema: bool = False):
         for attr in self._INSTANCE_ATTRS:
@@ -1414,11 +1527,17 @@ class StatefulOptimizer(torch.optim.Optimizer):
         self.register_load_state_dict_pre_hook(StatefulOptimizer._load_stats)
 
     def _store_stats(self, state_dict: dict[str, any]):
-        state_dict["heavyball"] = {"inner_group": self.inner_group, "use_ema": self.use_ema,
-            "ema_decay": self.ema_decay, "compile_step": self.compile_step, "hessian_approx": self.hessian_approx,
+        state_dict["heavyball"] = {
+            "inner_group": self.inner_group,
+            "use_ema": self.use_ema,
+            "ema_decay": self.ema_decay,
+            "compile_step": self.compile_step,
+            "hessian_approx": self.hessian_approx,
             "precond_schedule": pickle.dumps(self.precond_schedule),
             "fallback_to_finite_differences": self.fallback_to_finite_differences,
-            "_fallback_enabled": self._fallback_enabled, "hvp_interval": self.hvp_interval, }
+            "_fallback_enabled": self._fallback_enabled,
+            "hvp_interval": self.hvp_interval,
+        }
 
     _REMOVED_STATS = frozenset({"stochastic_schedule", "precond_rng"})
 
@@ -1459,8 +1578,13 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 for i, pv in enumerate(p_views):
                     self.mapping_inverse[_tensor_key(pv)] = (p, i)
 
-    def split_p_and_g_in_group(self, group: dict, skip_none: bool = True, should_promote: bool = True,
-            raw: bool = False, ):
+    def split_p_and_g_in_group(
+        self,
+        group: dict,
+        skip_none: bool = True,
+        should_promote: bool = True,
+        raw: bool = False,
+    ):
         tmp = group.get("_tmp")
         for p in group["params"]:
             if raw:
@@ -1657,15 +1781,19 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 raise
             if not any(isinstance(arg, str) and _cudnn_double_backward_pattern.match(arg) for arg in e.args):
                 raise
-            warn_once("CUDNN doesn't support double-backward for some models (including RNNs). "  #
-                      f"Falling back to finite_differences.\n{_fd_error}{e}")
+            warn_once(
+                "CUDNN doesn't support double-backward for some models (including RNNs). "  #
+                f"Falling back to finite_differences.\n{_fd_error}{e}"
+            )
         except RuntimeError as e:
             if not self.fallback_to_finite_differences:
                 raise
             if not any(isinstance(arg, str) and _torch_compile_double_backward_pattern.match(arg) for arg in e.args):
                 raise
-            warn_once(f"torch.compile does not support double-backward. Disabling it may be beneficial, depending on "
-                      f"the model.\n{_fd_error}{e}")
+            warn_once(
+                f"torch.compile does not support double-backward. Disabling it may be beneficial, depending on "
+                f"the model.\n{_fd_error}{e}"
+            )
         except ExactHVPFailed as e:
             if not self.fallback_to_finite_differences:
                 raise
@@ -1725,8 +1853,15 @@ def _lerp(state: List[Tensor], grad: List[Tensor], beta):
 
 
 @decorator_knowngood
-def _compilable_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: Tensor, beta2: Tensor,
-        step: Tensor, eps: Tensor, ):
+def _compilable_adam_(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    eps: Tensor,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1736,8 +1871,15 @@ def _compilable_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: Lis
     copy_stochastic_list_(grad, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)])
 
 
-def adam_(exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Tensor, grad: List[Tensor] | Tensor, beta1: float,
-        beta2: float, step: int, eps: float = 1e-8, ) -> List[Tensor]:
+def adam_(
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    eps: float = 1e-8,
+) -> List[Tensor]:
     exp_avg, exp_avg_sq, grad = map(list_guard, (exp_avg, exp_avg_sq, grad))
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
     _compilable_adam_(exp_avg, exp_avg_sq, grad, beta1, beta2, step, eps)
@@ -1745,8 +1887,15 @@ def adam_(exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Tensor, gra
 
 
 @decorator_knowngood
-def _compilable_unscaled_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: Tensor,
-        beta2: Tensor, step: Tensor, eps: Tensor, ):
+def _compilable_unscaled_adam_(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    eps: Tensor,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1757,8 +1906,15 @@ def _compilable_unscaled_adam_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], 
     copy_stochastic_list_(grad, [e_ * d_ for e_, d_ in zip(exp_avg32, denom)])
 
 
-def unscaled_adam_(exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Tensor, grad: List[Tensor] | Tensor,
-        beta1: float, beta2: float, step: int, eps: float = 1e-8, ) -> List[Tensor]:
+def unscaled_adam_(
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    eps: float = 1e-8,
+) -> List[Tensor]:
     exp_avg, exp_avg_sq, grad = map(list_guard, (exp_avg, exp_avg_sq, grad))
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
     _compilable_unscaled_adam_(exp_avg, exp_avg_sq, grad, beta1, beta2, step, eps)
@@ -1766,9 +1922,20 @@ def unscaled_adam_(exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Te
 
 
 @decorator_knowngood
-def _fused_compilable_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-        grad: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, decay: Tensor, lr: Tensor, eps: Tensor,
-        caution: bool, ):
+def _fused_compilable_adam_(
+    y: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    decay: Tensor,
+    lr: Tensor,
+    eps: Tensor,
+    caution: bool,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1778,17 +1945,39 @@ def _fused_compilable_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: 
     _compilable_update_(y, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)], decay, lr, caution, g32)
 
 
-def fused_adam_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-        grad: List[Tensor], beta1: float, beta2: float, step: int, lr: float, eps: float, decay: float,
-        caution: bool, ):
+def fused_adam_(
+    y: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: float,
+    beta2: float,
+    step: int,
+    lr: float,
+    eps: float,
+    decay: float,
+    caution: bool,
+):
     y, exp_avg, exp_avg_sq, grad = list_guard(y, exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, lr, decay = scalar_guard(beta1, beta2, step, lr, decay, y[0])
     _fused_compilable_adam_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, decay, lr, eps, caution)
 
 
-def nadam_(param: List[Tensor] | Tensor, exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Tensor,
-        mu_product: List[Tensor] | Tensor, update: List[Tensor] | Tensor, beta1: float, beta2: float, step: int,
-        momentum_decay: float, eps: float, weight_decay: float, decoupled_weight_decay: bool, ) -> List[Tensor]:
+def nadam_(
+    param: List[Tensor] | Tensor,
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    mu_product: List[Tensor] | Tensor,
+    update: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    momentum_decay: float,
+    eps: float,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+) -> List[Tensor]:
     param, exp_avg, exp_avg_sq, mu_product, update = map(list_guard, (param, exp_avg, exp_avg_sq, mu_product, update))
     if not param:
         return update
@@ -1801,8 +1990,9 @@ def nadam_(param: List[Tensor] | Tensor, exp_avg: List[Tensor] | Tensor, exp_avg
 
     _nadam_prepare_weight_decay(update32, param32, None, weight_decay_val, decoupled_weight_decay)
     mu_t, mu_next_t = _nadam_moments(beta1_t, step_t, momentum_decay)
-    update32 = _nadam_compute_update(exp_avg, exp_avg_sq, mu_product, update32, beta1_t, beta2_t, step_t, eps_t, mu_t,
-        mu_next_t)
+    update32 = _nadam_compute_update(
+        exp_avg, exp_avg_sq, mu_product, update32, beta1_t, beta2_t, step_t, eps_t, mu_t, mu_next_t
+    )
     update32 = _nadam_finish_weight_decay(update32, param32, weight_decay_val, decoupled_weight_decay)
 
     copy_stochastic_list_(update, update32)
@@ -1810,10 +2000,24 @@ def nadam_(param: List[Tensor] | Tensor, exp_avg: List[Tensor] | Tensor, exp_avg
 
 
 @decorator_knowngood
-def _fused_compilable_nadam_(param: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor],
-        mu_product: List[Tensor], update: List[Tensor], grad: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor,
-        lr: Tensor, eps: Tensor, mu: Tensor, mu_next: Tensor, weight_decay: float, decoupled_weight_decay: bool,
-        caution: bool, ):
+def _fused_compilable_nadam_(
+    param: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    mu_product: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    lr: Tensor,
+    eps: Tensor,
+    mu: Tensor,
+    mu_next: Tensor,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+    caution: bool,
+):
     weight_decay_val = float(weight_decay)
 
     update32 = promote(update)
@@ -1830,24 +2034,64 @@ def _fused_compilable_nadam_(param: List[Tensor], exp_avg: List[Tensor], exp_avg
     _compilable_update_(param, update32, decay_t, lr, caution, grad32)
 
 
-def fused_nadam_(param: List[Tensor] | Tensor, exp_avg: List[Tensor] | Tensor, exp_avg_sq: List[Tensor] | Tensor,
-        mu_product: List[Tensor] | Tensor, update: List[Tensor] | Tensor, grad: List[Tensor] | Tensor, beta1: float,
-        beta2: float, step: int, lr: float, eps: float, momentum_decay: float, weight_decay: float,
-        decoupled_weight_decay: bool, caution: bool, ):
-    param, exp_avg, exp_avg_sq, mu_product, update, grad = list_guard(param, exp_avg, exp_avg_sq, mu_product, update,
-        grad)
+def fused_nadam_(
+    param: List[Tensor] | Tensor,
+    exp_avg: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    mu_product: List[Tensor] | Tensor,
+    update: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    beta1: float,
+    beta2: float,
+    step: int,
+    lr: float,
+    eps: float,
+    momentum_decay: float,
+    weight_decay: float,
+    decoupled_weight_decay: bool,
+    caution: bool,
+):
+    param, exp_avg, exp_avg_sq, mu_product, update, grad = list_guard(
+        param, exp_avg, exp_avg_sq, mu_product, update, grad
+    )
     if not param:
         return
 
     beta1_t, beta2_t, step_t, lr_t, eps_t = scalar_guard(beta1, beta2, step, lr, eps, param[0])
     mu_t, mu_next_t = _nadam_moments(beta1_t, step_t, momentum_decay)
-    _fused_compilable_nadam_(param, exp_avg, exp_avg_sq, mu_product, update, grad, beta1_t, beta2_t, step_t, lr_t,
-        eps_t, mu_t, mu_next_t, weight_decay, decoupled_weight_decay, caution, )
+    _fused_compilable_nadam_(
+        param,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        update,
+        grad,
+        beta1_t,
+        beta2_t,
+        step_t,
+        lr_t,
+        eps_t,
+        mu_t,
+        mu_next_t,
+        weight_decay,
+        decoupled_weight_decay,
+        caution,
+    )
 
 
 @decorator_knowngood
-def _compilable_ademamix_update_(exp_avg_fast: List[Tensor], exp_avg_slow: List[Tensor], exp_avg_sq: List[Tensor],
-        update: List[Tensor], beta1: Tensor, beta2: Tensor, beta3: Tensor, step: Tensor, alpha: Tensor, eps: Tensor, ):
+def _compilable_ademamix_update_(
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    beta3: Tensor,
+    step: Tensor,
+    alpha: Tensor,
+    eps: Tensor,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1860,36 +2104,90 @@ def _compilable_ademamix_update_(exp_avg_fast: List[Tensor], exp_avg_slow: List[
 
 
 @decorator_knowngood
-def _fused_compilable_ademamix_(y: List[Tensor], exp_avg_fast: List[Tensor], exp_avg_slow: List[Tensor],
-        exp_avg_sq: List[Tensor], update: List[Tensor], grad: List[Tensor], beta1: Tensor, beta2: Tensor, beta3: Tensor,
-        step: Tensor, alpha: Tensor, lr: Tensor, eps: Tensor, decay: Tensor, caution: bool, ):
+def _fused_compilable_ademamix_(
+    y: List[Tensor],
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    beta3: Tensor,
+    step: Tensor,
+    alpha: Tensor,
+    lr: Tensor,
+    eps: Tensor,
+    decay: Tensor,
+    caution: bool,
+):
     grad32 = list(map(promote, grad))
-    update32 = _compilable_ademamix_update_(exp_avg_fast, exp_avg_slow, exp_avg_sq, update, beta1, beta2, beta3, step,
-        alpha, eps)
+    update32 = _compilable_ademamix_update_(
+        exp_avg_fast, exp_avg_slow, exp_avg_sq, update, beta1, beta2, beta3, step, alpha, eps
+    )
     _compilable_update_(y, update32, decay, lr, caution, grad32)
 
 
-def fused_ademamix_(y: List[Tensor], exp_avg_fast: List[Tensor], exp_avg_slow: List[Tensor], exp_avg_sq: List[Tensor],
-        update: List[Tensor], grad: List[Tensor], betas: tuple[float, float, float], step: int, lr: float, eps: float,
-        decay: float, alpha: float, caution: bool, beta3_warmup: Optional[int] = None,
-        alpha_warmup: Optional[int] = None, ):
-    y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad = list_guard(y, exp_avg_fast, exp_avg_slow, exp_avg_sq,
-        update, grad)
+def fused_ademamix_(
+    y: List[Tensor],
+    exp_avg_fast: List[Tensor],
+    exp_avg_slow: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    betas: tuple[float, float, float],
+    step: int,
+    lr: float,
+    eps: float,
+    decay: float,
+    alpha: float,
+    caution: bool,
+    beta3_warmup: Optional[int] = None,
+    alpha_warmup: Optional[int] = None,
+):
+    y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad = list_guard(
+        y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad
+    )
     if not y:
         return
 
     ref = y[0]
     beta1_f, beta2_f, beta3_f, alpha_f = _compute_ademamix_hparams(betas, step, alpha, beta3_warmup, alpha_warmup)
-    beta1_t, beta2_t, beta3_t, alpha_t, step_t, lr_t, eps_t, decay_t = scalar_guard(beta1_f, beta2_f, beta3_f, alpha_f,
-        step, lr, eps, decay, ref)
+    beta1_t, beta2_t, beta3_t, alpha_t, step_t, lr_t, eps_t, decay_t = scalar_guard(
+        beta1_f, beta2_f, beta3_f, alpha_f, step, lr, eps, decay, ref
+    )
 
-    _fused_compilable_ademamix_(y, exp_avg_fast, exp_avg_slow, exp_avg_sq, update, grad, beta1_t, beta2_t, beta3_t,
-        step_t, alpha_t, lr_t, eps_t, decay_t, caution, )
+    _fused_compilable_ademamix_(
+        y,
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        update,
+        grad,
+        beta1_t,
+        beta2_t,
+        beta3_t,
+        step_t,
+        alpha_t,
+        lr_t,
+        eps_t,
+        decay_t,
+        caution,
+    )
 
 
-def ademamix_(exp_avg_fast: List[Tensor] | Tensor, exp_avg_slow: List[Tensor] | Tensor,
-        exp_avg_sq: List[Tensor] | Tensor, grad: List[Tensor] | Tensor, betas: tuple[float, float, float], step: int,
-        eps: float, alpha: float, beta3_warmup: Optional[int] = None, alpha_warmup: Optional[int] = None, ):
+def ademamix_(
+    exp_avg_fast: List[Tensor] | Tensor,
+    exp_avg_slow: List[Tensor] | Tensor,
+    exp_avg_sq: List[Tensor] | Tensor,
+    grad: List[Tensor] | Tensor,
+    betas: tuple[float, float, float],
+    step: int,
+    eps: float,
+    alpha: float,
+    beta3_warmup: Optional[int] = None,
+    alpha_warmup: Optional[int] = None,
+):
     exp_avg_fast, exp_avg_slow, exp_avg_sq, grad = list_guard(exp_avg_fast, exp_avg_slow, exp_avg_sq, grad)
     if not grad:
         return grad
@@ -1898,15 +2196,23 @@ def ademamix_(exp_avg_fast: List[Tensor] | Tensor, exp_avg_slow: List[Tensor] | 
     beta1_f, beta2_f, beta3_f, alpha_f = _compute_ademamix_hparams(betas, step, alpha, beta3_warmup, alpha_warmup)
     beta1_t, beta2_t, beta3_t, alpha_t, step_t, eps_t = scalar_guard(beta1_f, beta2_f, beta3_f, alpha_f, step, eps, ref)
 
-    update32 = _compilable_ademamix_update_(exp_avg_fast, exp_avg_slow, exp_avg_sq, grad, beta1_t, beta2_t, beta3_t,
-        step_t, alpha_t, eps_t)
+    update32 = _compilable_ademamix_update_(
+        exp_avg_fast, exp_avg_slow, exp_avg_sq, grad, beta1_t, beta2_t, beta3_t, step_t, alpha_t, eps_t
+    )
     copy_stochastic_list_(grad, update32)
     return grad
 
 
 @decorator_knowngood
-def _compilable_laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: Tensor,
-        beta2: Tensor, step: Tensor, eps: Tensor, ):
+def _compilable_laprop_(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    eps: Tensor,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1916,8 +2222,15 @@ def _compilable_laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: L
     copy_stochastic_list_(grad, gp32)
 
 
-def laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor], beta1: float, beta2: float, step: int,
-        eps: float = 1e-8, ):
+def laprop_(
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    grad: List[Tensor],
+    beta1: float,
+    beta2: float,
+    step: int,
+    eps: float = 1e-8,
+):
     exp_avg, exp_avg_sq, grad = list_guard(exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, eps = scalar_guard(beta1, beta2, step, eps, exp_avg[0])
     _compilable_laprop_(exp_avg, exp_avg_sq, grad, beta1, beta2, step, eps)
@@ -1925,9 +2238,20 @@ def laprop_(exp_avg: List[Tensor], exp_avg_sq: List[Tensor], grad: List[Tensor],
 
 
 @decorator_knowngood
-def _fused_compilable_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-        grad: List[Tensor], beta1: Tensor, beta2: Tensor, step: Tensor, lr: Tensor, decay: Tensor, caution: bool,
-        eps: Tensor, ):
+def _fused_compilable_laprop_(
+    y: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: Tensor,
+    beta2: Tensor,
+    step: Tensor,
+    lr: Tensor,
+    decay: Tensor,
+    caution: bool,
+    eps: Tensor,
+):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
@@ -1937,9 +2261,20 @@ def _fused_compilable_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq
     _compilable_update_(y, u32, decay, lr, caution, gp32)
 
 
-def fused_laprop_(y: List[Tensor], exp_avg: List[Tensor], exp_avg_sq: List[Tensor], update: List[Tensor],
-        grad: List[Tensor], beta1: float, beta2: float, step: int, lr: float, decay: float, caution: bool,
-        eps: float = 1e-8, ):
+def fused_laprop_(
+    y: List[Tensor],
+    exp_avg: List[Tensor],
+    exp_avg_sq: List[Tensor],
+    update: List[Tensor],
+    grad: List[Tensor],
+    beta1: float,
+    beta2: float,
+    step: int,
+    lr: float,
+    decay: float,
+    caution: bool,
+    eps: float = 1e-8,
+):
     exp_avg, exp_avg_sq, grad, y = list_guard(exp_avg, exp_avg_sq, grad, y)
     beta1, beta2, step, lr, eps, decay = scalar_guard(beta1, beta2, step, lr, eps, decay, exp_avg[0])
     _fused_compilable_laprop_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, lr, decay, caution, eps)
@@ -2018,8 +2353,14 @@ def copy_stochastic_(target: Tensor, source: Tensor):
 
 
 @decorator_knowngood
-def _compilable_update_(p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Tensor, caution: bool,
-        g: List[Optional[Tensor]], ):
+def _compilable_update_(
+    p: List[Tensor],
+    u: List[Tensor],
+    decay: Tensor,
+    lr: Tensor,
+    caution: bool,
+    g: List[Optional[Tensor]],
+):
     for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a multi-tensor op
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
@@ -2029,8 +2370,14 @@ def _compilable_update_(p: List[Tensor], u: List[Tensor], decay: Tensor, lr: Ten
         copy_stochastic_(p_, p32_)
 
 
-def update_param_(param: List[Tensor], update: List[Tensor], lr: float, decay: float, caution: bool = False,
-        grad: List[Tensor] = None, ):
+def update_param_(
+    param: List[Tensor],
+    update: List[Tensor],
+    lr: float,
+    decay: float,
+    caution: bool = False,
+    grad: List[Tensor] = None,
+):
     param, update, grad = list_guard(param, update, grad)
     lr = scalar_guard(lr, param[0])
     if not caution:
@@ -2105,13 +2452,16 @@ def precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, ve
     if scale is not None:
         automatic_scale = False
         warn_once(
-            "It's recommended to use precond_init_scale=None (default since 1.7.x), which uses advanced heuristics.")
+            "It's recommended to use precond_init_scale=None (default since 1.7.x), which uses advanced heuristics."
+        )
         if scale_scale != 1:
             warn_once(
-                "precond_init_scale_scale multiplies the precond_init_scale by a constant factor. With a fixed precond_init_scale, you should explicitly fuse it.")
+                "precond_init_scale_scale multiplies the precond_init_scale by a constant factor. With a fixed precond_init_scale, you should explicitly fuse it."
+            )
         if scale_power is not None:
             warn_once(
-                "precond_init_scale_power is used to compute precond_init_scale ** precond_init_scale_power. With a fixed precond_init_scale, you should explicitly fuse it.")
+                "precond_init_scale_power is used to compute precond_init_scale ** precond_init_scale_power. With a fixed precond_init_scale, you should explicitly fuse it."
+            )
     elif hessian_vector is None:
         scale = mean_root(grad, 4) * scale_scale
     else:
@@ -2119,7 +2469,7 @@ def precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, ve
 
     if automatic_scale:
         scale_power = 0.5 if scale_power is None else scale_power
-        scale = scale ** scale_power
+        scale = scale**scale_power
 
     if isinstance(scale, torch.Tensor):
         scale = scale.item()  # slow, but necessary
@@ -2138,7 +2488,8 @@ def precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, ve
             continue
         if torch.allclose(x, torch.zeros_like(x)):
             raise PrecondInitError(
-                f"Grad or HVP is all 0s, causing NaNs in precond_init_scale computation.{manual_hint}")
+                f"Grad or HVP is all 0s, causing NaNs in precond_init_scale computation.{manual_hint}"
+            )
         if not torch.isfinite(x).all().item():
             raise PrecondInitError("Grad or HVP is not finite")
 
@@ -2148,8 +2499,9 @@ def precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, ve
     raise PrecondInitError(f"Computed precond_init_scale is not finite.{manual_hint}")
 
 
-def init_lra(grad, param_count, scale, scale_scale, scale_power, rank, hessian_vector, vector, dtype=None,
-        eps: float = 10):
+def init_lra(
+    grad, param_count, scale, scale_scale, scale_power, rank, hessian_vector, vector, dtype=None, eps: float = 10
+):
     # "+10 to 1) avoid /0; 2) make sure that norm(U*V') << 1 even when rank_of_approximation=1" from @lixilinx at
     # https://github.com/lixilinx/psgd_torch/blob/590cd3f125552998ed20028be096652540e2a200/preconditioned_stochastic_gradient_descent.py#L829C11-L829C14
     scale = precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, vector)
@@ -2160,8 +2512,18 @@ def init_lra(grad, param_count, scale, scale_scale, scale_power, rank, hessian_v
     return U, V, d
 
 
-def init_Q_exprs(grad, scale, scale_scale, scale_power, max_size, min_ndim_triangular, memory_save_mode, hessian_vector,
-        vector, dtype=None, ):
+def init_Q_exprs(
+    grad,
+    scale,
+    scale_scale,
+    scale_power,
+    max_size,
+    min_ndim_triangular,
+    memory_save_mode,
+    hessian_vector,
+    vector,
+    dtype=None,
+):
     """
     For a scalar or tensor `grad`, we initialize its preconditioner Q and
     reusable einsum expressions for updating Q and preconditioning gradient.
@@ -2194,8 +2556,10 @@ def init_Q_exprs(grad, scale, scale_scale, scale_power, max_size, min_ndim_trian
     elif memory_save_mode == "all_diag":
         dim_diag = [True for _ in shape]
     else:
-        raise ValueError(f"Invalid memory_save_mode: {memory_save_mode}, must be one of "
-                         "[None, 'one_diag', 'all_diag', 'smart_one_diag']")
+        raise ValueError(
+            f"Invalid memory_save_mode: {memory_save_mode}, must be one of "
+            "[None, 'one_diag', 'all_diag', 'smart_one_diag']"
+        )
 
     Q = []
     for i, (size, dim_d) in enumerate(zip(shape, dim_diag)):
@@ -2234,8 +2598,18 @@ def low_rank_mm(U: Tensor, V: Tensor, x: Tensor) -> Tensor:
 
 
 @decorator_knowngood
-def _compilable_d_step(d: Tensor, d_orig: List[Tensor], invQtv: Tensor, vector: Tensor, inverse_precond_vector: Tensor,
-        hessian_vector: Tensor, precond_hessian_vector: Tensor, eps: Tensor, step: Tensor, delayed: bool, ):
+def _compilable_d_step(
+    d: Tensor,
+    d_orig: List[Tensor],
+    invQtv: Tensor,
+    vector: Tensor,
+    inverse_precond_vector: Tensor,
+    hessian_vector: Tensor,
+    precond_hessian_vector: Tensor,
+    eps: Tensor,
+    step: Tensor,
+    delayed: bool,
+):
     precond_hessian_vector = promote(precond_hessian_vector)
     hessian_vector = promote(hessian_vector)
     vector = promote(vector)
@@ -2274,8 +2648,17 @@ def _compilable_d_step(d: Tensor, d_orig: List[Tensor], invQtv: Tensor, vector: 
         copy_stochastic_(d, promote(d) - nablaD * step)
 
 
-def update_lra_precond_(U: List[Tensor], V: List[Tensor], d: List[Tensor], vector: Tensor, hessian_vector: Tensor,
-        eps: float, step: float, delayed: bool, precond_u: bool, ):
+def update_lra_precond_(
+    U: List[Tensor],
+    V: List[Tensor],
+    d: List[Tensor],
+    vector: Tensor,
+    hessian_vector: Tensor,
+    eps: float,
+    step: float,
+    delayed: bool,
+    precond_u: bool,
+):
     """
     Adapted from https://github.com/lixilinx/psgd_torch/blob/6dbea94915679d08a289928e6431b6ce07931aaf/preconditioned_stochastic_gradient_descent.py#L657
     """
@@ -2359,19 +2742,37 @@ def dampen_grad(g: Tensor, damp: float = 1e-9):
 
 
 @decorator_knowngood
-def _compilable_lra_update_(params: List[Tensor], update: List[Tensor], U: Tensor, V: Tensor, d: Tensor, lr: Tensor,
-        decay: Tensor, caution: bool, grads: List[Tensor], ):
+def _compilable_lra_update_(
+    params: List[Tensor],
+    update: List[Tensor],
+    U: Tensor,
+    V: Tensor,
+    d: Tensor,
+    lr: Tensor,
+    decay: Tensor,
+    caution: bool,
+    grads: List[Tensor],
+):
     update = lra_precond(U, V, d, flatten(update))
     start = 0
     update = update.flatten()
     for p, g in zip(params, grads):
         size = p.numel()
-        update_param_(p, update[start: start + size].view_as(p), lr, decay, caution, g)
+        update_param_(p, update[start : start + size].view_as(p), lr, decay, caution, g)
         start += size
 
 
-def apply_lra_update(params: List[Tensor], update: Tensor, U: Tensor, V: Tensor, d: Tensor, lr: float, decay: float,
-        caution: bool, grads: List[Tensor], ):
+def apply_lra_update(
+    params: List[Tensor],
+    update: Tensor,
+    U: Tensor,
+    V: Tensor,
+    d: Tensor,
+    lr: float,
+    decay: float,
+    caution: bool,
+    grads: List[Tensor],
+):
     params, grads = list_guard(params, grads)
     lr, decay = scalar_guard(lr, decay, params[0])
     _compilable_lra_update_(params, update, U, V, d, lr, decay, caution, grads)
@@ -2383,7 +2784,7 @@ def apply_flat_update(params: List[Tensor], update: Tensor):
     update = update.flatten()
     for p in params:
         size = p.numel()
-        copy_stochastic_(p, update[start: start + size].view_as(p))
+        copy_stochastic_(p, update[start : start + size].view_as(p))
         start += size
 
 
@@ -2399,7 +2800,7 @@ def apply_flat_add(params: List[Tensor], update: Tensor, alpha: Tensor):
     update = update.flatten()
     for p in params:
         size = p.numel()
-        stochastic_add_([p], [update[start: start + size].view_as(p)], alpha)
+        stochastic_add_([p], [update[start : start + size].view_as(p)], alpha)
         start += size
 
 
@@ -2410,7 +2811,7 @@ def extract_from_flat_update(params: List[Tensor], update: Tensor):
     update = update.flatten()
     for p in params:
         size = p.numel()
-        outputs.append(update[start: start + size].view_as(p))
+        outputs.append(update[start : start + size].view_as(p))
         start += size
     return outputs
 
@@ -2596,13 +2997,19 @@ def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
 
 
 @decorator_knowngood
-def clamped_max_singular_value(A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False,
-        power_iter: int = 16) -> Tensor:
+def clamped_max_singular_value(
+    A: Tensor, min: float, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16
+) -> Tensor:
     return max_singular_value(A, max_svd, use_cholesky, power_iter).clamp(min=min)
 
 
 @decorator_knowngood
-def min_singular_value(A: Tensor, power_iter: int = 5, safety: float = 1.05, max_svd: int = 32, ):
+def min_singular_value(
+    A: Tensor,
+    power_iter: int = 5,
+    safety: float = 1.05,
+    max_svd: int = 32,
+):
     if A.ndim < 2:
         return A.abs().min()
 
@@ -2631,7 +3038,7 @@ def min_singular_value(A: Tensor, power_iter: int = 5, safety: float = 1.05, max
     lambda_min_hat = lambda_upper - mu_hat
 
     mu = A.trace() / n
-    sigma_square = A.square().sum() / n - mu ** 2
+    sigma_square = A.square().sum() / n - mu**2
     approx = mu - (sigma_square / (n - 1)).sqrt()
 
     return torch.where((~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), approx, lambda_min_hat).squeeze()
@@ -2752,8 +3159,17 @@ def _update_lb(ell: Tensor, lb_state: Tensor, beta: Tensor) -> Tensor:
 
 
 @decorator_no_fullgraph
-def psgd_update_precond(G: Tensor, precond_lr: float, oq: "TriuOrLine", store_triu_as_line: bool, beta2: float,
-        V: Tensor, running_lower_bound: List[Tensor], lower_bount_beta: float, power_iter: int, ) -> None:
+def psgd_update_precond(
+    G: Tensor,
+    precond_lr: float,
+    oq: "TriuOrLine",
+    store_triu_as_line: bool,
+    beta2: float,
+    V: Tensor,
+    running_lower_bound: List[Tensor],
+    lower_bount_beta: float,
+    power_iter: int,
+) -> None:
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     Q = _balance_to_triu(oq)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
@@ -2781,8 +3197,16 @@ def psgd_update_precond(G: Tensor, precond_lr: float, oq: "TriuOrLine", store_tr
 
 
 @decorator_knowngood
-def psgd_pro_update_precond(G: Tensor, precond_lr: float, Q: List[Tensor], running_lower_bound: List[Tensor],
-        lower_bount_beta: float, power_iter: int, dampening: float, max_step_size: float = 1 / 8, ) -> None:
+def psgd_pro_update_precond(
+    G: Tensor,
+    precond_lr: float,
+    Q: List[Tensor],
+    running_lower_bound: List[Tensor],
+    lower_bount_beta: float,
+    power_iter: int,
+    dampening: float,
+    max_step_size: float = 1 / 8,
+) -> None:
     """Update Kronecker product preconditioner Q with Q0.5EQ1.5 (PRO) method."""
     psgd_balance_Q(Q)
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
@@ -2872,8 +3296,9 @@ def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
 
 
 @decorator_knowngood
-def eigvecs_product_rank1(G: Tensor, v: Tensor, w: Optional[Tensor] = None, eps: float = 1e-12) -> Tuple[
-    Tensor, Tensor]:
+def eigvecs_product_rank1(
+    G: Tensor, v: Tensor, w: Optional[Tensor] = None, eps: float = 1e-12
+) -> Tuple[Tensor, Tensor]:
     """
     Compute Y = G @ V where V is an eigenvector matrix for P = λ I + σ v v^T,
     using the Householder reflector with first column v. Never materializes V.
@@ -2914,8 +3339,15 @@ def cond_n(cond_val: Tensor, *fns):
 
 
 @decorator_knowngood
-def _psgd_precond_update_(matmuled: List[Optional[Tensor]], Q: "TriuOrLine", running_lower_bound: List[Tensor],
-        lower_bount_beta: Tensor, precond_lr: Tensor, store_triu_as_line: bool, power_iter: int, ):
+def _psgd_precond_update_(
+    matmuled: List[Optional[Tensor]],
+    Q: "TriuOrLine",
+    running_lower_bound: List[Tensor],
+    lower_bount_beta: Tensor,
+    precond_lr: Tensor,
+    store_triu_as_line: bool,
+    power_iter: int,
+):
     for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
         if isinstance(oq, tuple):
             oq = oq[1]
@@ -2999,7 +3431,7 @@ def _compilable_global_l2norm_clip_(x, clip_at, eps=1e-8):
     norm = 0
     for i in x:
         norm += promote(i).square().sum()
-    norm = norm ** 0.5
+    norm = norm**0.5
     scalar = clip_at / norm.clamp(min=max(clip_at, eps))
     stochastic_multiply_(x, scalar)
 
@@ -3095,8 +3527,9 @@ def _log_ulp(x):
     m = _NUM_MANTISSA_BITS[x.dtype]
     bias = _EXPONENT_BIAS[x.dtype]
     exp = (x.view(torch.int16) & 0x7FFF) >> m
-    return torch.where(exp == 0, torch.tensor(1 - bias - m, device=x.device, dtype=torch.int32),
-                       exp.to(torch.int32) - (bias + m))
+    return torch.where(
+        exp == 0, torch.tensor(1 - bias - m, device=x.device, dtype=torch.int32), exp.to(torch.int32) - (bias + m)
+    )
 
 
 def _scale_by_exp2(x, log_scale):
@@ -3236,7 +3669,12 @@ def cached_precond_grad_expr(Q_dim, grad_dim):
 
 
 @decorator_knowngood
-def precond_grad_cached_(ea: Tensor, cached_q: List[Tensor], caution: bool = False, grad: Optional[Tensor] = None, ):
+def precond_grad_cached_(
+    ea: Tensor,
+    cached_q: List[Tensor],
+    caution: bool = False,
+    grad: Optional[Tensor] = None,
+):
     if caution:
         ea = _compilable_cautioning(grad, ea)
     args = [promote(q) for q in cached_q]
@@ -3261,8 +3699,9 @@ def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cach
 
 @functools.lru_cache(maxsize=None)
 def precond_grad_expr(Q_dim, grad_dim):
-    expr = [f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in
-        zip(einsum_base, einsum_base[13:], Q_dim)]
+    expr = [
+        f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
+    ]
     expr = ",".join(expr)
     grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
@@ -3270,8 +3709,13 @@ def precond_grad_expr(Q_dim, grad_dim):
 
 
 @decorator_knowngood
-def psgd_precond_grad(ea: Tensor, preconds: TriuOrLine, caution: bool = False, grad: Optional[Tensor] = None,
-        store_triu_as_line: bool = False, ):
+def psgd_precond_grad(
+    ea: Tensor,
+    preconds: TriuOrLine,
+    caution: bool = False,
+    grad: Optional[Tensor] = None,
+    store_triu_as_line: bool = False,
+):
     if caution:
         ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
@@ -3282,14 +3726,36 @@ def psgd_precond_grad(ea: Tensor, preconds: TriuOrLine, caution: bool = False, g
 
 
 @decorator_knowngood
-def _compilable_fused_psgd_precond_grad(ea: Tensor, param, lr, grad, decay, caution, preconds: TriuOrLine,
-        store_triu_as_line: bool = False, ):
-    precond = psgd_precond_grad(ea, preconds, caution=caution, grad=grad, store_triu_as_line=store_triu_as_line, )
+def _compilable_fused_psgd_precond_grad(
+    ea: Tensor,
+    param,
+    lr,
+    grad,
+    decay,
+    caution,
+    preconds: TriuOrLine,
+    store_triu_as_line: bool = False,
+):
+    precond = psgd_precond_grad(
+        ea,
+        preconds,
+        caution=caution,
+        grad=grad,
+        store_triu_as_line=store_triu_as_line,
+    )
     update_param_(param, precond, lr, decay, caution=False, grad=grad)
 
 
-def fused_psgd_precond_grad(ea: Tensor, param, lr, grad, decay, caution, preconds: TriuOrLine,
-        store_triu_as_line: bool = False, ):
+def fused_psgd_precond_grad(
+    ea: Tensor,
+    param,
+    lr,
+    grad,
+    decay,
+    caution,
+    preconds: TriuOrLine,
+    store_triu_as_line: bool = False,
+):
     lr, decay = scalar_guard(lr, decay, param[0])
     _compilable_fused_psgd_precond_grad(ea, param, lr, grad, decay, caution, preconds, store_triu_as_line)
 
@@ -3344,8 +3810,15 @@ def caution(g, update):
 
 
 @decorator_knowngood
-def _compilable_hyperball_(p: List[Tensor], u: List[Tensor], init_norm: List[Tensor], lr: Tensor, decay: float,
-        caution: bool, g: List[Tensor], ):
+def _compilable_hyperball_(
+    p: List[Tensor],
+    u: List[Tensor],
+    init_norm: List[Tensor],
+    lr: Tensor,
+    decay: float,
+    caution: bool,
+    g: List[Tensor],
+):
     for op, u_, n_, g_ in zip(p, u, init_norm, g):
         u_ = promote(u_.view_as(op))
         p_ = promote(op)
@@ -3371,13 +3844,15 @@ def hyperball_step_(param, update, init_norm, lr, decay, caution, grad):
     _compilable_hyperball_(param, update, init_norm, lr, decay, caution, grad)
 
 
-def _inner_precond_update_prob_schedule(n: int, max_prob: float = 1.0, min_prob: float = 0.03, decay: float = 0.999,
-        flat_start: float = 1000):
+def _inner_precond_update_prob_schedule(
+    n: int, max_prob: float = 1.0, min_prob: float = 0.03, decay: float = 0.999, flat_start: float = 1000
+):
     return max(min_prob, max_prob * decay ** max(n - flat_start, 0))
 
 
-def precond_update_prob_schedule(max_prob: float = 1.0, min_prob: float = 0.03, decay: float = 0.999,
-        flat_start: float = 1000):
+def precond_update_prob_schedule(
+    max_prob: float = 1.0, min_prob: float = 0.03, decay: float = 0.999, flat_start: float = 1000
+):
     """Anneal preconditioner update probability during beginning of training.
 
     PSGD benefits from more preconditioner updates at the beginning of training,
@@ -3388,8 +3863,9 @@ def precond_update_prob_schedule(max_prob: float = 1.0, min_prob: float = 0.03, 
     `min_prob` by ~4000 steps. Default settings work very well for most models and
     training regimes.
     """
-    return functools.partial(_inner_precond_update_prob_schedule, max_prob=max_prob, min_prob=min_prob, decay=decay,
-        flat_start=flat_start)
+    return functools.partial(
+        _inner_precond_update_prob_schedule, max_prob=max_prob, min_prob=min_prob, decay=decay, flat_start=flat_start
+    )
 
 
 def merge_group(group, *tensors):
@@ -3400,9 +3876,14 @@ def merge_group(group, *tensors):
 
     out = []
     for t in tensors:
-        append_or_extend(out,
-            dim_merger(t, group["max_size_triangular"] if "max_size_triangular" in group else group["max_precond_dim"],
-                group.get("split", False), ), )
+        append_or_extend(
+            out,
+            dim_merger(
+                t,
+                group["max_size_triangular"] if "max_size_triangular" in group else group["max_precond_dim"],
+                group.get("split", False),
+            ),
+        )
     return out
 
 
@@ -3425,8 +3906,9 @@ def d_adaptation(grads: List[Tensor], update: List[Tensor], state: List[Tensor],
 
 
 @decorator_knowngood
-def _compilable_lr_adapt_(grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor],
-        lr_lr: Tensor):
+def _compilable_lr_adapt_(
+    grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor], lr_lr: Tensor
+):
     for g_, u_, s_, d_ in zip(grads, update, state, delta):
         g, u, s, d = promote(g_), promote(u_), promote(s_), promote(d_)
         lr_grad = d.sigmoid()
@@ -3445,8 +3927,9 @@ def lr_adaptation(grads: List[Tensor], update: List[Tensor], state: List[Tensor]
 
 
 @decorator_knowngood
-def _compilable_pointwise_lr_adapt_(grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor],
-        lr_lr: Tensor):
+def _compilable_pointwise_lr_adapt_(
+    grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor], lr_lr: Tensor
+):
     for g_, u_, s_, d_ in zip(grads, update, state, delta):
         g, u, s, d = promote(g_), promote(u_), promote(s_), promote(d_)
         lr_grad = d.sigmoid()
@@ -3458,8 +3941,9 @@ def _compilable_pointwise_lr_adapt_(grads: List[Tensor], update: List[Tensor], s
         copy_stochastic_(s_, u)
 
 
-def pointwise_lr_adaptation(grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor],
-        lr_lr: float):
+def pointwise_lr_adaptation(
+    grads: List[Tensor], update: List[Tensor], state: List[Tensor], delta: List[Tensor], lr_lr: float
+):
     grads, update, state, delta = list_guard(grads, update, state, delta)
     lr_lr = scalar_guard(lr_lr, grads[0])
     _compilable_pointwise_lr_adapt_(grads, update, state, delta, lr_lr)
@@ -3485,8 +3969,9 @@ def fused_hook(parameters, optimizer, *args, **kwargs):
 
     o = optimizer(parameters, *args, **kwargs)
     step_fn = o.step
-    o.step = functools.partial(warn_once,
-        msg="You're trying to call `step` on a fused optimizer. This will not do anything.")
+    o.step = functools.partial(
+        warn_once, msg="You're trying to call `step` on a fused optimizer. This will not do anything."
+    )
 
     def _step(p: Tensor):
         step_fn()
