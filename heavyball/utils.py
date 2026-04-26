@@ -1240,10 +1240,16 @@ class _ULPState:
         ls = (_log_ulp(narrow) - 1).float()
         e_norm = _scale_by_exp2(e, -ls)
         scaled = e_norm.clamp(-1.0, 1.0) * self.smax
-        self.correction.copy_(scaled.abs().add(0.5).floor().copysign(scaled).to(self.correction.dtype))
+        # SR on the int correction — the bits below the correction's resolution.
+        # narrow is RNE so |e| ≤ ULP/2, keeping `scaled` in [-smax, smax]; SR
+        # adds at most 1 unit of correction (= ULP/(2*smax)) of error and is
+        # unbiased on the lowest representable bits.
+        rounded = (scaled + torch.rand_like(scaled)).floor()
+        self.correction.copy_(rounded.to(self.correction.dtype))
 
     def encode(self, fp32, target):
-        # RNE, not stochastic: the correction range assumes |error| ≤ ULP/2.
+        # RNE on the narrow keeps |error| ≤ ULP/2 so the correction range stays
+        # ±ULP/2; SR is applied on the int correction inside compute_correction.
         rounded = fp32.to(target.dtype)
         set_(target, rounded)
         self.compute_correction(fp32, target)

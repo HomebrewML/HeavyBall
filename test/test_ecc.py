@@ -78,7 +78,8 @@ def test_ulp_roundtrip(mode):
     err, naive_err = (x - out).abs(), (x - xn.float()).abs()
     improvement = naive_err.max().item() / max(err.max().item(), 1e-45)
     assert improvement > (100 if cfg.corr_dtype == torch.int8 else 10000)
-    assert (err <= naive_err + 1e-10).all()
+    sr_bound = torch.exp2(utils._log_ulp(xn).float()) / (2 * cfg.smax)
+    assert (err <= sr_bound + 1e-10).all()
 
 
 def test_ecc_boundary_values():
@@ -89,7 +90,8 @@ def test_ecc_boundary_values():
         st = utils._ULPState(ecc, smax)
         st.compute_correction(vals, xn)
         out = st.decode(xn)
-        assert ((vals - out).abs() <= (vals - xn.float()).abs() + 1e-10).all()
+        sr_bound = torch.exp2(utils._log_ulp(xn).float()) / (2 * smax)
+        assert ((vals - out).abs() <= sr_bound + 1e-10).all()
 
 
 @pytest.mark.parametrize("mode", ULP_MODES)
