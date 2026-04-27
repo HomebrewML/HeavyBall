@@ -112,13 +112,18 @@ def test_clip(
 
     for i in range(outer_iterations):
         model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-        o = get_optim(
-            opt,
-            model.parameters(),
-            lr=1e-5,
-            gradient_clipping=lambda x: clip_func(x, clip_at=5.0),
-            update_clipping=lambda x: clip_func(x, clip_at=0.05),
-        )
+        try:
+            o = get_optim(
+                opt,
+                model.parameters(),
+                lr=1e-5,
+                gradient_clipping=lambda x: clip_func(x, clip_at=5.0),
+                update_clipping=lambda x: clip_func(x, clip_at=0.05),
+            )
+        except ValueError as e:
+            if "cannot follow" in str(e):
+                pytest.skip(f"{opt.__name__} does not support update_clipping (fused param-update kernel)")
+            raise
 
         for _ in range(iterations):
             set_grad(model)

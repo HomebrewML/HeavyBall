@@ -1,0 +1,23 @@
+  cff-version: 1.2.0
+  message: "If you use HeavyBall in your research, please cite it as below."
+  title: HeavyBall
+  abstract: "Compile-first PyTorch optimizer library: AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more, assembled from composable transforms under torch.compile."
+  type: software
+  authors:
+    - family-names: Nestler
+      given-names: Lucas
+      email: github.heavyball@nestler.sh
+    - name: "HomebrewML contributors"
+  repository-code: "https://github.com/HomebrewML/HeavyBall"
+  url: "https://github.com/HomebrewML/HeavyBall"
+  license: BSD-2-Clause
+  version: "3.1.1"
+  date-released: "2026-04-27"
+  keywords:
+    - pytorch
+    - optimizer
+    - shampoo
+    - soap
+    - psgd
+    - muon
+    - schedule-free

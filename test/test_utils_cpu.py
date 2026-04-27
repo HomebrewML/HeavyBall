@@ -306,3 +306,59 @@ def test_mars_correction_updates_old_gradient_copy():
     old = [torch.zeros(2)]
     mars_correction(g, old, beta1=0.9, gamma=0.2)
     assert torch.allclose(old[0], torch.torch.tensor([1.0, 2.0]))
+
+
+def test_cautious_weight_decay_replaces_l2_at_diff_sign_indices():
+    p_init = torch.tensor([2.0, -3.0, 1.0, -0.5])  # signs: + - + -
+    g = torch.tensor([1.0, -2.0, -1.0, 1.0])  # signs: + - - +
+    lr, wd = 1e-2, 0.05
+    a = nn.Parameter(p_init.clone())  # standard L2
+    b = nn.Parameter(p_init.clone())  # cautious L2
+
+    opt_a = heavyball.AdamW([a], lr=lr, weight_decay=wd, cautious_weight_decay=False)
+    opt_b = heavyball.AdamW([b], lr=lr, weight_decay=wd, cautious_weight_decay=True)
+    a.grad = g.clone()
+    b.grad = g.clone()
+    opt_a.step()
+    opt_b.step()
+
+    # A: p ← p·(1 − lr·wd) − lr·u_adam
+    # B: p ← p − lr·u_adam − lr·wd·mask·p   (mask = same-sign)
+    # diff = a − b = -lr·wd·p + lr·wd·mask·p = -lr·wd·(1−mask)·p
+    # → zero at same-sign indices; shrunk at diff-sign indices.
+    same_sign = p_init.sign() == g.sign()
+    expected_diff = torch.where(same_sign, torch.zeros_like(p_init), -lr * wd * p_init)
+    diff = a.detach() - b.detach()
+    assert torch.allclose(diff, expected_diff, atol=1e-6), f"diff={diff} expected={expected_diff}"
+
+
+def test_cautious_weight_decay_with_zero_weight_decay_is_noop():
+    p_init = torch.tensor([2.0, -3.0, 1.0, -0.5])
+    g = torch.tensor([1.0, -2.0, -1.0, 1.0])
+    a = nn.Parameter(p_init.clone())
+    b = nn.Parameter(p_init.clone())
+    opt_a = heavyball.AdamW([a], lr=1e-2, weight_decay=0.0, cautious_weight_decay=False)
+    opt_b = heavyball.AdamW([b], lr=1e-2, weight_decay=0.0, cautious_weight_decay=True)
+    a.grad = g.clone()
+    b.grad = g.clone()
+    opt_a.step()
+    opt_b.step()
+    assert torch.allclose(a.detach(), b.detach(), atol=1e-7), "cautious with wd=0 should be a noop"
+
+
+def test_cautious_weight_decay_false_matches_standard():
+    torch.manual_seed(0)
+    a = nn.Linear(8, 4)
+    b = nn.Linear(8, 4)
+    b.load_state_dict(a.state_dict())
+    opt_a = heavyball.AdamW(a.parameters(), lr=1e-2, weight_decay=0.01)
+    opt_b = heavyball.AdamW(b.parameters(), lr=1e-2, weight_decay=0.01, cautious_weight_decay=False)
+    x, y = torch.randn(16, 8), torch.randn(16, 4)
+    for _ in range(3):
+        for m, o in ((a, opt_a), (b, opt_b)):
+            o.zero_grad()
+            ((m(x) - y) ** 2).mean().backward()
+            o.step()
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        assert torch.equal(pa, pb)
+    assert len(opt_a.fns) == len(opt_b.fns)

@@ -141,12 +141,14 @@ def _compilable_schedule_free_(
     decay: float,
     grad: List[Tensor],
     caution,
+    cautious_decay: bool,
 ):
     for op, oz, u_, g_ in zip(p, z, update, grad):
         u_ = u_.view_as(op)
         p_, z_, u_ = map(promote, (op, oz, u_))
         if decay != 0:
-            u_ = u_ + p_ * decay
+            d = decay * (1 - (p_.signbit() ^ u_.signbit()).to(p_.dtype)) if cautious_decay else decay
+            u_ = u_ + p_ * d
         if caution:
             u_ = _compilable_cautioning(u_, g_)
         p_ = p_.lerp(z_, ckp1)
@@ -169,6 +171,7 @@ def schedule_free_(
     r: float = 0.0,
     step: int = 0,
     decay: float = 0.0,
+    cautious_decay: bool = False,
 ):
     weight = abs(lr) ** weight_lr_power * max(step, 1) ** r
     weight_sum = weight_sum + weight
@@ -180,7 +183,7 @@ def schedule_free_(
 
     update, parameters, z, grad = list_guard(update, parameters, z, grad)
     lr, ckp1, beta1 = scalar_guard(lr, ckp1, beta1, grad[0])
-    _compilable_schedule_free_(parameters, z, ckp1, update, lr, beta1, decay, grad, caution)
+    _compilable_schedule_free_(parameters, z, ckp1, update, lr, beta1, decay, grad, caution, cautious_decay)
     return weight_sum
 
 
@@ -194,6 +197,7 @@ def _compilable_msam(
     grad: List[Tensor],
     exp_avg: List[Tensor],
     caution: bool,
+    cautious_decay: bool,
     decay: Tensor,
     sam_step_size: Tensor,
 ):
@@ -203,7 +207,8 @@ def _compilable_msam(
         z32_ = promote(z_)
         if caution:
             u_ = _compilable_cautioning(promote(g_), u_)
-        z32_ = z32_ * (1 - decay * lr) + u_ * -lr
+        d = decay * (1 - (z32_.signbit() ^ u_.signbit()).to(z32_.dtype)) if cautious_decay else decay
+        z32_ = z32_ * (1 - d * lr) + u_ * -lr
         copy_stochastic_(z_, z32_)
         copy_stochastic_(p_, z32_ + u_ / u_.norm().clamp(min=1e-8) * -sam_step_size)
 
@@ -219,10 +224,11 @@ def msam_(
     caution: bool,
     weight_decay: float,
     sam_step_size: float,
+    cautious_decay: bool = False,
 ):
     param, z, update, grad, exp_avg = list_guard(param, z, update, grad, exp_avg)
     lr, beta1, weight_decay, sam_step_size = scalar_guard(lr, beta1, weight_decay, sam_step_size, exp_avg[0])
-    _compilable_msam(lr, beta1, param, z, update, grad, exp_avg, caution, weight_decay, sam_step_size)
+    _compilable_msam(lr, beta1, param, z, update, grad, exp_avg, caution, cautious_decay, weight_decay, sam_step_size)
 
 
 def append_or_extend(base, new):
@@ -1923,6 +1929,7 @@ def _fused_compilable_adam_(
     lr: Tensor,
     eps: Tensor,
     caution: bool,
+    cautious_decay: bool,
 ):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
@@ -1930,7 +1937,7 @@ def _fused_compilable_adam_(
     u32, g32 = [list(map(promote, x)) for x in [update, grad]]
     exp_avg32 = _lerp(exp_avg, u32, beta1)
     denom = _compilable_exp_avg_sq_(exp_avg_sq, u32, beta2, eps, [None])
-    _compilable_update_(y, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)], decay, lr, caution, g32)
+    _compilable_update_(y, [e_ / d_ for e_, d_ in zip(exp_avg32, denom)], decay, lr, caution, cautious_decay, g32)
 
 
 def fused_adam_(
@@ -1946,10 +1953,13 @@ def fused_adam_(
     eps: float,
     decay: float,
     caution: bool,
+    cautious_decay: bool = False,
 ):
     y, exp_avg, exp_avg_sq, grad = list_guard(y, exp_avg, exp_avg_sq, grad)
     beta1, beta2, step, lr, decay = scalar_guard(beta1, beta2, step, lr, decay, y[0])
-    _fused_compilable_adam_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, decay, lr, eps, caution)
+    _fused_compilable_adam_(
+        y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, decay, lr, eps, caution, cautious_decay
+    )
 
 
 def nadam_(
@@ -2005,6 +2015,7 @@ def _fused_compilable_nadam_(
     weight_decay: float,
     decoupled_weight_decay: bool,
     caution: bool,
+    cautious_decay: bool,
 ):
     weight_decay_val = float(weight_decay)
 
@@ -2019,7 +2030,7 @@ def _fused_compilable_nadam_(
     copy_stochastic_list_(update, update32)
 
     decay_t = scalar_guard(decay, param[0])
-    _compilable_update_(param, update32, decay_t, lr, caution, grad32)
+    _compilable_update_(param, update32, decay_t, lr, caution, cautious_decay, grad32)
 
 
 def fused_nadam_(
@@ -2038,6 +2049,7 @@ def fused_nadam_(
     weight_decay: float,
     decoupled_weight_decay: bool,
     caution: bool,
+    cautious_decay: bool = False,
 ):
     param, exp_avg, exp_avg_sq, mu_product, update, grad = list_guard(
         param, exp_avg, exp_avg_sq, mu_product, update, grad
@@ -2064,6 +2076,7 @@ def fused_nadam_(
         weight_decay,
         decoupled_weight_decay,
         caution,
+        cautious_decay,
     )
 
 
@@ -2108,12 +2121,13 @@ def _fused_compilable_ademamix_(
     eps: Tensor,
     decay: Tensor,
     caution: bool,
+    cautious_decay: bool,
 ):
     grad32 = list(map(promote, grad))
     update32 = _compilable_ademamix_update_(
         exp_avg_fast, exp_avg_slow, exp_avg_sq, update, beta1, beta2, beta3, step, alpha, eps
     )
-    _compilable_update_(y, update32, decay, lr, caution, grad32)
+    _compilable_update_(y, update32, decay, lr, caution, cautious_decay, grad32)
 
 
 def fused_ademamix_(
@@ -2130,6 +2144,7 @@ def fused_ademamix_(
     decay: float,
     alpha: float,
     caution: bool,
+    cautious_decay: bool = False,
     beta3_warmup: Optional[int] = None,
     alpha_warmup: Optional[int] = None,
 ):
@@ -2161,6 +2176,7 @@ def fused_ademamix_(
         eps_t,
         decay_t,
         caution,
+        cautious_decay,
     )
 
 
@@ -2238,6 +2254,7 @@ def _fused_compilable_laprop_(
     lr: Tensor,
     decay: Tensor,
     caution: bool,
+    cautious_decay: bool,
     eps: Tensor,
 ):
     beta1 = beta_debias(beta1, step)
@@ -2246,7 +2263,7 @@ def _fused_compilable_laprop_(
     u32, gp32 = [list(map(promote, x)) for x in [update, grad]]
     denom = _compilable_exp_avg_sq_(exp_avg_sq, u32, beta2, eps, [None])
     u32 = _lerp(exp_avg, [u_ / d_ for u_, d_ in zip(u32, denom)], beta1)
-    _compilable_update_(y, u32, decay, lr, caution, gp32)
+    _compilable_update_(y, u32, decay, lr, caution, cautious_decay, gp32)
 
 
 def fused_laprop_(
@@ -2261,17 +2278,22 @@ def fused_laprop_(
     lr: float,
     decay: float,
     caution: bool,
+    cautious_decay: bool = False,
     eps: float = 1e-8,
 ):
     exp_avg, exp_avg_sq, grad, y = list_guard(exp_avg, exp_avg_sq, grad, y)
     beta1, beta2, step, lr, eps, decay = scalar_guard(beta1, beta2, step, lr, eps, decay, exp_avg[0])
-    _fused_compilable_laprop_(y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, lr, decay, caution, eps)
+    _fused_compilable_laprop_(
+        y, exp_avg, exp_avg_sq, update, grad, beta1, beta2, step, lr, decay, caution, cautious_decay, eps
+    )
 
 
 @decorator_knowngood
-def _fused_compilable_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution):
+def _fused_compilable_adopt_(
+    y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution, cautious_decay
+):
     u32, g32, exp_avg_sq32 = [list(map(promote, x)) for x in [update, grad, exp_avg_sq]]
-    _compilable_update_(y, u32, decay, lr, caution, g32)
+    _compilable_update_(y, u32, decay, lr, caution, cautious_decay, g32)
 
     beta1 = beta_debias(beta1, step)
     stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
@@ -2280,10 +2302,14 @@ def _fused_compilable_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2,
     stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
 
 
-def fused_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution):
+def fused_adopt_(
+    y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution, cautious_decay=False
+):
     exp_avg, exp_avg_sq, grad, y = list_guard(exp_avg, exp_avg_sq, grad, y)
     beta1, beta2, step, lr, decay = scalar_guard(beta1, beta2, step, lr, decay, exp_avg[0])
-    _fused_compilable_adopt_(y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution)
+    _fused_compilable_adopt_(
+        y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution, cautious_decay
+    )
 
 
 @decorator_knowngood
@@ -2347,6 +2373,7 @@ def _compilable_update_(
     decay: Tensor,
     lr: Tensor,
     caution: bool,
+    cautious_decay: bool,
     g: List[Optional[Tensor]],
 ):
     for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a multi-tensor op
@@ -2354,7 +2381,8 @@ def _compilable_update_(
         p32_ = promote(p_)
         if caution:
             u_ = _compilable_cautioning(promote(g_), u_)
-        p32_ = p32_ * (1 - decay * lr) + u_ * -lr
+        d = decay * (1 - (p32_.signbit() ^ u_.signbit()).to(p32_.dtype)) if cautious_decay else decay
+        p32_ = p32_ * (1 - d * lr) + u_ * -lr
         copy_stochastic_(p_, p32_)
 
 
@@ -2364,13 +2392,14 @@ def update_param_(
     lr: float,
     decay: float,
     caution: bool = False,
+    cautious_decay: bool = False,
     grad: List[Tensor] = None,
 ):
     param, update, grad = list_guard(param, update, grad)
     lr = scalar_guard(lr, param[0])
     if not caution:
         grad = [None] * len(param)
-    _compilable_update_(param, update, decay, lr, caution, grad)
+    _compilable_update_(param, update, decay, lr, caution, cautious_decay, grad)
 
 
 @decorator_knowngood
@@ -2739,6 +2768,7 @@ def _compilable_lra_update_(
     lr: Tensor,
     decay: Tensor,
     caution: bool,
+    cautious_decay: bool,
     grads: List[Tensor],
 ):
     update = lra_precond(U, V, d, flatten(update))
@@ -2746,7 +2776,7 @@ def _compilable_lra_update_(
     update = update.flatten()
     for p, g in zip(params, grads):
         size = p.numel()
-        update_param_(p, update[start : start + size].view_as(p), lr, decay, caution, g)
+        update_param_(p, update[start : start + size].view_as(p), lr, decay, caution, cautious_decay, g)
         start += size
 
 
@@ -2760,10 +2790,11 @@ def apply_lra_update(
     decay: float,
     caution: bool,
     grads: List[Tensor],
+    cautious_decay: bool = False,
 ):
     params, grads = list_guard(params, grads)
     lr, decay = scalar_guard(lr, decay, params[0])
-    _compilable_lra_update_(params, update, U, V, d, lr, decay, caution, grads)
+    _compilable_lra_update_(params, update, U, V, d, lr, decay, caution, cautious_decay, grads)
 
 
 @decorator_knowngood
@@ -3558,18 +3589,6 @@ def l1_weight_decay_to_ema_(p, ema, ema_decay, weight_decay):
 
 
 @decorator_knowngood
-def _compilable_cautious_weight_decay_(p, update, weight_decay):
-    xs = [_compilable_cautioning(p_, u_) for p_, u_ in zip(p, update)]
-    stochastic_add_(p, xs, -weight_decay)
-
-
-def cautious_weight_decay_(p: list[Tensor], update: list[Tensor], weight_decay: float):
-    p, update = list_guard(p, update)
-    (weight_decay,) = scalar_guard(weight_decay, p[0])
-    _compilable_cautious_weight_decay_(p, update, weight_decay)
-
-
-@decorator_knowngood
 def _compilable_sign_(grad: List[Tensor], graft: bool):
     for g_ in grad:
         gs = g_.sign()
@@ -3675,14 +3694,18 @@ TriuOrLine = Union[List[Tensor], List[Tuple[Optional[List[int]], Tensor]]]
 
 
 @decorator_knowngood
-def _compilable_fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cached_q: List[Tensor]):
+def _compilable_fused_precond_grad_cached_(
+    ea: Tensor, param, lr, grad, decay, caution, cautious_decay, cached_q: List[Tensor]
+):
     precond = precond_grad_cached_(ea, cached_q, caution=caution, grad=grad)
-    update_param_(param, precond, lr, decay, caution=False)
+    update_param_(param, precond, lr, decay, caution=False, cautious_decay=cautious_decay)
 
 
-def fused_precond_grad_cached_(ea: Tensor, param, lr, grad, decay, caution, cached_q: List[Tensor]):
+def fused_precond_grad_cached_(
+    ea: Tensor, param, lr, grad, decay, caution, cached_q: List[Tensor], cautious_decay: bool = False
+):
     lr, decay = scalar_guard(lr, decay, param[0])
-    _compilable_fused_precond_grad_cached_(ea, param, lr, grad, decay, caution, cached_q)
+    _compilable_fused_precond_grad_cached_(ea, param, lr, grad, decay, caution, cautious_decay, cached_q)
 
 
 @functools.lru_cache(maxsize=None)
@@ -3721,6 +3744,7 @@ def _compilable_fused_psgd_precond_grad(
     grad,
     decay,
     caution,
+    cautious_decay,
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
 ):
@@ -3731,7 +3755,7 @@ def _compilable_fused_psgd_precond_grad(
         grad=grad,
         store_triu_as_line=store_triu_as_line,
     )
-    update_param_(param, precond, lr, decay, caution=False, grad=grad)
+    update_param_(param, precond, lr, decay, caution=False, cautious_decay=cautious_decay)
 
 
 def fused_psgd_precond_grad(
@@ -3743,9 +3767,12 @@ def fused_psgd_precond_grad(
     caution,
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
+    cautious_decay: bool = False,
 ):
     lr, decay = scalar_guard(lr, decay, param[0])
-    _compilable_fused_psgd_precond_grad(ea, param, lr, grad, decay, caution, preconds, store_triu_as_line)
+    _compilable_fused_psgd_precond_grad(
+        ea, param, lr, grad, decay, caution, cautious_decay, preconds, store_triu_as_line
+    )
 
 
 @decorator_knowngood
@@ -3805,13 +3832,15 @@ def _compilable_hyperball_(
     lr: Tensor,
     decay: float,
     caution: bool,
+    cautious_decay: bool,
     g: List[Tensor],
 ):
     for op, u_, n_, g_ in zip(p, u, init_norm, g):
         u_ = promote(u_.view_as(op))
         p_ = promote(op)
         if decay != 0:
-            u_ = u_ + p_ * decay
+            d = decay * (1 - (p_.signbit() ^ u_.signbit()).to(p_.dtype)) if cautious_decay else decay
+            u_ = u_ + p_ * d
         if caution:
             u_ = _compilable_cautioning(promote(g_), u_)
         u_norm = u_.norm()
@@ -3824,12 +3853,12 @@ def _compilable_hyperball_(
         copy_stochastic_(op, p_)
 
 
-def hyperball_step_(param, update, init_norm, lr, decay, caution, grad):
+def hyperball_step_(param, update, init_norm, lr, decay, caution, grad, cautious_decay=False):
     param, update, init_norm, grad = list_guard(param, update, init_norm, grad)
     lr = scalar_guard(lr, param[0])
     if not caution:
         grad = [None] * len(param)
-    _compilable_hyperball_(param, update, init_norm, lr, decay, caution, grad)
+    _compilable_hyperball_(param, update, init_norm, lr, decay, caution, cautious_decay, grad)
 
 
 def _inner_precond_update_prob_schedule(

@@ -535,7 +535,15 @@ def identity(state, group, update, grad, param):
 
 @no_state
 def apply_update(group, update, grad, param):
-    utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+    utils.update_param_(
+        param,
+        update,
+        group["lr"],
+        group["weight_decay"],
+        caution=group["caution"],
+        cautious_decay=group.get("cautious_weight_decay", False),
+        grad=grad,
+    )
     raise SkipUpdate from None
 
 
@@ -548,12 +556,6 @@ def weight_decay_to_ema(group, update, grad, param, exp_avg):
         utils.beta_debias(group["ema_beta"], group["step"]),
         group["weight_decay_to_ema"] * group["lr"],
     )
-    return update
-
-
-@no_state
-def cautious_weight_decay(group, update, grad, param):
-    utils.cautious_weight_decay_(param, update, group["cautious_weight_decay"] * group["lr"])
     return update
 
 
@@ -610,6 +612,7 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
         group["eps"],
         group["weight_decay"],
         group["caution"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -655,6 +658,7 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
         group["weight_decay"],
         group.get("decoupled_weight_decay", False),
         group["caution"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -675,6 +679,7 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
         group["eps"],
         group["lr"] * group["weight_decay"] / group["max_lr"],
         group["caution"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -713,6 +718,7 @@ def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, e
         group["weight_decay"],
         group["alpha"],
         group["caution"],
+        group.get("cautious_weight_decay", False),
         group.get("beta3_warmup"),
         group.get("alpha_warmup"),
     )
@@ -740,6 +746,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
         group["lr"],
         group["weight_decay"],
         group["caution"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -768,7 +775,18 @@ def update_by_schedule_free(group, update, grad, param, z):
 
     update, param, z, grad = utils.list_guard(update, param, z, grad)
     lr, ckp1, beta1 = utils.scalar_guard(group["lr"], ckp1, utils.get_beta1(group), grad[0])
-    utils._compilable_schedule_free_(param, z, ckp1, update, lr, beta1, group["weight_decay"], grad, group["caution"])
+    utils._compilable_schedule_free_(
+        param,
+        z,
+        ckp1,
+        update,
+        lr,
+        beta1,
+        group["weight_decay"],
+        grad,
+        group["caution"],
+        group.get("cautious_weight_decay", False),
+    )
     raise SkipUpdate from None
 
 
@@ -788,6 +806,7 @@ def update_by_msam(group, update, grad, param, z, exp_avg):
         group["caution"],
         group["weight_decay"],
         group["sam_step_size"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -822,6 +841,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
         group["eps"],
         group["weight_decay"],
         group["caution"],
+        group.get("cautious_weight_decay", False),
     )
     raise SkipUpdate from None
 
@@ -995,7 +1015,16 @@ def _store_init_norm(state, group, update, grad, param):
 @general_guard("init_norm", init_fn=_store_init_norm, skip_first=False)
 @no_state
 def update_by_hyperball(group, update, grad, param, init_norm):
-    utils.hyperball_step_(param, update, init_norm, group["lr"], group["weight_decay"], group["caution"], grad)
+    utils.hyperball_step_(
+        param,
+        update,
+        init_norm,
+        group["lr"],
+        group["weight_decay"],
+        group["caution"],
+        grad,
+        group.get("cautious_weight_decay", False),
+    )
     raise SkipUpdate from None
 
 
@@ -1344,6 +1373,7 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
         "param": param,
         "lr": group["lr"],
         "decay": group["weight_decay"],
+        "cautious_decay": group.get("cautious_weight_decay", False),
     }
     if group.get("is_cached", False) and Q_cache[0] is not None:
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
@@ -1386,7 +1416,18 @@ def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
 @no_state
 def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     u, v, d = _update_lra(group, U, V, d, param, update_to_precond, False)
-    utils.apply_lra_update(param, update, u, v, d, group["lr"], group["weight_decay"], group["caution"], grad)
+    utils.apply_lra_update(
+        param,
+        update,
+        u,
+        v,
+        d,
+        group["lr"],
+        group["weight_decay"],
+        group["caution"],
+        grad,
+        group.get("cautious_weight_decay", False),
+    )
     raise SkipUpdate from None
 
 
@@ -1407,7 +1448,18 @@ def scale_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, 
 @no_state
 def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     u, v, d = _update_lra(group, U, V, d, param, update_to_precond, True)
-    utils.apply_lra_update(param, update, u, v, d, group["lr"], group["weight_decay"], group["caution"], grad)
+    utils.apply_lra_update(
+        param,
+        update,
+        u,
+        v,
+        d,
+        group["lr"],
+        group["weight_decay"],
+        group["caution"],
+        grad,
+        group.get("cautious_weight_decay", False),
+    )
     raise SkipUpdate from None
 
 
@@ -1979,14 +2031,30 @@ def chain(state: list, group, grad, param, *fns):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if skip_update or update is None:
             return
-        utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+        utils.update_param_(
+            param,
+            update,
+            group["lr"],
+            group["weight_decay"],
+            caution=group["caution"],
+            cautious_decay=group.get("cautious_weight_decay", False),
+            grad=grad,
+        )
         return
 
     corrs = [st["param::ecc"] for st in state]
     with ecc.attached(param, corrs):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
-            utils.update_param_(param, update, group["lr"], group["weight_decay"], caution=group["caution"], grad=grad)
+            utils.update_param_(
+                param,
+                update,
+                group["lr"],
+                group["weight_decay"],
+                caution=group["caution"],
+                cautious_decay=group.get("cautious_weight_decay", False),
+                grad=grad,
+            )
 
 
 def _walk_fns(obj):
