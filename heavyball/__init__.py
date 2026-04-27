@@ -786,6 +786,7 @@ class KLShampoo(SOAPBase):
         param_ecc: str | None = None,
         orig_shapes: ShapeMap | None = None,
         init_factor: float = 0.1,
+        dampening: float = 1e-9,
         **kwargs,
     ):
         self._build_soap_defaults(locals(), fns=(C.scale_by_kl_shampoo,))

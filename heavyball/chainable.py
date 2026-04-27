@@ -1079,19 +1079,16 @@ def _init_soap(state, group, update, grad, param):
 
 
 def _apply_soap_preconditioner(group, update, Q, GG, *references, use_kl: bool = False, eps=1e-8):
+    beta = utils.beta_debias(group["shampoo_beta"], group["step"])
+    max_dim, p1d = group["max_precond_dim"], group["precondition_1d"]
     for upd, q, gg, *ref in zip(update, Q, GG, *references):
-        utils.update_preconditioner(
-            utils.promote(upd),
-            q,
-            gg,
-            ref,
-            group["max_precond_dim"],
-            group["precondition_1d"],
-            utils.beta_debias(group["shampoo_beta"], group["step"]),
-            group["is_preconditioning"],
-            use_kl=use_kl,
-            eps=eps,
-        )
+        g = utils.promote(upd)
+        if use_kl:
+            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps)
+        else:
+            utils.update_ggt(g, gg, max_dim, p1d, beta)
+        if group["is_preconditioning"]:
+            utils.get_orthogonal_matrix_QR(gg, q, *ref)
 
 
 @needs_full_param
@@ -1141,7 +1138,13 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
     utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
     precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
-    _apply_soap_preconditioner(group, update, Q, GG, use_kl=True, eps=group["eps"])
+    dampening = group.get("dampening", 0.0)
+    accum = [utils.dampen_grad(u, dampening)[1] for u in update] if dampening > 0 else update
+    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"])
+    for gg in GG:
+        factors = [m for m in gg if isinstance(m, torch.Tensor)]
+        if len(factors) >= 2:
+            utils.psgd_balance_Q(factors)
     return precond
 
 

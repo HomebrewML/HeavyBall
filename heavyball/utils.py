@@ -1209,6 +1209,13 @@ def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
 
 
 @decorator_knowngood
+def _kl_eigvals(q: Tensor, m: Tensor) -> Tensor:
+    """diag(Q.T @ M @ Q)."""
+    q32, m32 = promote(q), promote(m)
+    return ((q32.T @ m32) * q32.T).sum(dim=1)
+
+
+@decorator_knowngood
 def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
     """KL-Shampoo corrected Kronecker factor accumulation (arXiv:2509.03378).
 
@@ -1230,10 +1237,8 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
         if not isinstance(m, Tensor) or q is None:
             infos.append(None)
             continue
-        q32, m32 = promote(q), promote(m)
-        eigvals = ((q32.T @ m32) * q32.T).sum(dim=1)
-        scale = eigvals.clamp_min(eps).reciprocal() / grad.shape[idx]
-        infos.append((g32.T @ q32 if idx == 0 else g32 @ q32, scale))
+        scale = _kl_eigvals(q, m).clamp_min(eps).reciprocal() / grad.shape[idx]
+        infos.append((g32.T @ promote(q) if idx == 0 else g32 @ promote(q), scale))
 
     for idx, (m, info) in enumerate(zip(GG, reversed(infos))):
         if not isinstance(m, Tensor):
@@ -1255,8 +1260,7 @@ def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Opt
     for idx, (q, m) in enumerate(zip(Q, GG)):
         if q is None or m is None:
             continue
-        q32, m32 = promote(q), promote(m)
-        d = ((q32.T @ m32) * q32.T).sum(dim=1).clamp_min(eps).rsqrt()
+        d = _kl_eigvals(q, m).clamp_min(eps).rsqrt()
         shape = [1] * out.ndim
         shape[idx] = -1
         out = out * d.view(shape)
@@ -1350,22 +1354,6 @@ def min_dtype(xs: List[Tensor]):
         if all(x in (d, torch.float32, torch.float64) for x in dtypes):
             return d
     return torch.float32
-
-
-def update_preconditioner(
-    grad, Q, GG, exp_avg, max_precond_dim, precondition_1d, beta, update_precond, use_kl: bool = False, eps=1e-8
-):
-    """
-    Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
-    When eps is provided, uses KL-Shampoo corrected Kronecker factor accumulation.
-    """
-    if use_kl:
-        update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps)
-    else:
-        update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
-    if update_precond:
-        exp_avg = list_guard(exp_avg)
-        get_orthogonal_matrix_QR(GG, Q, *exp_avg)
 
 
 def init_preconditioner(grad, state, max_precond_dim, precondition_1d, init_factor: float = 0.0):
