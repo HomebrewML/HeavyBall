@@ -940,10 +940,11 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
     state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
-    line, group["store_triu_as_line"] = group["store_triu_as_line"], False
-    _update_psgd_precond(False, None, group, param, update, Q, state["running_lower_bound"], state["step"], prob)
-    group["store_triu_as_line"] = line
-    state["Q"] = utils.triu_to_line(Q) if line else Q
+    _update_psgd_precond(
+        False, None, group, param, update, Q, state["running_lower_bound"], state["step"], prob,
+        store_triu_as_line=False,
+    )
+    state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
     state["Q_basis"] = utils.init_psgd_eigenbasis(Q)
 
 
@@ -1255,9 +1256,12 @@ def _update_psgd_precond(
     running_lower_bound,
     step,
     prob: Optional[callable] = None,
+    store_triu_as_line: Optional[bool] = None,
 ) -> None:
     if prob is None:
         prob = utils.precond_update_prob_schedule()
+    if store_triu_as_line is None:
+        store_triu_as_line = group["store_triu_as_line"]
 
     if not group["is_preconditioning"]:
         return
@@ -1271,7 +1275,7 @@ def _update_psgd_precond(
         hessian_vector,
         group["precond_lr"],
         Q,
-        group["store_triu_as_line"],
+        store_triu_as_line,
         utils.get_beta2(group),
         vector,
         running_lower_bound,
@@ -1289,7 +1293,7 @@ def _update_psgd_precond(
     if not should_use_cache or not cached:
         return
 
-    Q_resolved = utils.line_to_triu(Q) if group["store_triu_as_line"] else Q
+    Q_resolved = utils.line_to_triu(Q) if store_triu_as_line else Q
     for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
         if c_ is None:
             c_ = (
@@ -1656,7 +1660,8 @@ def update_by_psgd_pro(
 
 def palm_beta2(state, group, update, grad, param):
     beta2 = 1 - group["step"] ** -group["beta2_scale"]
-    group["betas"] = (utils.get_beta1(group), beta2)
+    betas = group["betas"]
+    group["betas"] = (utils.get_beta1(group), beta2, *betas[2:])
     return update
 
 
@@ -2119,15 +2124,6 @@ class ChainOpt(utils.StatefulOptimizer):
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
 
-    def state_dict(self):
-        sd = super().state_dict()
-        for param_state in sd["state"].values():
-            for group_state in param_state.values():
-                if isinstance(group_state, dict):
-                    for key in [k for k in group_state if isinstance(k, str) and "Q_cache" in k]:
-                        del group_state[key]
-        return sd
-
     def _init_param_ecc(self):
         for group in self.param_groups:
             self._init_param_ecc_group(group)
@@ -2271,16 +2267,16 @@ class ChainOpt(utils.StatefulOptimizer):
         group["_group_step"] = group["step"] = step = step + 1
         self.state_(p[0])["step"] = step
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / step.clamp(min=group["warmup_steps"] + 1)
-
-        if not group["multi_tensor"] or len(p) == 1:
-            for param, grad in zip(p, g):
-                self._chain(group, [grad], [param], caution)
-        else:
-            self._chain(group, g, p, caution)
-
-        group["caution"] = caution
-        group["lr"] = group["base_lr"]
-        group["step"] = None
+        try:
+            if not group["multi_tensor"] or len(p) == 1:
+                for param, grad in zip(p, g):
+                    self._chain(group, [grad], [param], caution)
+            else:
+                self._chain(group, g, p, caution)
+        finally:
+            group["caution"] = caution
+            group["lr"] = group["base_lr"]
+            group["step"] = None
 
     def _run_chain(self, state, group, g, p, caution):
         chain(state, group, g, p, *self.fns)

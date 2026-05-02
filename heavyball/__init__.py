@@ -1366,7 +1366,7 @@ class SplitOpt(utils.StatefulOptimizer):
         return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
 
     def load_state_dict(self, state_dict):
-        for opt, s in zip(self.optimizers, state_dict["optimizers"]):
+        for opt, s in zip(self.optimizers, state_dict["optimizers"], strict=True):
             opt.load_state_dict(s)
 
 
@@ -1416,6 +1416,24 @@ class SAMWrapper(torch.optim.Optimizer):
 
     def zero_grad(self, set_to_none: bool = True):
         self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {
+            "wrapped": self.wrapped_optimizer.state_dict(),
+            "ball": [g["ball"] for g in self.param_groups],
+        }
+
+    def load_state_dict(self, state_dict):
+        self.wrapped_optimizer.load_state_dict(state_dict["wrapped"])
+        for g, b in zip(self.param_groups, state_dict["ball"]):
+            g["ball"] = b
+
+    def train(self, mode: bool = True):
+        self.wrapped_optimizer.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
 
 
 capture_param_shapes = utils.capture_param_shapes
