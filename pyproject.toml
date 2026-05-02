@@ -7,9 +7,10 @@ name = "heavyball"
 description = "Compile-first PyTorch optimizer library - AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more with torch.compile fusion and composable features"
 version = "3.1.1"
 authors = [{ name = "HeavyBall Authors", email = "github.heavyball@nestler.sh" }]
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
 classifiers = ["Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -56,7 +57,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "lightbench"]
+dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "tqdm"]
 
 [project.urls]
 Homepage = "https://github.com/HomebrewML/HeavyBall"

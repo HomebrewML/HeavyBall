@@ -1,6 +1,6 @@
 # HeavyBall
 
-[![PyPI version](https://img.shields.io/pypi/v/heavyball?color=blue)][pypi] [![Downloads](https://img.shields.io/pypi/dm/heavyball)][pypi] [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)][license]
+[![PyPI version](https://img.shields.io/pypi/v/heavyball?color=blue)][pypi] [![Downloads](https://img.shields.io/pypi/dm/heavyball)][pypi] [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)][license]
 
 HeavyBall is an optimizer library for PyTorch where every optimizer is assembled from composable, compiled building
 blocks. It includes API-compatible replacements for `torch.optim.AdamW`, `SGD`, and `RMSprop`, alongside Muon, SOAP (
@@ -182,9 +182,9 @@ class GraftedAdam(C.BaseOpt):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
                  weight_decay=0, warmup_steps=0, multi_tensor=True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                        warmup_steps=warmup_steps)
+                        warmup_steps=warmup_steps, multi_tensor=multi_tensor)
         branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
-        super().__init__(params, defaults, multi_tensor, fns=(branch,))
+        super().__init__(params, defaults, fns=(branch,))
 ```
 
 Custom optimizers that inherit from `BaseOpt` get ECC, MARS, caution, clipping, warmup, and stochastic rounding
@@ -235,7 +235,7 @@ To contribute, fork the repository, install with `pip install -e .[dev]`, and ru
 
 ## License
 
-BSD-3-Clause, see [LICENSE](LICENSE).
+BSD-2-Clause, see [LICENSE](LICENSE).
 
 The name "HeavyBall" comes from [Polyak's heavy-ball method](https://doi.org/10.1016/0041-5553(64)90137-5), the momentum
 technique underlying most modern optimizers.

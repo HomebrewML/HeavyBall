@@ -31,6 +31,9 @@ test/test_helpers_cpu.py
 test/test_utils_cpu.py
 test/test_stochastic_utils_cpu.py
 test/test_optimizer_cpu_smoke.py
+test/test_ademamix.py
+test/test_psgd_precond_init_stability.py
+test/test_utils_property.py
 EOF
 
 if [[ ${1:-} == push ]]; then
