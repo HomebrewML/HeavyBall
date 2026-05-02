@@ -30,8 +30,13 @@ def test_merge(opt, size: List[int], merge, split, depth: int = 2, iterations: i
     model = nn.Sequential(*[Param(size) for _ in range(depth)]).cuda()
     initial = [p.detach().clone() for p in model.parameters()]
     o = get_optim(
-        opt, model.parameters(), lr=1e-3,
-        merge_dims=merge, split=split, max_precond_dim=256, max_size_triangular=256,
+        opt,
+        model.parameters(),
+        lr=1e-3,
+        merge_dims=merge,
+        split=split,
+        max_precond_dim=256,
+        max_size_triangular=256,
     )
 
     for _ in range(iterations):

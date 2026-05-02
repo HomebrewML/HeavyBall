@@ -941,7 +941,15 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
     _update_psgd_precond(
-        False, None, group, param, update, Q, state["running_lower_bound"], state["step"], prob,
+        False,
+        None,
+        group,
+        param,
+        update,
+        Q,
+        state["running_lower_bound"],
+        state["step"],
+        prob,
         store_triu_as_line=False,
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
