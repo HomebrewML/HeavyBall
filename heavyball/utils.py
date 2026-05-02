@@ -150,7 +150,7 @@ def _compilable_schedule_free_(
             d = decay * (1 - (p_.signbit() ^ u_.signbit()).to(p_.dtype)) if cautious_decay else decay
             u_ = u_ + p_ * d
         if caution:
-            u_ = _compilable_cautioning(u_, g_)
+            u_ = _compilable_cautioning(g_, u_)
         p_ = p_.lerp(z_, ckp1)
         p_ = p_ + u_ * (lr * (beta1 * (1 - ckp1)) - lr)
         z_ = z_ + u_ * -lr
@@ -206,7 +206,7 @@ def _compilable_msam(
         u_ = u_.view_as(z_)
         z32_ = promote(z_)
         if caution:
-            u_ = _compilable_cautioning(promote(g_), u_)
+            u_ = _compilable_cautioning(g_, u_)
         d = decay * (1 - (z32_.signbit() ^ u_.signbit()).to(z32_.dtype)) if cautious_decay else decay
         z32_ = z32_ * (1 - d * lr) + u_ * -lr
         copy_stochastic_(z_, z32_)
@@ -549,7 +549,7 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
 
 
 @decorator_knowngood
-def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7, power_iter: int = -1):
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     assert G.ndim >= 2
     assert steps == 5
@@ -1536,7 +1536,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
     _REMOVED_STATS = frozenset({"stochastic_schedule", "precond_rng"})
 
     def _load_stats(self, state_dict):
-        sd = state_dict.pop("heavyball", {})
+        sd = state_dict.get("heavyball", {})
         for k, v in sd.items():
             if k in self._REMOVED_STATS:
                 continue
@@ -2380,7 +2380,7 @@ def _compilable_update_(
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
         if caution:
-            u_ = _compilable_cautioning(promote(g_), u_)
+            u_ = _compilable_cautioning(g_, u_)
         d = decay * (1 - (p32_.signbit() ^ u_.signbit()).to(p32_.dtype)) if cautious_decay else decay
         p32_ = p32_ * (1 - d * lr) + u_ * -lr
         copy_stochastic_(p_, p32_)
@@ -2840,7 +2840,7 @@ def flatten(x: List[Tensor], remaining: int = 0) -> Tensor:
     last_dim = x[0].shape[-remaining:] if remaining else []
     tensors = [i.reshape(-1, *last_dim) for i in x if i.numel()]
     if not tensors:
-        return torch.zeros((), dtype=x[0].device, device=x[0].device)
+        return torch.zeros((), dtype=x[0].dtype, device=x[0].device)
     return torch.cat(tensors, 0)
 
 
@@ -3387,8 +3387,6 @@ def _psgd_precond_update_(
 
 
 @decorator_knowngood
-@decorator
-@decorator_knowngood
 def _clip(x, norm, clip_at, eps=1e-8):
     x32 = promote(x)
     # (x / y.clamp(min=eps)).clamp(max=1) == x / y.clamp(min=max(x, eps))
@@ -3842,7 +3840,7 @@ def _compilable_hyperball_(
             d = decay * (1 - (p_.signbit() ^ u_.signbit()).to(p_.dtype)) if cautious_decay else decay
             u_ = u_ + p_ * d
         if caution:
-            u_ = _compilable_cautioning(promote(g_), u_)
+            u_ = _compilable_cautioning(g_, u_)
         u_norm = u_.norm()
         u_norm = u_norm.clamp(min=1e-12)
         u_ = u_ / u_norm
