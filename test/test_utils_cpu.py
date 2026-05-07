@@ -171,8 +171,8 @@ def test_global_clip_functions_limit_group_norm(clip_fn, metric):
 
 def test_triu_line_roundtrip_on_cpu():
     tensors = [
-        torch.arange(4, dtype=torch.float32).reshape(2, 2),
-        torch.arange(9, dtype=torch.float32).reshape(3, 3),
+        torch.arange(2 * 4, dtype=torch.float32).reshape(2, 2, 2),
+        torch.arange(2 * 9, dtype=torch.float32).reshape(2, 3, 3),
     ]
     packed = triu_to_line(tensors)
     restored = line_to_triu(packed)

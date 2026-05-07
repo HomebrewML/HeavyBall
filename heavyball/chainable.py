@@ -419,12 +419,17 @@ def _view_preserve_ecc(src, target):
     return v
 
 
+def _squeeze_inner(u: Tensor) -> Tensor:
+    inner = tuple(i for i in range(1, u.ndim) if u.shape[i] == 1)
+    return u.squeeze(inner) if inner else u
+
+
 class SqueezeGrad(FunctionTransform):
     needs_init = False
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         original_shapes = [u.shape for u in update]
-        update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
+        update = [_squeeze_inner(u) for u in update]
         grad = [_view_preserve_ecc(x, u) for x, u in zip(grad, update)]
         param = [_view_preserve_ecc(x, u) for x, u in zip(param, update)]
         args = list(args)
@@ -449,6 +454,75 @@ class TagGuard(FunctionTransform):
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+
+class BucketGuard(FunctionTransform):
+    """Group same-shape params into a leading-dim slab, run the inner chain once per bucket, unstack."""
+
+    needs_init = False
+
+    @property
+    def _bucket_state_key(self):
+        return f"__bucket_{self.transform_idx}__"
+
+    def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        states = state if isinstance(state, list) else [state(p) for p in param]
+        shapes = group.get("_orig_shapes") or {}
+        bucket_key = self._bucket_state_key
+        buckets: dict = {}
+        for i, p in enumerate(param):
+            info = shapes.get(id(p))
+            sig = (tuple(p.shape), p.dtype, p.device, info.owner if info is not None else None)
+            buckets.setdefault(sig, []).append(i)
+
+        out = [None] * len(param)
+        skip = False
+        for indices in buckets.values():
+            views = [param[i] for i in indices]
+            grads = [grad[i] for i in indices]
+            updates = [update[i] for i in indices]
+            n = len(indices)
+            if n == 1:
+                slab_p, slab_g, slab_u = views[0][None], grads[0][None], updates[0][None]
+            else:
+                slab_p = torch.stack(views, 0)
+                slab_g = torch.stack(grads, 0)
+                slab_u = torch.stack(updates, 0)
+
+            eccs = [getattr(v, "_ecc", None) for v in views]
+            stacked_corr = None
+            if eccs[0] is not None:
+                stacked_corr = (
+                    eccs[0].correction[None] if n == 1 else torch.stack([e.correction for e in eccs], 0)
+                )
+                slab_p._ecc = utils._ULPState(stacked_corr, eccs[0].smax)
+
+            bucket_state = states[indices[0]].setdefault(bucket_key, {})
+            for i in indices[1:]:
+                states[i][bucket_key] = bucket_state
+
+            try:
+                result = self.fn([bucket_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
+            except SkipUpdate:
+                skip = True
+                if n > 1:
+                    for k in range(n):
+                        views[k].copy_(slab_p[k])
+                    if stacked_corr is not None:
+                        for k, e in enumerate(eccs):
+                            e.correction.copy_(stacked_corr[k])
+                continue
+
+            precond_slab = result[0]
+            if n == 1:
+                out[indices[0]] = precond_slab[0]
+            else:
+                for k, i in enumerate(indices):
+                    out[i] = precond_slab[k]
+
+        if skip:
+            raise SkipUpdate from None
+        return out
 
 
 class WarmupGuard(FunctionTransform):
@@ -478,6 +552,8 @@ class WarmupGuard(FunctionTransform):
 
 
 needs_full_param = functools.partial(TagGuard, needs_full_param=True)
+
+bucket_aware = BucketGuard
 
 
 def zero_guard(*names):
@@ -915,7 +991,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
@@ -937,7 +1013,7 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
         tmp.get("vector"),
         dtype=getattr(torch, group["q_dtype"]),
     )
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
     _update_psgd_precond(
@@ -970,7 +1046,7 @@ def _init_psgd_pro_kron(state, group, update, grad, param, cached: bool = False,
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = Q
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
@@ -1130,6 +1206,7 @@ def _apply_soap_preconditioner(group, update, Q, GG, *references, use_kl: bool =
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1150,6 +1227,7 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1170,6 +1248,7 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1187,6 +1266,7 @@ def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @general_guard("Q", "GG", init_fn=_init_soap)
@@ -1213,6 +1293,7 @@ def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_prod
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1232,6 +1313,7 @@ def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG)
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1252,6 +1334,16 @@ def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slo
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg_slow, exp_avg_fast)
     return precond
+
+
+def _fill_q_cache(Q_cache, Q):
+    for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
+        if c_ is None:
+            Q_cache[i] = c_ = torch.empty_like(q_)
+        if q_.ndim == 3:
+            torch.matmul(q_.mT, q_, out=c_)
+        else:
+            torch.mul(q_, q_, out=c_)
 
 
 def _update_psgd_precond(
@@ -1298,23 +1390,8 @@ def _update_psgd_precond(
         float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
-    if not should_use_cache or not cached:
-        return
-
-    Q_resolved = utils.line_to_triu(Q) if store_triu_as_line else Q
-    for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
-        if c_ is None:
-            c_ = (
-                torch.empty_like(q_)
-                if q_.ndim == 1
-                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
-            )
-            Q_cache[i] = c_
-        if q_.ndim == 2:
-            torch.matmul(q_.T, q_, out=c_)
-        else:
-            torch.mul(q_, q_, out=c_)
-    return
+    if should_use_cache:
+        _fill_q_cache(Q_cache, utils.line_to_triu(Q) if store_triu_as_line else Q)
 
 
 def _update_psgd_pro_precond(
@@ -1350,21 +1427,8 @@ def _update_psgd_pro_precond(
         float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
-    if not should_use_cache or not cached:
-        return
-
-    for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
-        if c_ is None:
-            c_ = (
-                torch.empty_like(q_)
-                if q_.ndim == 1
-                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
-            )
-            Q_cache[i] = c_
-        if q_.ndim == 2:
-            torch.matmul(q_.T, q_, out=c_)
-        else:
-            torch.mul(q_, q_, out=c_)
+    if should_use_cache:
+        _fill_q_cache(Q_cache, Q)
 
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
@@ -1476,6 +1540,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1498,6 +1563,7 @@ def scale_by_psgd(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -1541,6 +1607,7 @@ def scale_by_lather(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1564,6 +1631,7 @@ def scale_by_delayed_psgd(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1599,6 +1667,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1622,6 +1691,7 @@ def update_by_delayed_psgd(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
@@ -1644,6 +1714,7 @@ def scale_by_psgd_pro(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
@@ -2240,6 +2311,7 @@ class ChainOpt(utils.StatefulOptimizer):
             self._orig_shapes = _detect_orig_shapes(all_params)
 
         views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
+        group["_orig_shapes"] = self._orig_shapes
         try:
             self._step_inner(group)
         finally:
