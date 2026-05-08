@@ -577,10 +577,6 @@ def no_state_no_multi_tensor(fn):
     return NoStateNoMultiTensor(fn)
 
 
-class SkipUpdate(ValueError):
-    pass
-
-
 @zero_guard("mars_old_grad")
 @no_state
 def mars(group, update, grad, param, mars_old_grad):
@@ -1189,19 +1185,20 @@ def _init_soap(state, group, update, grad, param):
     )
 
 
-def _apply_soap_preconditioner(group, update, Q, GG, *exp_avgs, use_kl=False, eps=1e-8, exp_avg_sq=None):
+def _apply_soap_preconditioner(group, update, Q, GG, *exp_avgs, use_kl=False, eps=1e-8, exp_avg_sq=None,
+                               eigvals=None):
     beta = utils.beta_debias(group["shampoo_beta"], group["step"])
     max_dim, p1d = group["max_precond_dim"], group["precondition_1d"]
     eas = exp_avg_sq or [None] * len(update)
-    for upd, q, gg, ea_sq, *ref in zip(update, Q, GG, eas, *exp_avgs):
+    eigs = eigvals or [None] * len(update)
+    for upd, q, gg, ea_sq, eig, *ref in zip(update, Q, GG, eas, eigs, *exp_avgs):
         g = utils.promote(upd)
         if use_kl:
-            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps)
+            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps, eigvals=eig)
         else:
             utils.update_ggt(g, gg, max_dim, p1d, beta)
         if group["is_preconditioning"]:
-            utils.get_orthogonal_matrix_QR(gg, q, *ref,
-                                           exp_avg_sq=[ea_sq] if ea_sq is not None else None)
+            utils.get_orthogonal_matrix_QR(gg, q, *ref, exp_avg_sq=ea_sq)
 
 
 @needs_full_param
@@ -1253,11 +1250,15 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
+    eigvals = [[utils._kl_eigvals(q, m) if isinstance(m, torch.Tensor) and q is not None else None
+                for q, m in zip(qs, ms)]
+               for qs, ms in zip(Q, GG)]
     utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
-    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
+    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"], eigvals=ev)
+               for e, q, gg, ev in zip(exp_avg, Q, GG, eigvals)]
     dampening = group.get("dampening", 0.0)
     accum = [utils.dampen_grad(u, dampening)[1] for u in update] if dampening > 0 else update
-    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"])
+    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"], eigvals=eigvals)
     for gg in GG:
         factors = [m for m in gg if isinstance(m, torch.Tensor)]
         if len(factors) >= 2:

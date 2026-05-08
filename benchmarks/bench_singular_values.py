@@ -3,7 +3,7 @@ import argparse
 import torch
 from torch._dynamo import config as dynamo_config
 
-from heavyball.utils import _max_singular_value_ndim, max_singular_value, min_singular_value
+from heavyball.utils import max_singular_value, min_singular_value
 
 dynamo_config.cache_size_limit = 2**20
 dynamo_config.accumulated_cache_size_limit = 2**20
@@ -31,7 +31,6 @@ def make_matrix(shape, cond=10, dtype=torch.float32, symmetric=False, seed=0):
 
 SHAPES_2D = [(4, 4), (32, 32), (128, 128), (10, 5), (5, 10)]
 SHAPES_SYM = [(4, 4), (32, 32), (128, 128)]
-SHAPES_NDIM = [(3, 4, 5), (16, 32, 64), (16, 16, 512)]
 CONDS = [1, 10, 1e4, 1e10, 1e18, 1e30, 1e300]
 DTYPES = [torch.bfloat16, torch.float32, torch.float64]
 POWER_ITERS = [0, 5, 20]
@@ -78,22 +77,6 @@ def bench_min_sv(rows):
                     rows.append(("min_sv", _dtype_name(dtype), pi, shape, cond, rerr, status))
 
 
-def bench_ndim(rows):
-    for shape in SHAPES_NDIM:
-        torch.manual_seed(0x172893)
-        A = torch.randn(shape).cuda()
-        exact = torch.linalg.svdvals(A.double()).max()
-        try:
-            approx = _max_singular_value_ndim(A, power_iter=2)
-            rerr = abs((approx.double() - exact) / exact).item()
-            is_upper = (approx.double() >= exact.double()).item()
-            status = "ok" if is_upper else "not_upper_bound"
-        except Exception as e:
-            rerr = float("nan")
-            status = type(e).__name__
-        rows.append(("ndim", "fp32", 2, shape, 0, rerr, status))
-
-
 def print_pareto(rows):
     from itertools import groupby
 
@@ -124,7 +107,6 @@ def main():
     rows = []
     bench_max_sv(rows)
     bench_min_sv(rows)
-    bench_ndim(rows)
 
     print_pareto(rows)
 
