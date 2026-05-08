@@ -828,20 +828,19 @@ def _compilable_scatter_set(target, source, index):
 
 
 @decorator_no_fullgraph
-def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor):
-    """
-    Computes the eigenbases of the preconditioner using one round of power iteration
-    followed by torch.linalg.qr decomposition, and updates exp_avg in-place from old to new eigenspace.
+def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor, exp_avg_sq=None):
+    """One step of subspace iteration on Q; rotates buffers from old to new basis.
 
-    :param GG: List of accumulated gradient outer products.
-    :param Q: List of current eigenbases (updated in-place to Q_new).
-    :param exp_avg: Exponential moving average in the old eigenspace (updated in-place if provided).
-        Pass nothing (or only `None` entries) to refresh Q without rotating any state.
+    First-moment buffers (`*exp_avg`) rotate linearly: r_new = R^T r R.
+    Second-moment buffers (`exp_avg_sq`) transport via Hadamard square:
+    v_new = (R*R)^T v (R*R) per side, R = Q_old^T Q_new (correct under the
+    independence Adam already assumes; preserves non-negativity and total
+    variance).
     """
     if isinstance(Q, list) and not Q:
         return
 
-    ref = exp_avg[0] if exp_avg else None
+    ref = exp_avg[0] if exp_avg else (exp_avg_sq[0] if exp_avg_sq else None)
     if ref is not None and ref.dim() <= 1:  # bucket-of-scalars: no preconditioning makes sense here
         Q.clear()
         return
@@ -884,15 +883,29 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
     if not from_shampoo:
         return
 
-    to_shampoo = ",".join([f"...{i}{o}" for m, i, o in zip(new_qs, in_str.upper(), out_str) if m is not None])
-    out_str = "".join([o if o in to_shampoo else i for i, o in zip(in_str, out_str)])
+    if exp_avg:
+        to_shampoo = ",".join([f"...{i}{o}" for m, i, o in zip(new_qs, in_str.upper(), out_str) if m is not None])
+        out_lin = "".join([o if o in to_shampoo else i for i, o in zip(in_str, out_str)])
+        subs = f"...{in_str},{from_shampoo},{to_shampoo}->...{out_lin}"
+        Q_kept = [promote(q) for q in Q if q is not None]
+        Qn_kept = [q for q in new_qs if q is not None]
+        for r in exp_avg:
+            copy_stochastic_(r, compiled_einsum(subs, promote(r), *Q_kept, *Qn_kept))
 
-    subscripts = f"...{in_str},{from_shampoo},{to_shampoo}->...{out_str}"
-    for r in exp_avg:
-        new = compiled_einsum(
-            subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None]
-        )
-        copy_stochastic_(r, new)
+    if exp_avg_sq:
+        R_squared = []
+        for qo, qn in zip(Q, new_qs):
+            if qo is None:
+                R_squared.append(None)
+                continue
+            R = compiled_einsum("...ji,...jk->...ik", promote(qo.data), promote(qn))
+            R_squared.append(R * R)
+        sq_terms = ",".join([f"...{i}{o}" for s, i, o in zip(R_squared, in_str, out_str) if s is not None])
+        out_sq = "".join([o if o in sq_terms else i for i, o in zip(in_str, out_str)])
+        subs = f"...{in_str},{sq_terms}->...{out_sq}"
+        Rsq_kept = [s for s in R_squared if s is not None]
+        for v in exp_avg_sq:
+            copy_stochastic_(v, compiled_einsum(subs, promote(v), *Rsq_kept).clamp_min(0))
 
     for q, q_new in zip(Q, new_qs):
         if q is not None:
@@ -1228,13 +1241,12 @@ def _kl_eigvals(q: Tensor, m: Tensor) -> Tensor:
 
 @decorator_knowngood
 def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
-    """KL-Shampoo corrected Kronecker factor accumulation (arXiv:2509.03378).
+    """KL-Shampoo factor update (arXiv:2509.03378).
 
-    L <- lerp(L, G @ R^{-1} @ G.T / d_b, 1-beta)
-    R <- lerp(R, G.T @ L^{-1} @ G / d_a, 1-beta)
+        L <- lerp(L, G R^+ G^T / d_b, 1-beta);    R <- lerp(R, G^T L^+ G / d_a, 1-beta)
 
-    Factor inverses approximated via eigenbasis: Q @ diag(lambda^{-1}) @ Q.T.
-    Falls back to standard outer product for non-2D grads or missing eigenbases.
+    where M^+ is the Moore-Penrose pseudo-inverse via eigenbasis. Falls back
+    to the SOAP outer product for non-2D grads or missing eigenbases.
     """
     if grad.dim() == 2 and (not precondition_1d or grad.shape[1] > max_precond_dim):
         return
@@ -1248,8 +1260,9 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
         if not isinstance(m, Tensor) or q is None:
             infos.append(None)
             continue
-        scale = _kl_eigvals(q, m).clamp_min(eps).reciprocal() / grad.shape[idx + 1]
-        # idx=0 contracts the row axis (g32.mT @ q), idx=1 contracts the col axis (g32 @ q).
+        eig = _kl_eigvals(q, m)
+        # Moore-Penrose pseudo-inverse: 1/eig where eig > eps, 0 elsewhere.
+        scale = torch.where(eig > eps, eig.reciprocal(), 0.0) / grad.shape[idx + 1]
         proj = compiled_einsum("...ji,...jk->...ik" if idx == 0 else "...ij,...jk->...ik", g32, promote(q))
         infos.append((proj, scale))
 
