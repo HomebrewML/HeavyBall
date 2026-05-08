@@ -5,7 +5,7 @@ import torch._dynamo
 import heavyball
 import heavyball.chainable as C
 from heavyball import utils
-from heavyball.chainable import SkipUpdate
+from heavyball.chainable import _SKIP
 
 
 @pytest.fixture(autouse=True)
@@ -31,8 +31,7 @@ def _state_value(state, fn_name: str, label: str):
 def _run_initial_call(transform, state_fn, group, tensors, params):
     grads = [t.clone() for t in tensors]
     updates = [t.clone() for t in tensors]
-    with pytest.raises(SkipUpdate):
-        transform(state_fn, group, updates, grads, params)
+    assert transform(state_fn, group, updates, grads, params) is _SKIP
 
 
 def _make_state_fn():

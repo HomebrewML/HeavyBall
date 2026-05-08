@@ -31,6 +31,9 @@ def _guard_in_state(state, key, template_fn):
     return state[key]
 
 
+_SKIP = object()
+
+
 class FunctionTransform:
     def __init__(self, fn, names: list[str] | None = None):
         if names is None:
@@ -39,6 +42,7 @@ class FunctionTransform:
         self.fn_name = self.get_fn().__name__
         self.transform_idx = None
         self.names = names
+        self._under_bucket = False
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
         raise NotImplementedError
@@ -51,16 +55,13 @@ class FunctionTransform:
         skip_update = False
         for st, a in zip(states, zip(update, grad, param, *args)):
             if self.transform_idx not in st.get("is_initialized", set()):
-                try:
-                    self._init(st, group, *a, **kwargs)
-                except SkipUpdate:
+                if self._init(st, group, *a, **kwargs) is _SKIP:
                     skip_update = True
-                finally:
-                    if "is_initialized" not in st:
-                        st["is_initialized"] = set()
-                    st["is_initialized"].add(self.transform_idx)
+                if "is_initialized" not in st:
+                    st["is_initialized"] = set()
+                st["is_initialized"].add(self.transform_idx)
         if skip_update:
-            raise SkipUpdate from None
+            return _SKIP
         vars = [[st.get(self.val_name(name), None) for st in states] for name in self.names]
         return self._call(state, group, update, grad, param, vars, *args, **kwargs)
 
@@ -108,7 +109,7 @@ class Parallel:
             u, skip = _inner_chain(state, group, branch_update, grad, param, *branch)
             results.append((u, skip, None))
         if _enforce_uniform_skip(results):
-            raise SkipUpdate from None
+            return _SKIP
         return self.merge_fn([u for u, _, _ in results])
 
 
@@ -137,7 +138,6 @@ class Route:
         def _sel(lst, idx):
             return [lst[i] for i in idx]
 
-        caution = group["caution"]
         results = []
 
         all_chains = [(buckets.get(j), fns) for j, (_, fns) in enumerate(self.routes)]
@@ -147,7 +147,6 @@ class Route:
         for idx, fns in all_chains:
             if not idx:
                 continue
-            group["caution"] = caution
             if fns is not None:
                 u, skip = _inner_chain(
                     _sel(state, idx), group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns
@@ -157,7 +156,7 @@ class Route:
             results.append((u, skip, idx))
 
         if _enforce_uniform_skip(results):
-            raise SkipUpdate from None
+            return _SKIP
 
         out = [None] * len(param)
         for u_list, _, idx in results:
@@ -344,12 +343,9 @@ class PrecondGradAccumGuard(FunctionTransform):
         else:
             self._accum(group, vars, base_grad)
             vars = base_grad
-        try:
-            out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
-        finally:
-            if accum_state is not None:
-                self._reset(group, accum_state)
-
+        out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
+        if accum_state is not None:
+            self._reset(group, accum_state)
         return out
 
 
@@ -378,7 +374,7 @@ class GeneralGuard(FunctionTransform):
         for name in self.names:
             state[self.val_name(name)] = state.pop(name, None)
         if self.skip_first:
-            raise SkipUpdate from None
+            return _SKIP
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
@@ -401,13 +397,13 @@ class NoStateNoMultiTensor(FunctionTransform):
         updates = []
         skip_update = False
         for a in zip(update, grad, param, *args):
-            try:
-                updates.append(self.fn(group, *a, **kwargs))
-            except SkipUpdate:
+            r = self.fn(group, *a, **kwargs)
+            if r is _SKIP:
                 skip_update = True
-                pass
+            else:
+                updates.append(r)
         if skip_update:
-            raise SkipUpdate from None
+            return _SKIP
         return updates
 
 
@@ -440,6 +436,8 @@ class SqueezeGrad(FunctionTransform):
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
                 kwargs[k] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         out = self.fn(state, group, update, grad, param, *args, **kwargs)
+        if out is _SKIP or out is None:
+            return out
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
 
@@ -501,9 +499,8 @@ class BucketGuard(FunctionTransform):
             for i in indices[1:]:
                 states[i][bucket_key] = bucket_state
 
-            try:
-                result = self.fn([bucket_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
-            except SkipUpdate:
+            result = self.fn([bucket_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
+            if result is _SKIP:
                 skip = True
                 if n > 1:
                     for k in range(n):
@@ -521,7 +518,7 @@ class BucketGuard(FunctionTransform):
                     out[i] = precond_slab[k]
 
         if skip:
-            raise SkipUpdate from None
+            return _SKIP
         return out
 
 
@@ -543,7 +540,7 @@ class WarmupGuard(FunctionTransform):
             for st, a in zip(states, zip(update, grad, param, *args)):
                 fn(st, group, *a, **kwargs)
                 st[self.warmup_key] = st.get(self.warmup_key, 0) + 1
-            raise SkipUpdate from None
+            return _SKIP
         for st in states:
             if "is_initialized" not in st:
                 st["is_initialized"] = set()
@@ -620,7 +617,7 @@ def apply_update(group, update, grad, param):
         cautious_decay=group.get("cautious_weight_decay", False),
         grad=grad,
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg")
@@ -690,7 +687,7 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -736,7 +733,7 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -757,7 +754,7 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
@@ -798,7 +795,7 @@ def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, e
         group.get("beta3_warmup"),
         group.get("alpha_warmup"),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -824,7 +821,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -863,7 +860,7 @@ def update_by_schedule_free(group, update, grad, param, z):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -884,7 +881,7 @@ def update_by_msam(group, update, grad, param, z, exp_avg):
         group["sam_step_size"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _adopt_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq):
@@ -919,7 +916,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _suds_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
@@ -1110,7 +1107,7 @@ def update_by_hyperball(group, update, grad, param, init_norm):
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _store_std(state, group, update, grad, param):
@@ -1504,7 +1501,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1536,7 +1533,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1651,7 +1648,7 @@ def update_by_psgd(
 ):
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1687,7 +1684,7 @@ def update_by_delayed_psgd(
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1734,7 +1731,7 @@ def update_by_psgd_pro(
 ):
     _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def palm_beta2(state, group, update, grad, param):
@@ -2097,13 +2094,14 @@ def _restore_params(views, gathers):
 def _inner_chain(state, group, update, grad, param, *fns):
     skip_update = False
     for fn in fns:
-        try:
-            update = fn(state, group, update, grad, param)
-        except SkipUpdate:
+        new = fn(state, group, update, grad, param)
+        if new is _SKIP:
             skip_update = True
             continue
-        if update is None:
+        if new is None:
+            update = None
             break
+        update = new
     return update, skip_update
 
 
@@ -2162,6 +2160,27 @@ def _walk_fns(obj):
             stack.extend(cur)
 
 
+def _walk_fns_with_bucket(obj):
+    stack = [(obj, False)]
+    while stack:
+        cur, ub = stack.pop()
+        if isinstance(cur, FunctionTransform):
+            yield cur, ub
+            stack.append((cur.fn, ub or isinstance(cur, BucketGuard)))
+        elif isinstance(cur, functools.partial):
+            stack.append((cur.func, ub))
+        elif isinstance(cur, Parallel):
+            for branch in cur.branches:
+                stack.extend((b, ub) for b in branch)
+        elif isinstance(cur, Route):
+            for _, fns in cur.routes:
+                stack.extend((f, ub) for f in fns)
+            if cur.default is not None:
+                stack.extend((f, ub) for f in cur.default)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend((c, ub) for c in cur)
+
+
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
     if retain and offset:
         raise ValueError("offset cannot be retained")
@@ -2170,9 +2189,10 @@ def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
         offset = max((ft.transform_idx for ft in _walk_fns(fns) if ft.transform_idx is not None), default=-1) + 1
 
     new_fns = [copy.deepcopy(fn) for fn in fns]
-    for ft in _walk_fns(new_fns):
+    for ft, under_bucket in _walk_fns_with_bucket(new_fns):
         if not retain or ft.transform_idx is None:
             ft.transform_idx, offset = offset, offset + 1
+        ft._under_bucket = under_bucket
         ft._build_val_names()
 
     return new_fns
@@ -2284,7 +2304,7 @@ class ChainOpt(utils.StatefulOptimizer):
         self._transform_ids = frozenset(
             ft.transform_idx
             for ft in _walk_fns(self._fns)
-            if ft.transform_idx is not None and getattr(ft, "needs_init", True)
+            if ft.transform_idx is not None and getattr(ft, "needs_init", True) and not ft._under_bucket
         )
 
     def _set_indices(self, retain=True):
@@ -2360,7 +2380,6 @@ class ChainOpt(utils.StatefulOptimizer):
 
     def _run_chain(self, state, group, g, p, caution):
         chain(state, group, g, p, *self.fns)
-        group["caution"] = caution
 
     def _needs_init(self, state):
         ids = self._transform_ids
