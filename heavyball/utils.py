@@ -886,8 +886,11 @@ def get_orthogonal_matrix_QR(
             copy_stochastic_(r, compiled_einsum(subs, promote(r), *Q_kept, *Qn_kept))
 
     if heavy and exp_avg_sq is not None:
-        Rsq = [compiled_einsum("...ji,...jk->...ik", promote(qo.data), promote(qn)).square()
-               for qo, qn in zip(Q, new_qs) if qo is not None]
+        Rsq = [
+            compiled_einsum("...ji,...jk->...ik", promote(qo.data), promote(qn)).square()
+            for qo, qn in zip(Q, new_qs)
+            if qo is not None
+        ]
         sq_terms = ",".join([f"...{i}{o}" for q, i, o in zip(Q, in_str, out_str) if q is not None])
         out_sq = "".join([o if o in sq_terms else i for i, o in zip(in_str, out_str)])
         subs = f"...{in_str},{sq_terms}->...{out_sq}"
@@ -3162,7 +3165,10 @@ def psgd_pro_update_precond(
         q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell_b * precond_lr
 
         R = (q_.mT - q_).contiguous()
-        R = R / (max_singular_value(R, power_iter=power_iter).unsqueeze(-1).unsqueeze(-1) + torch.finfo(R.dtype).smallest_normal)
+        R = R / (
+            max_singular_value(R, power_iter=power_iter).unsqueeze(-1).unsqueeze(-1)
+            + torch.finfo(R.dtype).smallest_normal
+        )
         RQ = R @ q_
         RRQ = R @ RQ
         c1 = RQ.diagonal(dim1=-2, dim2=-1).sum(dim=-1)

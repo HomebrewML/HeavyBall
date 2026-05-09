@@ -64,7 +64,9 @@ def summarize(rows):
         buckets[(r["shape"], r["dtype"], r["k"], r["eps"])].append(r)
 
     cols = [(stat, m) for stat in ("maxinv", "err") for m in METHODS]
-    header = f"{'shape':<10} {'dtype':<5} {'k':>3} {'eps':>9}  {'rank/d':>8}  " + "  ".join(f"{stat + '_' + m:<13}" for stat, m in cols)
+    header = f"{'shape':<10} {'dtype':<5} {'k':>3} {'eps':>9}  {'rank/d':>8}  " + "  ".join(
+        f"{stat + '_' + m:<13}" for stat, m in cols
+    )
     print(f"\n{header}\n{'-' * len(header)}")
     for (shape, dt, k, eps), items in sorted(buckets.items()):
         rank, d = items[0]["rank"], items[0]["d"]
@@ -80,9 +82,7 @@ def main():
 
     rows = [
         run_case(shape, k, eps, dtype, seed)
-        for shape, k, eps, dtype, seed in product(
-            SHAPES, WARMUP_K, EPS_VALS, DTYPES, range(args.seeds)
-        )
+        for shape, k, eps, dtype, seed in product(SHAPES, WARMUP_K, EPS_VALS, DTYPES, range(args.seeds))
     ]
     summarize(rows)
 

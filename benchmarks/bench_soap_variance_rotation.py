@@ -114,9 +114,7 @@ def main():
 
     rows = [
         run_case(shape, theta, kind, dtype, seed)
-        for shape, theta, kind, dtype, seed in product(
-            SHAPES, ANGLES, V_KINDS, DTYPES, range(args.seeds)
-        )
+        for shape, theta, kind, dtype, seed in product(SHAPES, ANGLES, V_KINDS, DTYPES, range(args.seeds))
     ]
     summarize(rows)
 
