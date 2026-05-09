@@ -11,6 +11,10 @@ ShapeMap = dict[int, tuple[int, ...]]
 
 
 class SGD(C.BaseOpt):
+    """
+    SGD with heavy-ball momentum.
+    """
+
     def __init__(
         self,
         params,
@@ -38,6 +42,15 @@ class SGD(C.BaseOpt):
 
 
 class AdamW(C.BaseOpt):
+    """
+    AdamW
+
+    Sources:
+        Decoupled Weight Decay Regularization
+        Ilya Loshchilov, Frank Hutter
+        https://arxiv.org/abs/1711.05101
+    """
+
     def __init__(
         self,
         params,
@@ -68,6 +81,15 @@ class AdamW(C.BaseOpt):
 
 
 class NAdam(C.BaseOpt):
+    """
+    NAdam
+
+    Sources:
+        Incorporating Nesterov Momentum into Adam
+        Timothy Dozat
+        https://cs229.stanford.edu/proj2015/054_report.pdf
+    """
+
     def __init__(
         self,
         params,
@@ -100,6 +122,15 @@ class NAdam(C.BaseOpt):
 
 
 class AdEMAMix(C.BaseOpt):
+    """
+    AdEMAMix
+
+    Sources:
+        The AdEMAMix Optimizer: Better, Faster, Older
+        Matteo Pagliardini, Pierre Ablin, David Grangier
+        https://arxiv.org/abs/2409.03137
+    """
+
     def __init__(
         self,
         params,
@@ -134,6 +165,25 @@ class AdEMAMix(C.BaseOpt):
 
 
 class UnscaledAdamW(C.BaseOpt):
+    """
+    UnscaledAdamW
+
+    AdamW without bias correction on the second moment — useful when the bias-correction
+    transient interacts poorly with downstream clipping or warmup.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        AdamW (baseline):
+            Decoupled Weight Decay Regularization
+            Ilya Loshchilov, Frank Hutter
+            https://arxiv.org/abs/1711.05101
+    """
+
     def __init__(
         self,
         params,
@@ -164,6 +214,21 @@ class UnscaledAdamW(C.BaseOpt):
 
 
 class SUDSAdamW(C.BaseOpt):
+    """
+    SUDSAdamW
+
+    AdamW augmented with SUDS, a rank-1 Fisher-direction preconditioner fit online via
+    Oja's rule and applied before Adam. The rank-1 sketch captures the dominant Hessian
+    direction at near-zero cost.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+    """
+
     def __init__(
         self,
         params,
@@ -195,6 +260,19 @@ class SUDSAdamW(C.BaseOpt):
 
 
 class Scion(C.BaseOpt):
+    """
+    Scion
+
+    Norm-constrained linear minimization oracle (LMO) optimizer with auto-norm selection:
+    spectral norm for matrices, RMS for vectors, spectral norm of the unfolded mode for
+    convolutions.
+
+    Sources:
+        Training Deep Learning Models with Norm-Constrained LMOs
+        Thomas Pethick, Wanyun Xie, Kimon Antonakopoulos, Zhenyu Zhu, Antonio Silveti-Falls, Volkan Cevher
+        https://arxiv.org/abs/2502.07529
+    """
+
     def __init__(
         self,
         params,
@@ -239,6 +317,18 @@ class Scion(C.BaseOpt):
 
 
 class AdamC(C.BaseOpt):
+    """
+    AdamC
+
+    Adam with weight-decay scaled by `lr / max_lr` so the effective decay stays constant
+    as the learning rate decays.
+
+    Sources:
+        AdamC: Confused Adam Optimizers
+        Defazio, Mehta, Mishchenko
+        https://arxiv.org/abs/2506.02285
+    """
+
     def __init__(
         self,
         params,
@@ -277,7 +367,12 @@ class AdamC(C.BaseOpt):
 
 class RMSprop(C.BaseOpt):
     """
-    Debiased RMSprop (not torch.optim.RMSprop)
+    Debiased RMSprop (not torch.optim.RMSprop). The bias correction matches Adam's
+    second-moment debiasing.
+
+    Sources:
+        Lecture 6.5 — RMSprop, COURSERA: Neural Networks for Machine Learning
+        Tieleman & Hinton, 2012
     """
 
     def __init__(
@@ -319,6 +414,24 @@ class RMSprop(C.BaseOpt):
 
 
 class HyperBallAdamW(C.BaseOpt):
+    """
+    HyperBallAdamW
+
+    Routes 2D+ parameters through HyperBall — updates are projected to keep each
+    parameter on a hyperball whose radius is set at initialization — and 1D parameters
+    through standard AdamW.
+
+    Sources:
+        HyperBall:
+            Fantastic Pretraining Optimizers and Where to Find Them, Section 2.1: HyperBall Optimization
+            https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd
+
+        AdamW:
+            Decoupled Weight Decay Regularization
+            Ilya Loshchilov, Frank Hutter
+            https://arxiv.org/abs/1711.05101
+    """
+
     def __init__(
         self,
         params,
@@ -362,6 +475,30 @@ class HyperBallAdamW(C.BaseOpt):
 
 
 class MuonAdamW(C.BaseOpt):
+    """
+    MuonAdamW
+
+    Routes 2D+ parameters through Muon (orthogonalized momentum) and 1D parameters
+    through AdamW.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        Muon:
+            Muon: An optimizer for hidden layers in neural networks
+            Keller Jordan
+            https://kellerjordan.github.io/posts/muon/
+
+        AdamW:
+            Decoupled Weight Decay Regularization
+            Ilya Loshchilov, Frank Hutter
+            https://arxiv.org/abs/1711.05101
+    """
+
     def __init__(
         self,
         params,
@@ -406,6 +543,15 @@ class MuonAdamW(C.BaseOpt):
 
 
 class SFAdamW(C.ScheduleFree):
+    """
+    SFAdamW (Schedule-Free AdamW)
+
+    Sources:
+        The Road Less Scheduled
+        Aaron Defazio, Xingyu (Alice) Yang, Harsh Mehta, Konstantin Mishchenko, Ahmed Khaled, Ashok Cutkosky
+        https://arxiv.org/abs/2405.15682
+    """
+
     def __init__(
         self,
         params,
@@ -445,6 +591,19 @@ class SFAdamW(C.ScheduleFree):
 
 
 class MSAMLaProp(C.MSAM):
+    """
+    MSAMLaProp
+
+    RMSprop-style adaptive scaling wrapped in Momentum-SAM (M-SAM). Despite the name,
+    the inner update is RMSprop, not LaProp.
+
+    Sources:
+        Momentum-SAM:
+            Momentum-SAM: Sharpness Aware Minimization without Computational Overhead
+            Marlon Becker, Frederick Altrock, Benjamin Risse
+            https://arxiv.org/abs/2401.12033
+    """
+
     def __init__(
         self,
         params,
@@ -485,6 +644,16 @@ class MSAMLaProp(C.MSAM):
 
 
 class ADOPT(C.BaseOpt):
+    """
+    ADOPT
+
+    Sources:
+        ADOPT: Modified Adam Can Converge with Any β2 with the Optimal Rate
+        Shohei Taniguchi, Keno Harada, Gouki Minegishi, Yuta Oshima, Seong Cheol Jeong,
+        Go Nagahara, Tomoshi Iiyama, Masahiro Suzuki, Yusuke Iwasawa, Yutaka Matsuo
+        https://arxiv.org/abs/2411.02853
+    """
+
     def __init__(
         self,
         params,
@@ -515,6 +684,15 @@ class ADOPT(C.BaseOpt):
 
 
 class Muon(C.BaseOpt):
+    """
+    Muon
+
+    Sources:
+        Muon: An optimizer for hidden layers in neural networks
+        Keller Jordan
+        https://kellerjordan.github.io/posts/muon/
+    """
+
     def __init__(
         self,
         params,
@@ -562,6 +740,15 @@ class Muon(C.BaseOpt):
 
 
 class LaProp(C.BaseOpt):
+    """
+    LaProp
+
+    Sources:
+        LaProp: Separating Momentum and Adaptivity in Adam
+        Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+        https://arxiv.org/abs/2002.04839
+    """
+
     def __init__(
         self,
         params,
@@ -592,6 +779,29 @@ class LaProp(C.BaseOpt):
 
 
 class MuonLaProp(C.BaseOpt):
+    """
+    MuonLaProp
+
+    LaProp's adaptivity feeding Muon's orthogonalization.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        Muon:
+            Muon: An optimizer for hidden layers in neural networks
+            Keller Jordan
+            https://kellerjordan.github.io/posts/muon/
+
+        LaProp:
+            LaProp: Separating Momentum and Adaptivity in Adam
+            Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+            https://arxiv.org/abs/2002.04839
+    """
+
     def __init__(
         self,
         params,
@@ -662,6 +872,8 @@ class SOAP(SOAPBase):
             https://github.com/nikhilvyas/SOAP
     """
 
+    _chain_fns = (C.scale_by_soap,)
+
     def __init__(
         self,
         params,
@@ -696,15 +908,15 @@ class SOAP(SOAPBase):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_soap,))
+        self._build_soap_defaults(locals(), fns=self._chain_fns)
 
 
-class KLSOAP(SOAPBase):
+class KLSOAP(SOAP):
     """
-    KL-SOAP
+    KLSOAP
 
-    SOAP with KL-Shampoo corrected Kronecker factor accumulation. Instead of one-sided
-    outer products (G@G.T), uses two-sided fixed point from KL divergence minimization,
+    SOAP with KL-Shampoo's corrected Kronecker factor accumulation: a two-sided fixed
+    point from KL-divergence minimization replaces the one-sided outer products G@G.T,
     weighting each factor's update by the inverse of the other factor's eigenvalues.
 
     Sources:
@@ -719,41 +931,7 @@ class KLSOAP(SOAPBase):
             https://arxiv.org/abs/2409.11321
     """
 
-    def __init__(
-        self,
-        params,
-        lr: float = 3e-3,
-        betas=(0.9, 0.95),
-        shampoo_beta: float = 0.95,
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
-        cautious_weight_decay: bool = False,
-        precondition_frequency: int = 2,
-        max_precond_dim: int = 2048,
-        merge_dims: bool = True,
-        precondition_1d: bool = False,
-        warmup_steps: int = 0,
-        split: bool = False,
-        multi_tensor: bool = True,
-        mars: bool = False,
-        caution: bool = False,
-        mars_gamma: float = 0.0025,
-        palm: bool = C.use_default,
-        precond_scheduler=(1 / 3, 9),
-        beta2_scale: float = 0.8,
-        use_precond_schedule: bool = C.use_default,
-        gradient_clipping: C.str_or_fn = C.use_default,
-        update_clipping: C.str_or_fn = C.use_default,
-        storage_dtype: str = "float32",
-        precond_grad_accum: bool = False,
-        compile_step: bool = C.use_default,
-        promote: bool = C.use_default,
-        ecc: str | None = None,
-        param_ecc: str | None = None,
-        orig_shapes: ShapeMap | None = None,
-        **kwargs,
-    ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_kl_soap,))
+    _chain_fns = (C.scale_by_kl_soap,)
 
 
 class KLShampoo(SOAPBase):
@@ -772,6 +950,8 @@ class KLShampoo(SOAPBase):
             Wu Lin, Scott C. Lowe, Felix Dangel, Runa Eschenhagen, Zikun Xu, Roger B. Grosse
             https://arxiv.org/abs/2509.03378
     """
+
+    _chain_fns = (C.scale_by_kl_shampoo,)
 
     def __init__(
         self,
@@ -809,10 +989,36 @@ class KLShampoo(SOAPBase):
         dampening: float = 1e-9,
         **kwargs,
     ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_kl_shampoo,))
+        self._build_soap_defaults(locals(), fns=self._chain_fns)
 
 
-class SOAPNAdam(SOAPBase):
+class SOAPNAdam(SOAP):
+    """
+    SOAPNAdam
+
+    SOAP with NAdam (Nesterov-Adam) running in the projected eigenbasis instead of
+    vanilla Adam.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        Baseline SOAP:
+            SOAP: Improving and Stabilizing Shampoo using Adam
+            Nikhil Vyas, Depen Morwani, Rosie Zhao, Itai Shapira, David Brandfonbrener, Lucas Janson, Sham Kakade
+            https://arxiv.org/abs/2409.11321
+
+        NAdam:
+            Incorporating Nesterov Momentum into Adam
+            Timothy Dozat
+            https://cs229.stanford.edu/proj2015/054_report.pdf
+    """
+
+    _chain_fns = (C.scale_by_soap_nadam,)
+
     def __init__(
         self,
         params,
@@ -849,10 +1055,36 @@ class SOAPNAdam(SOAPBase):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_nadam,))
+        self._build_soap_defaults(locals(), fns=self._chain_fns)
 
 
-class SOAPAdEMAMix(SOAPBase):
+class SOAPAdEMAMix(SOAP):
+    """
+    SOAPAdEMAMix
+
+    SOAP with AdEMAMix's three-EMA scheme running in the projected eigenbasis instead
+    of vanilla Adam.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        Baseline SOAP:
+            SOAP: Improving and Stabilizing Shampoo using Adam
+            Nikhil Vyas, Depen Morwani, Rosie Zhao, Itai Shapira, David Brandfonbrener, Lucas Janson, Sham Kakade
+            https://arxiv.org/abs/2409.11321
+
+        AdEMAMix:
+            The AdEMAMix Optimizer: Better, Faster, Older
+            Matteo Pagliardini, Pierre Ablin, David Grangier
+            https://arxiv.org/abs/2409.03137
+    """
+
+    _chain_fns = (C.scale_by_soap_ademamix,)
+
     def __init__(
         self,
         params,
@@ -890,10 +1122,28 @@ class SOAPAdEMAMix(SOAPBase):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_ademamix,))
+        self._build_soap_defaults(locals(), fns=self._chain_fns)
 
 
 class SignLaProp(C.BaseOpt):
+    """
+    SignLaProp
+
+    LaProp followed by sign normalization of the resulting update.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        LaProp:
+            LaProp: Separating Momentum and Adaptivity in Adam
+            Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+            https://arxiv.org/abs/2002.04839
+    """
+
     def __init__(
         self,
         params,
@@ -930,55 +1180,98 @@ class SignLaProp(C.BaseOpt):
         )
 
 
-class SOLP(SOAPBase):
+class SOLP(SOAP):
     """
     SOLP
 
+    SOAP with LaProp running in the projected eigenbasis instead of vanilla Adam.
+
     Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
         Baseline SOAP:
             SOAP: Improving and Stabilizing Shampoo using Adam
             Nikhil Vyas, Depen Morwani, Rosie Zhao, Itai Shapira, David Brandfonbrener, Lucas Janson, Sham Kakade
             https://arxiv.org/abs/2409.11321
             https://github.com/nikhilvyas/SOAP
+
+        LaProp:
+            LaProp: Separating Momentum and Adaptivity in Adam
+            Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+            https://arxiv.org/abs/2002.04839
     """
 
-    def __init__(
-        self,
-        params,
-        lr: float = 3e-3,
-        betas=(0.9, 0.95),
-        shampoo_beta: float = 0.95,
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
-        cautious_weight_decay: bool = False,
-        precondition_frequency: int = 2,
-        max_precond_dim: int = 2048,  #
-        merge_dims: bool = True,
-        precondition_1d: bool = False,
-        warmup_steps: int = 0,
-        split: bool = False,
-        multi_tensor: bool = True,
-        mars: bool = False,
-        caution: bool = False,
-        mars_gamma: float = 0.0025,
-        palm: bool = C.use_default,
-        precond_scheduler=(1 / 3, 9),
-        beta2_scale: float = 0.8,
-        use_precond_schedule: bool = C.use_default,
-        gradient_clipping: C.str_or_fn = C.use_default,
-        update_clipping: C.str_or_fn = C.use_default,
-        storage_dtype: str = "float32",
-        compile_step: bool = C.use_default,
-        promote: bool = C.use_default,
-        ecc: str | None = None,
-        param_ecc: str | None = None,
-        orig_shapes: ShapeMap | None = None,
-        **kwargs,
-    ):
-        self._build_soap_defaults(locals(), fns=(C.scale_by_soap_laprop,))
+    _chain_fns = (C.scale_by_soap_laprop,)
+
+
+_HEAVYBALL_SOURCE = """
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360"""
+
+
+class HeavySOAP(SOAP):
+    __doc__ = "SOAP with post-orth Q sort and Hadamard-square second-moment transport.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_soap,)
+
+
+class HeavyKLSOAP(KLSOAP):
+    __doc__ = "KLSOAP with HeavySOAP's eigenbasis update and Moore-Penrose pinv KL inversion.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_kl_soap,)
+
+
+class HeavyKLShampoo(KLShampoo):
+    __doc__ = "KLShampoo with Moore-Penrose pinv KL inversion.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_kl_shampoo,)
+
+
+class HeavySOAPNAdam(SOAPNAdam):
+    __doc__ = "SOAPNAdam with HeavySOAP's eigenbasis update.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_soap_nadam,)
+
+
+class HeavySOAPAdEMAMix(SOAPAdEMAMix):
+    __doc__ = "SOAPAdEMAMix with HeavySOAP's eigenbasis update.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_soap_ademamix,)
+
+
+class HeavySOLP(SOLP):
+    __doc__ = "SOLP with HeavySOAP's eigenbasis update.\n" + _HEAVYBALL_SOURCE
+    _chain_fns = (C.scale_by_heavy_soap_laprop,)
 
 
 class OrthoLaProp(C.BaseOpt):
+    """
+    OrthoLaProp
+
+    Applies OrthoGrad to the gradient (suppressing the radial component along the
+    parameter direction) before running LaProp.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        OrthoGrad:
+            Grokking at the Edge of Numerical Stability
+            Lucas Prieto, Melih Barsbey, Pedro A. M. Mediano, Tolga Birdal
+            https://arxiv.org/abs/2501.04697
+
+        LaProp:
+            LaProp: Separating Momentum and Adaptivity in Adam
+            Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+            https://arxiv.org/abs/2002.04839
+    """
+
     def __init__(
         self,
         params,
@@ -1016,6 +1309,29 @@ class OrthoLaProp(C.BaseOpt):
 
 
 class LaPropOrtho(C.BaseOpt):
+    """
+    LaPropOrtho
+
+    Runs LaProp first, then applies OrthoGrad to the resulting update.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        OrthoGrad:
+            Grokking at the Edge of Numerical Stability
+            Lucas Prieto, Melih Barsbey, Pedro A. M. Mediano, Tolga Birdal
+            https://arxiv.org/abs/2501.04697
+
+        LaProp:
+            LaProp: Separating Momentum and Adaptivity in Adam
+            Liu Ziyin, Zhikang T. Wang, Masahito Ueda
+            https://arxiv.org/abs/2002.04839
+    """
+
     def __init__(
         self,
         params,
@@ -1084,9 +1400,20 @@ class PSGDBase(C.BaseOpt):
 
 class PSGDKron(PSGDBase):
     """
-    Originally from Evan Walters and Omead Pooladzandi, 2024
-    Modified under Creative Commons Attribution 4.0 International
-    Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
+    PSGDKron
+
+    Preconditioned Stochastic Gradient Descent with a Kronecker-factored preconditioner.
+
+    Sources:
+        PSGD:
+            Preconditioned Stochastic Gradient Descent
+            Xi-Lin Li
+            https://arxiv.org/abs/1512.04202
+            https://github.com/lixilinx/psgd_torch
+
+        Originally adapted from Evan Walters and Omead Pooladzandi, 2024,
+        under Creative Commons Attribution 4.0 International:
+            https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
     """
 
     def __init__(
@@ -1147,8 +1474,23 @@ class PSGDKron(PSGDBase):
 
 class LATHER(PSGDBase):
     """
-    Lie-group Adam Through Harmonic Eigenbasis Rotations.
-    Runs Adam in the approximate eigenspace induced by the PSGD-Kron preconditioner, then maps back.
+    LATHER (Lie-group Adam Through Harmonic Eigenbasis Rotations)
+
+    Runs Adam in the approximate eigenspace induced by the PSGD-Kron preconditioner,
+    then maps back to the original space.
+
+    Sources:
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+
+        PSGD:
+            Preconditioned Stochastic Gradient Descent
+            Xi-Lin Li
+            https://arxiv.org/abs/1512.04202
+            https://github.com/lixilinx/psgd_torch
     """
 
     def __init__(
@@ -1204,9 +1546,22 @@ class LATHER(PSGDBase):
 
 class PSGDPRO(PSGDBase):
     """
-    PSGD with Q0.5EQ1.5 (PRO/Procrustes) preconditioner update.
-    Solve-free alternative to standard PSGD-Kron (EQ method).
-    Reference: https://github.com/lixilinx/psgd_torch
+    PSGDPRO
+
+    PSGD-Kron with the Q0.5EQ1.5 (PRO / Procrustes) Q-update — Xi-Lin Li's default
+    and recommended local coordinate for fitting Q, using an online orthogonal
+    Procrustes solver to keep Q approximately SPD.
+
+    Sources:
+        Preconditioned Stochastic Gradient Descent
+        Xi-Lin Li
+        https://arxiv.org/abs/1512.04202
+
+        Stochastic Hessian Fittings with Lie Groups
+        Xi-Lin Li
+        https://arxiv.org/abs/2402.11858
+
+        https://github.com/lixilinx/psgd_torch
     """
 
     def __init__(
@@ -1261,13 +1616,24 @@ class PSGDPRO(PSGDBase):
 
 class PSGDLRA(PSGDBase):
     """
-    Originally from Evan Walters and Omead Pooladzandi, 2024
-    Modified under Creative Commons Attribution 4.0 International
-    Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
+    PSGDLRA
+
+    Preconditioned Stochastic Gradient Descent with a low-rank preconditioner.
 
     Note: `multi_tensor=True` (default) uses a single global low-rank approximation shared across all
     parameters, while `multi_tensor=False` fits an independent per-parameter LRA. These are different
     algorithms and will produce different results.
+
+    Sources:
+        PSGD:
+            Preconditioned Stochastic Gradient Descent
+            Xi-Lin Li
+            https://arxiv.org/abs/1512.04202
+            https://github.com/lixilinx/psgd_torch
+
+        Originally adapted from Evan Walters and Omead Pooladzandi, 2024,
+        under Creative Commons Attribution 4.0 International:
+            https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
     """
 
     def __init__(
@@ -1371,6 +1737,20 @@ class SplitOpt(utils.StatefulOptimizer):
 
 
 class SAMWrapper(torch.optim.Optimizer):
+    """
+    SAMWrapper
+
+    Adaptive Sharpness-Aware Minimization wrapper. The inner ascent step scales the
+    gradient elementwise by p^2 — the ASAM parameterization — making the perturbation
+    scale-invariant under per-parameter rescalings. Wraps any HeavyBall optimizer;
+    requires a closure passed to step().
+
+    Sources:
+        ASAM: Adaptive Sharpness-Aware Minimization for Scale-Invariant Learning of Deep Neural Networks
+        Jungmin Kwon, Jeongseop Kim, Hyunseo Park, In Kwon Choi
+        https://arxiv.org/abs/2102.11600
+    """
+
     def __init__(
         self,
         params,

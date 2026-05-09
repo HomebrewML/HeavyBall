@@ -828,9 +828,9 @@ def _compilable_scatter_set(target, source, index):
 
 
 @decorator_no_fullgraph
-def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor, exp_avg_sq: Tensor = None):
-    """Subspace iteration on Q with state transport. v rotates by Hadamard-square of
-    R = Q_old^T Q_new — the consistent transport when only the diagonal is tracked."""
+def get_orthogonal_matrix_QR(
+    GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor, exp_avg_sq: Tensor = None, heavy: bool = False
+):
     if isinstance(Q, list) and not Q:
         return
 
@@ -848,10 +848,18 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
             new_qs.append(None)
             continue
         m = promote(m.data)
-        oriented = inplace_orthogonal_(m @ promote(q.data), precise_zeroth_power_mode)
-        eig = compiled_einsum("...ij,...ij->...j", oriented, m @ oriented)
-        idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(oriented)
-        new_qs.append(oriented.gather(-1, idx))
+        if heavy:
+            oriented = inplace_orthogonal_(m @ promote(q.data), precise_zeroth_power_mode)
+            eig = compiled_einsum("...ij,...ij->...j", oriented, m @ oriented)
+            idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(oriented)
+            new_qs.append(oriented.gather(-1, idx))
+            continue
+        q_old = promote(q.data)
+        tmp = m @ q_old
+        eig = compiled_einsum("...ij,...ij->...j", q_old, tmp)
+        idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(tmp)
+        tmp.scatter_(-1, idx, inplace_orthogonal_(tmp.gather(-1, idx), precise_zeroth_power_mode))
+        new_qs.append(tmp)
 
     if ref is None:
         for q, q_new in zip(Q, new_qs):
@@ -877,7 +885,7 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
         for r in exp_avg:
             copy_stochastic_(r, compiled_einsum(subs, promote(r), *Q_kept, *Qn_kept))
 
-    if exp_avg_sq is not None:
+    if heavy and exp_avg_sq is not None:
         Rsq = [compiled_einsum("...ji,...jk->...ik", promote(qo.data), promote(qn)).square()
                for qo, qn in zip(Q, new_qs) if qo is not None]
         sq_terms = ",".join([f"...{i}{o}" for q, i, o in zip(Q, in_str, out_str) if q is not None])
@@ -1213,14 +1221,11 @@ def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
 
 @decorator_knowngood
 def _kl_eigvals(q: Tensor, m: Tensor) -> Tensor:
-    # diag(Q.T @ M @ Q) per bucket member: sum_{j,k} Q_ji * M_jk * Q_ki
     return compiled_einsum("...ji,...jk,...ki->...i", promote(q), promote(m), promote(q))
 
 
 @decorator_knowngood
-def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps, eigvals=None):
-    """KL-Shampoo factor update (arXiv:2509.03378):
-        L <- lerp(L, G R^+ G^T / d_b, 1-beta);    R <- lerp(R, G^T L^+ G / d_a, 1-beta)"""
+def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps, *, heavy: bool = False):
     if grad.dim() == 2 and (not precondition_1d or grad.shape[1] > max_precond_dim):
         return
 
@@ -1233,10 +1238,10 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps, eigv
         if not isinstance(m, Tensor) or q is None:
             infos.append(None)
             continue
-        eig = eigvals[idx] if eigvals is not None else _kl_eigvals(q, m)
-        scale = torch.where(eig > eps, eig.reciprocal(), 0.0) / grad.shape[idx + 1]
+        eig = _kl_eigvals(q, m)
+        inv = torch.where(eig > eps, eig.reciprocal(), 0.0) if heavy else eig.clamp_min(eps).reciprocal()
         proj = compiled_einsum("...ji,...jk->...ik" if idx == 0 else "...ij,...jk->...ik", g32, promote(q))
-        infos.append((proj, scale))
+        infos.append((proj, inv / grad.shape[idx + 1]))
 
     g0 = einsum_base[: grad.dim() - 1]
     for idx, (m, info) in enumerate(zip(GG, reversed(infos))):
@@ -1253,14 +1258,12 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps, eigv
 
 
 @decorator_knowngood
-def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Optional[Tensor]], eps: float,
-                            eigvals=None):
+def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Optional[Tensor]], eps: float):
     out = promote(grad)
     for idx, (q, m) in enumerate(zip(Q, GG)):
         if q is None or m is None:
             continue
-        eig = eigvals[idx] if eigvals is not None else _kl_eigvals(q, m)
-        d = eig.clamp_min(eps).rsqrt()
+        d = _kl_eigvals(q, m).clamp_min(eps).rsqrt()
         shape = [1] * out.ndim
         shape[0] = d.shape[0]
         shape[idx + 1] = -1
@@ -1268,10 +1271,9 @@ def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Opt
     return out.to(grad.dtype)
 
 
-def kl_shampoo_precondition(grad, Q, GG, eps, eigvals=None):
+def kl_shampoo_precondition(grad, Q, GG, eps):
     """KL-Shampoo Kronecker preconditioner (arXiv:2509.03378): ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T"""
-    return project(_kl_shampoo_kron_scale(project(grad, Q, back=False), Q, GG, eps, eigvals=eigvals),
-                   Q, back=True)
+    return project(_kl_shampoo_kron_scale(project(grad, Q, back=False), Q, GG, eps), Q, back=True)
 
 
 def tree_apply(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
