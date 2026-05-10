@@ -270,7 +270,7 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
     new_shape = [grad.shape[0], *new_shape[::-1]]
     new_grad = grad.reshape(new_shape)
     if not split:
-        return new_grad.to(memory_format=torch.contiguous_format).contiguous()
+        return new_grad
 
     grads = [new_grad]
     for i, sh in reversed(list(enumerate(new_shape[:]))):
@@ -281,7 +281,7 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
             continue
         grads = [a for g in grads for a in g.split(max_precond_dim, dim=i)]
     if len(grads) == 1:
-        return new_grad.to(memory_format=torch.contiguous_format).contiguous()
+        return new_grad
     new_grads = []
     for g in grads:
         append_or_extend(new_grads, dim_merger(g, max_precond_dim, split))
@@ -2891,15 +2891,6 @@ def _psgd_calc_scalars_(Qs: List[Tensor], conjB: Tensor):
     return triangular_qs, conjB
 
 
-@decorator_knowngood
-def _reshape_conjB(solved: Tensor, transposed_shape: List[int], original_shape: List[int], last_dim: int, new_dim: int):
-    solved = solved.reshape(transposed_shape)
-    solved = solved.transpose(-1, last_dim)
-    solved = solved.reshape(original_shape)
-    solved = solved.transpose(-1, new_dim)
-    return solved.contiguous(), solved.shape
-
-
 def ndim_tuple(Q: list[Tensor]) -> tuple:
     return tuple(q.ndim for q in Q)
 
@@ -2909,14 +2900,14 @@ def psgd_calc_A_and_conjB(G: Tensor, Q, conjB: Tensor | None):  # conjB ("V", "v
         conjB = torch.randn_like(G)
     exprA = cached_precond_grad_expr(ndim_tuple(Q), G.ndim)  # calcA expr and cached precond expr are the same
     A = casted_einsum(exprA, *Q, G)
-    transposed_shape = original_shape = conjB.shape
-    prev_i = -1
     qs, conjB = _psgd_calc_scalars_(Q, conjB)
+    n = G.shape[0]
     for i, tri_q in qs:
-        conjB, transposed_shape = _reshape_conjB(conjB, transposed_shape, original_shape, prev_i, i)
-        prev_i = i
-        conjB = no_compile_solve_triangular(tri_q, conjB, upper=True, left=False)
-    conjB, _ = _reshape_conjB(conjB, transposed_shape, original_shape, prev_i, -1)
+        conjB = conjB.movedim(i, -1).contiguous()
+        moved_shape = conjB.shape
+        flat = conjB.reshape(n, -1, moved_shape[-1])
+        flat = no_compile_solve_triangular(tri_q, flat, upper=True, left=False)
+        conjB = flat.reshape(moved_shape).movedim(-1, i).contiguous()
     return A, conjB
 
 
@@ -3076,8 +3067,10 @@ def calcG_expr(q_dim, g_dim):
         if q == 3:
             new[i] = "Z"
             out = f"{base[i]}Z"
-        else:
+        elif q == 2:
             out = base[i]
+        else:
+            out = ""
         exprs.append(f"...{base},...{''.join(new)}->...{out}")
     return exprs
 
@@ -3114,7 +3107,9 @@ def psgd_update_precond(
         term2 = promote(compiled_einsum(exprG, conjB, conjB))
 
         if q.ndim < 3:
-            ell = _update_lb((term1 + term2).amax(dim=-1), lb_state, lower_bount_beta)
+            sum_terms = term1 + term2
+            reduced = sum_terms if q.ndim == 1 else sum_terms.amax(dim=-1)
+            ell = _update_lb(reduced, lb_state, lower_bount_beta)
             update = promote(q) * (term1 - term2)
         else:
             ell = _update_lb(max_eigenvalue_spd(term1 + term2, power_iter=power_iter), lb_state, lower_bount_beta)
@@ -3154,8 +3149,10 @@ def psgd_pro_update_precond(
 
         if q.ndim < 3:
             target_energy = total_numel / max(1, q.numel())
-            ell = _update_lb(covariance_PP.amax(dim=-1) + target_energy, lb_state, lower_bount_beta)
-            copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell.unsqueeze(-1) * precond_lr)
+            reduced = covariance_PP if q.ndim == 1 else covariance_PP.amax(dim=-1)
+            ell = _update_lb(reduced + target_energy, lb_state, lower_bount_beta)
+            ell_b = ell if q.ndim == 1 else ell.unsqueeze(-1)
+            copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell_b * precond_lr)
             continue
 
         target_energy = total_numel / (q.shape[0] * q.shape[-1])
@@ -3504,7 +3501,10 @@ def psgd_should_update(group, prob: Union[float, callable], name: str = "cumulat
 
 @functools.lru_cache(maxsize=None)
 def cached_precond_grad_expr(Q_dim, grad_dim):
-    expr = [f"...{c.upper()}{c}" if q_ == 3 else f"...{c}" for c, q_ in zip(einsum_base, Q_dim)]
+    expr = [
+        f"...{c.upper()}{c}" if q_ == 3 else f"...{c}" if q_ == 2 else "..."
+        for c, q_ in zip(einsum_base, Q_dim)
+    ]
     expr = ",".join(expr)
     grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim - 1)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
@@ -3547,7 +3547,7 @@ def fused_precond_grad_cached_(
 @functools.lru_cache(maxsize=None)
 def precond_grad_expr(Q_dim, grad_dim):
     expr = [
-        f"...{c2}{c.upper()},...{c2}{c}" if q_ == 3 else f"...{c},...{c}"
+        f"...{c2}{c.upper()},...{c2}{c}" if q_ == 3 else f"...{c},...{c}" if q_ == 2 else "...,..."
         for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
     ]
     expr = ",".join(expr)

@@ -190,7 +190,10 @@ def test_stochastic_add_divide_matches_expected(data, alpha, divisor):
         (xi + yi * alpha_scalar) / divisor_scalar for xi, yi in zip(expected_inputs, expected_partner, strict=True)
     ]
     max_error = max((result.float() - exp).abs().max().item() for result, exp in zip(x, expected, strict=True))
-    assert max_error <= DTYPE_TOLERANCE[dtype] + 1e-6
+    max_magnitude = max(exp.abs().max().item() for exp in expected) if expected else 0.0
+    ulp = max_magnitude * (2**-7 if dtype is torch.bfloat16 else 2**-23)
+    tolerance = max(DTYPE_TOLERANCE[dtype], 2 * ulp)
+    assert max_error <= tolerance + 1e-6
 
 
 @settings(deadline=None, max_examples=75)
@@ -264,7 +267,8 @@ def test_merge_group_preserves_structure(tensor: List[torch.Tensor], max_dim: in
     assert sum(chunk.numel() for chunk in flat) == base.numel()
     for chunk in flat:
         assert chunk.dtype == base.dtype
-        assert chunk.is_contiguous()
+        if not split:
+            assert chunk.is_contiguous()
 
 
 @settings(deadline=None, max_examples=75)

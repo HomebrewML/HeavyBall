@@ -147,7 +147,7 @@ def test_compilable_update_rne():
         decay = scalar_guard(0.0, p)
 
         for _ in range(10):
-            _compilable_update_([p], [update], decay, lr, False, [None])
+            _compilable_update_([p], [update], decay, lr, False, False, [None])
 
         del p._ecc
 

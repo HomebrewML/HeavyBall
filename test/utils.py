@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.utils import _pytree as tree_util
 
 import heavyball
-from heavyball.chainable import FunctionTransform
+from heavyball.chainable import FunctionTransform, _walk_fns
 
 # Optimizers incompatible with the standard get_optim(betas=(0.9, 0.999)) call:
 #   AdEMAMix variants require 3 betas, SplitOpt requires dict param specs,
@@ -32,13 +32,10 @@ def _fn_key(f):
 
 
 def _deduplicate_by_chain(names):
-    """Keep one optimizer per unique chain of functions.
-
-    Two optimizers that differ only by multi_tensor=True/False have identical
-    chains and test the same code paths, keep whichever appears first.
-    """
+    """Keep one optimizer per unique chain of functions; also report which are bucket-aware."""
     seen = set()
     out = []
+    bucket_aware = set()
     for name in names:
         dummy = [torch.nn.Parameter(torch.randn(4, 4))]
         cls = getattr(heavyball, name)
@@ -48,13 +45,17 @@ def _deduplicate_by_chain(names):
         except Exception as e:
             warnings.warn(f"Failed to instantiate {name} for dedup: {e}")
             continue
+        if any(ft._under_bucket for ft in _walk_fns(opt._fns)):
+            bucket_aware.add(name)
         if key not in seen:
             seen.add(key)
             out.append(name)
-    return out
+    return out, bucket_aware
 
 
-REPRESENTATIVE_OPTS = _deduplicate_by_chain([name for name in heavyball.__all__ if name not in _SKIP_GET_OPTIM])
+REPRESENTATIVE_OPTS, BUCKET_AWARE_OPTS = _deduplicate_by_chain(
+    [name for name in heavyball.__all__ if name not in _SKIP_GET_OPTIM]
+)
 
 
 @torch.no_grad()

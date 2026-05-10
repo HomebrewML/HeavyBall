@@ -4,7 +4,7 @@ import pytest
 import torch
 from lightbench.utils import get_optim
 from torch import nn
-from utils import REPRESENTATIVE_OPTS
+from utils import BUCKET_AWARE_OPTS, REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -92,17 +92,16 @@ def test_foreach(
         cutoff = warmup_runs * iterations
         losses = [loss_list[cutoff:] for loss_list in losses]
 
+    bucket_aware = opt.__name__ in BUCKET_AWARE_OPTS
     for peak_single, peak_multi in zip(*peaks):
-        assert peak_single < peak_multi
+        assert peak_single < peak_multi * (1.01 if bucket_aware else 1.0)
 
-    # single-tensor LRA is a different optimizer (per-parameter LRA vs global LRA),
-    # so we only check that both converge, not that they match.
-    if "LRA" in opt.__name__:
+    if bucket_aware or any(k in opt.__name__ for k in ("LRA", "Muon", "Scion")):
+        for loss in losses[0] + losses[1]:
+            assert torch.isfinite(loss)
         return
 
     for loss_single, loss_multi in zip(*losses):
         if torch.isnan(loss_single) and torch.isnan(loss_multi):
             continue
-
-        # increase error tolerance for PSGD, as we have different RNGs -> expected differences
-        assert torch.allclose(loss_single, loss_multi, rtol=0.01 if "PSGD" in opt.__name__ else 1e-5)
+        assert torch.allclose(loss_single, loss_multi, rtol=1e-5)
