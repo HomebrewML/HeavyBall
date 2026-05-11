@@ -2299,13 +2299,13 @@ def _fused_compilable_adopt_(
     y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution, cautious_decay
 ):
     u32, g32, exp_avg_sq32 = [list(map(promote, x)) for x in [update, grad, exp_avg_sq]]
-    _compilable_update_(y, u32, decay, lr, caution, cautious_decay, g32)
 
     beta1 = beta_debias(beta1, step)
-    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
+    m_new = _lerp(exp_avg, [u_ / eps_sqrt(d_, eps) for u_, d_ in zip(u32, exp_avg_sq32)], beta1)
+    _compilable_update_(y, m_new, decay, lr, caution, cautious_decay, g32)
 
     beta2 = beta_debias(beta2, step + 1)
-    stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
+    stochastic_lerp_(exp_avg_sq, [u_ * u_ for u_ in u32], 1 - beta2)
 
 
 def fused_adopt_(
@@ -2321,12 +2321,13 @@ def fused_adopt_(
 @decorator_knowngood
 def _compilable_adopt_(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps):
     g32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, exp_avg_sq]]
-    update = list(map(promote, exp_avg))
 
     beta1 = beta_debias(beta1, step)
-    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
+    m_new = _lerp(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], beta1)
+
+    beta2 = beta_debias(beta2, step + 1)
     stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
-    copy_stochastic_list_(grad, update)
+    copy_stochastic_list_(grad, m_new)
 
 
 def adopt(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps: float = 1e-8):
