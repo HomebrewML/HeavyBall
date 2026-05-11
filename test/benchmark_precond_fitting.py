@@ -17,7 +17,7 @@ import typer
 from matplotlib.colors import LogNorm
 from torch._dynamo import config as dyn_cfg
 
-from heavyball.utils import _gg_inverse_via_newtonschulz, set_torch
+from heavyball.utils import init_Q_exprs, psgd_update_precond, set_torch
 
 set_torch()
 dyn_cfg.cache_size_limit = dyn_cfg.accumulated_cache_size_limit = 1_000_000
@@ -145,20 +145,28 @@ class Runner:
             sstr = "x".join(map(str, shape))
             hs0 = hess_init(shape, cfg, self.device)
             hstgt = hess_init(shape, cfg, self.device) if cfg["hess_dynamic"] == "lerp" else hs0
-            Q = [torch.eye(d, device=self.device) for d in shape]
-            oq = Q
+            stacked_shape = (1, *shape)
+            seed_grad = torch.zeros(stacked_shape, device=self.device)
+            Q = init_Q_exprs(seed_grad, 1.0, 1.0, 0.0, max(shape), 1, None, None, None)
+            running_lb = [torch.zeros((1,), device=self.device, dtype=torch.float64) for _ in shape]
             for step in range(self.steps):
                 torch.manual_seed(self.seed + step)
-                Graw = gen_grad(shape, cfg, step, self.steps, self.device)
+                vector = gen_grad(shape, cfg, step, self.steps, self.device).unsqueeze(0)
                 hs = hess_update(hs0, hstgt, cfg, step, self.steps)
-                G = precond(Graw, hs).contiguous()
-                _gg_inverse_via_newtonschulz(
-                    G=G,
-                    oq=oq,
-                    inverse_order=cfg["inverse_order"],
-                    precond_lr=torch.tensor(cfg["precond_lr"], device=self.device),
+                hessian_vector = precond(vector.squeeze(0), hs).unsqueeze(0).contiguous()
+                psgd_update_precond(
+                    hessian_vector,
+                    cfg["precond_lr"],
+                    Q,
+                    False,  # store_triu_as_line
+                    cfg["beta2"],
+                    vector,
+                    running_lb,
+                    cfg["lower_bound_beta"],
+                    cfg["power_iter"],
                 )
-            err = rel_err(Q, hs)
+            # rel_err expects per-dim Q matrices; strip leading stack dim
+            err = rel_err([q[0] if q.ndim == 3 else torch.diag(q[0]) for q in Q], hs)
             out.append({**cfg, "shape_str": sstr, "rel_error": err})
         return pd.DataFrame(out)
 
@@ -170,7 +178,7 @@ def heatmaps(df: pd.DataFrame, out_dir: str):
     g = sns.FacetGrid(df, row="grad_dist", col="hess_dynamic", height=3.4, despine=False, margin_titles=True)
 
     def _hm(data, **kw):
-        pivot = data.pivot_table(index="inverse_order", columns="precond_lr", values="rel_error", aggfunc="mean")
+        pivot = data.pivot_table(index="power_iter", columns="precond_lr", values="rel_error", aggfunc="mean")
         sns.heatmap(pivot, norm=LogNorm(), cmap="viridis", cbar=False, **kw)
 
     g.map_dataframe(_hm)
@@ -211,8 +219,10 @@ def main(
     os.makedirs(out_dir, exist_ok=True)
     grid = {
         "matrix_shape": [(4, 4), (32, 32), (256, 256)],
-        "inverse_order": [1, 4],
+        "power_iter": [1, 4],
         "precond_lr": [1.0, 1e-1, 1e-2],
+        "beta2": [0.9],
+        "lower_bound_beta": [0.95],
         "matrix_type": ["spd", "non_spd"],
         "cond_number": [1e2, 1e4, 1e12, 1e30],
         "eig_min": [1, -10],

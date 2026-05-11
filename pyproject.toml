@@ -58,6 +58,7 @@ requires-python = ">=3.9"
 
 [project.optional-dependencies]
 dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "tqdm"]
+tuning = ["optuna", "optunahub", "gpytorch", "scikit-learn", "pandas"]
 
 [project.urls]
 Homepage = "https://github.com/HomebrewML/HeavyBall"

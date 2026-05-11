@@ -179,7 +179,7 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
-_PASSTHROUGH_KWARGS = {"orig_shapes"}
+_PASSTHROUGH_KWARGS = frozenset({"orig_shapes", *utils.StatefulOptimizer._INSTANCE_ATTRS})
 
 _RENAMED_KWARGS = {"foreach": "multi_tensor"}
 
@@ -213,10 +213,10 @@ def _build_defaults(locals_dict):
             f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. See docs/heavyball3.md for migration details."
         )
 
-    d.update(kwargs)
-    unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
+    unknown = kwargs.keys() - _PASSTHROUGH_KWARGS
     if unknown:
-        utils.warn_once(f"Working with uncaptured keyword arguments: {unknown}")
+        raise TypeError(f"unknown keyword arguments: {sorted(unknown)}")
+    d.update(kwargs)
     return params, d
 
 
@@ -2449,7 +2449,7 @@ class ChainOpt(utils.StatefulOptimizer):
     def _step(self, group):
         if "base_lr" not in group:
             group["base_lr"] = group["lr"]
-        if "base_lr" in group and group["base_lr"] != group["lr"]:
+        elif group["base_lr"] != group["lr"]:
             utils.warn_once(
                 f"Learning rate changed between steps. This is an experimental feature and "
                 f"only supported with multi_tensor=True (currently multi_tensor={group['multi_tensor']})."
@@ -2545,30 +2545,20 @@ def default(a, b):
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
-_scale_to_update_map = {
-    scale_by_delayed_psgd.get_fn(): update_by_delayed_psgd,  #
-    scale_by_psgd.get_fn(): update_by_psgd,  #
-    scale_by_psgd_lra.get_fn(): update_by_psgd_lra,  #
-    scale_by_delayed_psgd_lra.get_fn(): update_by_delayed_psgd_lra,  #
-    scale_by_adam.get_fn(): update_by_adam,  #
-    scale_by_nadam.get_fn(): update_by_nadam,  #
-    scale_by_laprop.get_fn(): update_by_laprop,  #
-    scale_by_adopt.get_fn(): update_by_adopt,  #
-    scale_by_ademamix.get_fn(): update_by_ademamix,  #
-    scale_by_psgd_pro.get_fn(): update_by_psgd_pro,  #
-}
-_scale_to_update_map_inv = {
-    update_by_delayed_psgd.get_fn(): scale_by_delayed_psgd,  #
-    update_by_psgd.get_fn(): scale_by_psgd,  #
-    update_by_psgd_lra.get_fn(): scale_by_psgd_lra,  #
-    update_by_delayed_psgd_lra.get_fn(): scale_by_delayed_psgd_lra,  #
-    update_by_adam.get_fn(): scale_by_adam,  #
-    update_by_nadam.get_fn(): scale_by_nadam,  #
-    update_by_laprop.get_fn(): scale_by_laprop,  #
-    update_by_adopt.get_fn(): scale_by_adopt,  #
-    update_by_ademamix.get_fn(): scale_by_ademamix,  #
-    update_by_psgd_pro.get_fn(): scale_by_psgd_pro,  #
-}
+_FUSION_PAIRS = (
+    (scale_by_delayed_psgd, update_by_delayed_psgd),
+    (scale_by_psgd, update_by_psgd),
+    (scale_by_psgd_lra, update_by_psgd_lra),
+    (scale_by_delayed_psgd_lra, update_by_delayed_psgd_lra),
+    (scale_by_adam, update_by_adam),
+    (scale_by_nadam, update_by_nadam),
+    (scale_by_laprop, update_by_laprop),
+    (scale_by_adopt, update_by_adopt),
+    (scale_by_ademamix, update_by_ademamix),
+    (scale_by_psgd_pro, update_by_psgd_pro),
+)
+_scale_to_update_map = {s.get_fn(): u for s, u in _FUSION_PAIRS}
+_scale_to_update_map_inv = {u.get_fn(): s for s, u in _FUSION_PAIRS}
 
 
 class BaseOpt(ChainOpt):

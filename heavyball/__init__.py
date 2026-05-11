@@ -290,7 +290,6 @@ class Scion(C.BaseOpt):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         scale: float = 1.0,
-        momentum: Optional[float] = None,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
         ecc: str | None = None,
@@ -300,10 +299,10 @@ class Scion(C.BaseOpt):
     ):
         if lr < 0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if len(betas) == 0 and momentum is None:
-            raise ValueError("Scion expects at least one beta or an explicit momentum.")
+        if len(betas) == 0:
+            raise ValueError("Scion expects at least one beta.")
 
-        beta1 = momentum if momentum is not None else betas[0]
+        beta1 = betas[0]
         if not 0 <= beta1 <= 1:
             raise ValueError(f"Invalid momentum value: {beta1}")
         beta2 = betas[1] if len(betas) > 1 else beta1
@@ -311,7 +310,6 @@ class Scion(C.BaseOpt):
         params, defaults = C._build_defaults(locals())
         defaults["betas"] = (beta1, beta2)
         defaults["scale"] = scale
-        defaults.pop("momentum", None)
 
         super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm))
 
@@ -1711,9 +1709,6 @@ class SplitOpt(utils.StatefulOptimizer):
             raise ValueError("No optimizers created")
         super().__init__(all_params, {"multi_tensor": True})
 
-    def _step(self, group):
-        pass
-
     def _handle_closure(self, closure):
         return self.optimizers[0]._handle_closure(closure)
 
@@ -1818,7 +1813,7 @@ class SAMWrapper(torch.optim.Optimizer):
 
 capture_param_shapes = utils.capture_param_shapes
 _BASE_CLASSES = {SOAPBase, PSGDBase}
-__all__ = [
+__all__ = ["capture_param_shapes"] + [
     k
     for k, v in globals().items()
     if isinstance(v, type) and issubclass(v, torch.optim.Optimizer) and v not in _BASE_CLASSES

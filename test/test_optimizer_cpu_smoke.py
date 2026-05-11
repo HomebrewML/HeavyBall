@@ -94,7 +94,7 @@ def test_optimizer_keeps_constructor_compatibility_features():
     with pytest.raises(TypeError, match="Removed in HeavyBall"):
         heavyball.SOAP([param], normalize_grads=True)
 
-    with pytest.warns(UserWarning, match="Working with uncaptured keyword arguments"):
+    with pytest.raises(TypeError, match="unknown keyword arguments"):
         heavyball.AdamW([param], totally_fake=True)
 
 

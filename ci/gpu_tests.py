@@ -44,8 +44,8 @@ MAX_RETRIES = 3
 
 
 def api(method, path, **kwargs):
-    kwargs.setdefault("params", {})
-    kwargs["params"]["api_key"] = API_KEY
+    headers = kwargs.setdefault("headers", {})
+    headers["Authorization"] = f"Bearer {API_KEY}"
     for attempt in range(3):
         r = requests.request(method, f"{API_BASE}{path}", **kwargs)
         if r.status_code != 429:
@@ -80,17 +80,18 @@ def find_offers(n):
 
 SELF_DESTRUCT_TIMEOUT = 1800
 
-ONSTART_TEMPLATE = """#!/bin/bash
-timeout {timeout} bash -c '
+ONSTART_SCRIPT = f"""#!/bin/bash
+timeout {SELF_DESTRUCT_TIMEOUT} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
 if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends g++; fi &&
-cd / && git clone --depth 1 -b {branch} {repo} /w &&
+cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w &&
 cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
 pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
-python -m pytest {test} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
+python -m pytest "$HB_TEST" --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
 sleep 3
-curl -s -X PUT "https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/?api_key=${{CONTAINER_API_KEY}}" \
+curl -s -X PUT "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
+  -H "Authorization: Bearer $CONTAINER_API_KEY" \\
   -H "Content-Type: application/json" -d '{{"state": "stopped"}}' || true
 sleep 2
 kill 1 2>/dev/null || true
@@ -102,12 +103,12 @@ def create_instance(offer_id, test_file):
         "client_id": "me",
         "image": IMAGE,
         "disk": 16,
-        "onstart": ONSTART_TEMPLATE.format(
-            timeout=SELF_DESTRUCT_TIMEOUT,
-            branch=BRANCH,
-            repo=REPO_URL,
-            test=test_file,
-        ),
+        "onstart": ONSTART_SCRIPT,
+        "env": {
+            "HB_BRANCH": BRANCH,
+            "HB_REPO": REPO_URL,
+            "HB_TEST": test_file,
+        },
         "runtype": "ssh_direc ssh_proxy",
     }
     r = api("PUT", f"/asks/{offer_id}/", json=payload)

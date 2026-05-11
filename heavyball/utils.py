@@ -1637,15 +1637,16 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
     def state_size(self) -> int:
         total_bytes = 0
+        seen: set[int] = set()
 
         def _add(x):
             nonlocal total_bytes
-            if isinstance(x, Tensor):
+            if isinstance(x, Tensor) and id(x) not in seen:
+                seen.add(id(x))
                 total_bytes += x.numel() * x.element_size()
 
-        for group in self.param_groups:
-            for p, _ in self.split_p_and_g_in_group(group, skip_none=False):
-                tree_map(_add, self.state_(p))
+        for st in self.state.values():
+            tree_map(_add, st)
         return total_bytes
 
     def _step(self, group):
@@ -2381,7 +2382,7 @@ def _compilable_update_(
     cautious_decay: bool,
     g: List[Optional[Tensor]],
 ):
-    for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a multi-tensor op
+    for u_, g_, p_ in zip(u, g, p):  # lr is data-dependent -> can't compile a multi-tensor op
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
         if caution:
@@ -2585,7 +2586,7 @@ def init_Q_exprs(
         )
 
     Q = []
-    for i, (size, dim_d) in enumerate(zip(shape, dim_diag)):
+    for size, dim_d in zip(shape, dim_diag):
         if size == 1 or size > max_size or len(shape) < min_ndim_triangular or dim_d:
             # use diagonal matrix as preconditioner for this dim
             Q.append(scale * torch.ones(n, size, dtype=promote(dtype), device=grad.device))
@@ -2924,7 +2925,7 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
 
 
 @decorator_knowngood
-def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
+def max_singular_value_power_iter(A_outer: Tensor, iterations: int = 5):
     """
     Rayleigh quotient of row with the largest norm + optional power iterations.
     Supports (..., m, n); returns (...,) — scalar for 2D, (N,) for 3D batched.
@@ -2975,7 +2976,7 @@ def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, 
         return max_singular_value_exact(A)
     if use_cholesky or power_iter < 0:
         return max_singular_value_cholesky(A)
-    return max_singular_value_power_iter(A, None, iterations=power_iter)
+    return max_singular_value_power_iter(A, iterations=power_iter)
 
 
 @decorator_knowngood
@@ -3501,10 +3502,7 @@ def psgd_should_update(group, prob: Union[float, callable], name: str = "cumulat
 
 @functools.lru_cache(maxsize=None)
 def cached_precond_grad_expr(Q_dim, grad_dim):
-    expr = [
-        f"...{c.upper()}{c}" if q_ == 3 else f"...{c}" if q_ == 2 else "..."
-        for c, q_ in zip(einsum_base, Q_dim)
-    ]
+    expr = [f"...{c.upper()}{c}" if q_ == 3 else f"...{c}" if q_ == 2 else "..." for c, q_ in zip(einsum_base, Q_dim)]
     expr = ",".join(expr)
     grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim - 1)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
