@@ -454,20 +454,77 @@ class TagGuard(FunctionTransform):
         return self.fn(state, group, update, grad, param, *args, **kwargs)
 
 
+def _stack_value(vals):
+    """Combine per-member values into one slab value.
+
+    Tensors with ndim >= 1 are concatenated along dim 0 — per-member tensors carry a
+    leading slot dim, so n members yield a size-n batch. Scalars (0-d) are shared. Lists
+    and tuples are recursed element-wise (so `[(shape, tensor), ...]` works). Sets are
+    merged. Anything else is taken from the first member.
+    """
+    first = next((v for v in vals if v is not None), None)
+    if first is None:
+        return None
+    if isinstance(first, Tensor):
+        if first.ndim == 0:
+            return first.clone()
+        return torch.cat([v if isinstance(v, Tensor) else torch.zeros_like(first) for v in vals], 0)
+    if isinstance(first, tuple):
+        return tuple(_stack_value([v[i] if isinstance(v, tuple) else None for v in vals]) for i in range(len(first)))
+    if isinstance(first, list):
+        return [
+            _stack_value([v[i] if isinstance(v, list) and i < len(v) else None for v in vals])
+            for i in range(len(first))
+        ]
+    if isinstance(first, set):
+        merged = set()
+        for v in vals:
+            if isinstance(v, set):
+                merged |= v
+        return merged
+    return first
+
+
+def _unstack_value(slab_val, i, n):
+    """Extract member `i` from a slab value, undoing `_stack_value`."""
+    if isinstance(slab_val, Tensor):
+        if slab_val.ndim >= 1 and slab_val.shape[0] == n:
+            return slab_val[i : i + 1].clone()
+        return slab_val.clone()
+    if isinstance(slab_val, tuple):
+        return tuple(_unstack_value(elem, i, n) for elem in slab_val)
+    if isinstance(slab_val, list):
+        return [_unstack_value(elem, i, n) for elem in slab_val]
+    if isinstance(slab_val, set):
+        return slab_val.copy()
+    return slab_val
+
+
 class BucketGuard(FunctionTransform):
-    """Group same-shape params into a leading-dim slab, run the inner chain once per bucket, unstack."""
+    """Group same-shape params into a leading-dim slab; run the inner chain once per bucket.
+
+    State lives flat in `state[p]` next to outer-chain state. The inner chain's keys are
+    declared by its transforms via `_val_names` (the existing `names=` protocol every
+    FunctionTransform follows), so BucketGuard can enumerate exactly what to stack/unstack
+    without any namespace marker. Each step: stack those keys across active members into a
+    transient slab, run the inner chain, unstack back. No bucket state is kept.
+    """
 
     needs_init = False
 
-    @property
-    def _bucket_state_key(self):
-        return f"__bucket_{self.transform_idx}__"
+    @functools.cached_property
+    def _chain_keys(self):
+        keys = set()
+        for ft in _walk_fns(self.fn):
+            keys.update(ft._val_names.values())
+        return keys
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         states = state if isinstance(state, list) else [state(p) for p in param]
         shapes = group.get("_orig_shapes") or {}
-        bucket_key = self._bucket_state_key
-        buckets: dict = {}
+        chain_keys = self._chain_keys
+
+        buckets = {}
         for i, p in enumerate(param):
             info = shapes.get(id(p))
             sig = (tuple(p.shape), p.dtype, p.device, info.owner if info is not None else None)
@@ -476,43 +533,58 @@ class BucketGuard(FunctionTransform):
         out = [None] * len(param)
         skip = False
         for indices in buckets.values():
-            views = [param[i] for i in indices]
-            grads = [grad[i] for i in indices]
-            updates = [update[i] for i in indices]
-            n = len(indices)
-            if n == 1:
-                slab_p, slab_g, slab_u = views[0][None], grads[0][None], updates[0][None]
-            else:
-                slab_p = torch.stack(views, 0)
-                slab_g = torch.stack(grads, 0)
-                slab_u = torch.stack(updates, 0)
+            fresh, ready = [], []
+            for i in indices:
+                (fresh if chain_keys.isdisjoint(states[i]) else ready).append(i)
+            for subgroup, is_fresh in ((fresh, True), (ready, False)):
+                if not subgroup:
+                    continue
+                n = len(subgroup)
+                member_states = [states[i] for i in subgroup]
+                views = [param[i] for i in subgroup]
+                grads = [grad[i] for i in subgroup]
+                updates = [update[i] for i in subgroup]
+                eccs = [getattr(v, "_ecc", None) for v in views]
+                corrs = [e.correction for e in eccs] if eccs[0] is not None else None
 
-            eccs = [getattr(v, "_ecc", None) for v in views]
-            stacked_corr = None
-            if eccs[0] is not None:
-                stacked_corr = eccs[0].correction[None] if n == 1 else torch.stack([e.correction for e in eccs], 0)
-                slab_p._ecc = utils._ULPState(stacked_corr, eccs[0].smax)
+                slab_p = views[0][None] if n == 1 else torch.stack(views, 0)
+                slab_g = grads[0][None] if n == 1 else torch.stack(grads, 0)
+                slab_u = updates[0][None] if n == 1 else torch.stack(updates, 0)
+                if corrs is not None:
+                    corr = corrs[0][None] if n == 1 else torch.stack(corrs, 0)
+                    slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
 
-            bucket_state = states[indices[0]].setdefault(bucket_key, {})
-            for i in indices[1:]:
-                states[i][bucket_key] = bucket_state
+                if is_fresh:
+                    slab_state = {}
+                else:
+                    slab_state = {k: _stack_value([m.get(k) for m in member_states]) for k in chain_keys}
+                    merged_init = set()
+                    for m in member_states:
+                        merged_init |= m.get("is_initialized", set())
+                    if merged_init:
+                        slab_state["is_initialized"] = merged_init
 
-            result = self.fn([bucket_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
-            if result is _SKIP:
-                skip = True
-                if n > 1:
-                    for k in range(n):
-                        views[k].copy_(slab_p[k])
-                    if stacked_corr is not None:
-                        for k, e in enumerate(eccs):
-                            e.correction.copy_(stacked_corr[k])
-                continue
+                result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
 
-            precond_slab = result[0]
-            if n == 1:
-                out[indices[0]] = precond_slab[0]
-            else:
-                for k, i in enumerate(indices):
+                for i_in_sg, m in enumerate(member_states):
+                    for k, val in slab_state.items():
+                        if k == "is_initialized":
+                            m.setdefault(k, set()).update(val)
+                        else:
+                            m[k] = _unstack_value(val, i_in_sg, n)
+
+                if result is _SKIP:
+                    skip = True
+                    if n > 1:  # n=1 slab is a view of the original; in-place mods already landed
+                        for k, _ in enumerate(subgroup):
+                            views[k].copy_(slab_p[k])
+                        if corrs is not None:
+                            for k, e in enumerate(eccs):
+                                e.correction.copy_(slab_p._ecc.correction[k])
+                    continue
+
+                precond_slab = result[0]
+                for k, i in enumerate(subgroup):
                     out[i] = precond_slab[k]
 
         if skip:

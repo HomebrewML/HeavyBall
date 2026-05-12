@@ -3475,8 +3475,10 @@ def line_to_triu(Q_list: List[Tuple[Optional[List[int]], Tensor]]):
     new = []
     for shape, q in Q_list:
         if shape is not None:
-            rows, cols = torch.triu_indices(shape[-2], shape[-1], device=q.device)
-            q_mat = torch.zeros(shape, device=q.device, dtype=q.dtype)
+            d0, d1 = shape[-2], shape[-1]
+            rows, cols = torch.triu_indices(d0, d1, device=q.device)
+            full_shape = q.shape[:-1] + (d0, d1)
+            q_mat = torch.zeros(full_shape, device=q.device, dtype=q.dtype)
             q_mat[..., rows, cols] = q
             q = q_mat
         new.append(q)
@@ -3849,7 +3851,7 @@ def disable_caution_scaling():
 
 
 @decorator_knowngood
-def sam_step(parameters, ball_size, adaptive: bool = True):
+def _compilable_sam_step(parameters: List[Tensor], ball_size: Tensor, adaptive: bool):
     old_params = []
     for p in parameters:
         old_params.append(p.detach().clone())
@@ -3861,3 +3863,10 @@ def sam_step(parameters, ball_size, adaptive: bool = True):
         stochastic_add_(p.data, grad, ball_size)
         p.grad.zero_()
     return old_params
+
+
+def sam_step(parameters, ball_size, adaptive: bool = True):
+    if not parameters:
+        return []
+    ball_size = scalar_guard(ball_size, parameters[0])
+    return _compilable_sam_step(parameters, ball_size, adaptive)

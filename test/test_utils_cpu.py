@@ -136,6 +136,32 @@ def test_sam_step_accumulates_and_zeros_gradients():
         assert torch.allclose(param.grad, torch.zeros_like(param.grad), atol=0, rtol=0)
 
 
+def test_sam_step_ball_size_does_not_bake_into_graph():
+    """ball_size must be promoted to a Tensor before the compile boundary; otherwise the
+    inlined scalar_guard runs inside the trace and `torch.empty(...).fill_(float)` bakes the
+    value as a constant, forcing a recompile on every value change."""
+    import subprocess
+    import sys
+
+    code = (
+        "import torch, torch._dynamo\n"
+        "import heavyball.utils as hbu\n"
+        "torch._dynamo.reset()\n"
+        "hbu.compile_mode = 'default'\n"
+        "p = [torch.nn.Parameter(torch.randn(8))]\n"
+        "counts = []\n"
+        "for ball in (0.1, 0.2, 0.05, 0.7):\n"
+        "    p[0].grad = torch.randn(8)\n"
+        "    hbu.sam_step(p, ball, adaptive=False)\n"
+        "    counts.append(torch._dynamo.utils.counters['stats'].get('unique_graphs', 0))\n"
+        "print(counts)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "TORCH_COMPILE_DISABLE"}
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
+    counts = eval(result.stdout.strip())
+    assert counts[0] == counts[-1], f"recompile on ball_size change: {counts}"
+
+
 @pytest.mark.parametrize(
     "clip_fn,metric",
     [
