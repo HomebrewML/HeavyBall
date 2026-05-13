@@ -555,8 +555,7 @@ class BucketGuard(FunctionTransform):
                     slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
 
                 slab_state = {
-                    k: v for k in chain_keys
-                    if (v := _stack_value([m.get(k) for m in member_states])) is not None
+                    k: v for k in chain_keys if (v := _stack_value([m.get(k) for m in member_states])) is not None
                 }
                 slab_state["is_initialized"] = set().union(*[m.get("is_initialized") or () for m in member_states])
 

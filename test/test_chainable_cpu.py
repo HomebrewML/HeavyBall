@@ -139,5 +139,3 @@ def test_state_dict_loadable_weights_only(tmp_path):
     path = tmp_path / "opt.pt"
     torch.save(opt.state_dict(), path)
     torch.load(path, weights_only=True)
-
-

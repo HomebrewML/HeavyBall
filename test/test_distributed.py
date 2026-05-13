@@ -32,7 +32,8 @@ _FSDP_NO_COMPILE = {"MSAMLaProp"}
 # Bucket-aware chains and Newton-Schulz/Scion sampling consume RNG in shapes that
 # depend on the slab/shard layout — single-rank slab vs sharded slab don't match bitwise.
 _FSDP_LOOSE_TOL = {
-    n for n in REPRESENTATIVE_OPTS
+    n
+    for n in REPRESENTATIVE_OPTS
     if (n in BUCKET_AWARE_OPTS or any(k in n for k in ("Muon", "Scion"))) and n not in _FSDP_SKIP
 }
 

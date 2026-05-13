@@ -1,4 +1,3 @@
-import collections
 import contextlib
 import enum
 import functools
