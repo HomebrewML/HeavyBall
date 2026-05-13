@@ -31,6 +31,9 @@ def _guard_in_state(state, key, template_fn):
     return state[key]
 
 
+_SKIP = object()
+
+
 class FunctionTransform:
     def __init__(self, fn, names: list[str] | None = None):
         if names is None:
@@ -39,6 +42,7 @@ class FunctionTransform:
         self.fn_name = self.get_fn().__name__
         self.transform_idx = None
         self.names = names
+        self._under_bucket = False
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
         raise NotImplementedError
@@ -51,16 +55,13 @@ class FunctionTransform:
         skip_update = False
         for st, a in zip(states, zip(update, grad, param, *args)):
             if self.transform_idx not in st.get("is_initialized", set()):
-                try:
-                    self._init(st, group, *a, **kwargs)
-                except SkipUpdate:
+                if self._init(st, group, *a, **kwargs) is _SKIP:
                     skip_update = True
-                finally:
-                    if "is_initialized" not in st:
-                        st["is_initialized"] = set()
-                    st["is_initialized"].add(self.transform_idx)
+                if "is_initialized" not in st:
+                    st["is_initialized"] = set()
+                st["is_initialized"].add(self.transform_idx)
         if skip_update:
-            raise SkipUpdate from None
+            return _SKIP
         vars = [[st.get(self.val_name(name), None) for st in states] for name in self.names]
         return self._call(state, group, update, grad, param, vars, *args, **kwargs)
 
@@ -108,7 +109,7 @@ class Parallel:
             u, skip = _inner_chain(state, group, branch_update, grad, param, *branch)
             results.append((u, skip, None))
         if _enforce_uniform_skip(results):
-            raise SkipUpdate from None
+            return _SKIP
         return self.merge_fn([u for u, _, _ in results])
 
 
@@ -137,7 +138,6 @@ class Route:
         def _sel(lst, idx):
             return [lst[i] for i in idx]
 
-        caution = group["caution"]
         results = []
 
         all_chains = [(buckets.get(j), fns) for j, (_, fns) in enumerate(self.routes)]
@@ -147,7 +147,6 @@ class Route:
         for idx, fns in all_chains:
             if not idx:
                 continue
-            group["caution"] = caution
             if fns is not None:
                 u, skip = _inner_chain(
                     _sel(state, idx), group, _sel(update, idx), _sel(grad, idx), _sel(param, idx), *fns
@@ -157,7 +156,7 @@ class Route:
             results.append((u, skip, idx))
 
         if _enforce_uniform_skip(results):
-            raise SkipUpdate from None
+            return _SKIP
 
         out = [None] * len(param)
         for u_list, _, idx in results:
@@ -180,7 +179,7 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
-_PASSTHROUGH_KWARGS = {"orig_shapes"}
+_PASSTHROUGH_KWARGS = frozenset({"orig_shapes", *utils.StatefulOptimizer._INSTANCE_ATTRS})
 
 _RENAMED_KWARGS = {"foreach": "multi_tensor"}
 
@@ -214,10 +213,10 @@ def _build_defaults(locals_dict):
             f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. See docs/heavyball3.md for migration details."
         )
 
-    d.update(kwargs)
-    unknown = {k: v for k, v in kwargs.items() if k not in _PASSTHROUGH_KWARGS}
+    unknown = kwargs.keys() - _PASSTHROUGH_KWARGS
     if unknown:
-        utils.warn_once(f"Working with uncaptured keyword arguments: {unknown}")
+        raise TypeError(f"unknown keyword arguments: {sorted(unknown)}")
+    d.update(kwargs)
     return params, d
 
 
@@ -344,12 +343,9 @@ class PrecondGradAccumGuard(FunctionTransform):
         else:
             self._accum(group, vars, base_grad)
             vars = base_grad
-        try:
-            out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
-        finally:
-            if accum_state is not None:
-                self._reset(group, accum_state)
-
+        out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
+        if accum_state is not None:
+            self._reset(group, accum_state)
         return out
 
 
@@ -378,7 +374,7 @@ class GeneralGuard(FunctionTransform):
         for name in self.names:
             state[self.val_name(name)] = state.pop(name, None)
         if self.skip_first:
-            raise SkipUpdate from None
+            return _SKIP
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
@@ -401,13 +397,13 @@ class NoStateNoMultiTensor(FunctionTransform):
         updates = []
         skip_update = False
         for a in zip(update, grad, param, *args):
-            try:
-                updates.append(self.fn(group, *a, **kwargs))
-            except SkipUpdate:
+            r = self.fn(group, *a, **kwargs)
+            if r is _SKIP:
                 skip_update = True
-                pass
+            else:
+                updates.append(r)
         if skip_update:
-            raise SkipUpdate from None
+            return _SKIP
         return updates
 
 
@@ -419,12 +415,17 @@ def _view_preserve_ecc(src, target):
     return v
 
 
+def _squeeze_inner(u: Tensor) -> Tensor:
+    inner = tuple(i for i in range(1, u.ndim) if u.shape[i] == 1)
+    return u.squeeze(inner) if inner else u
+
+
 class SqueezeGrad(FunctionTransform):
     needs_init = False
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         original_shapes = [u.shape for u in update]
-        update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
+        update = [_squeeze_inner(u) for u in update]
         grad = [_view_preserve_ecc(x, u) for x, u in zip(grad, update)]
         param = [_view_preserve_ecc(x, u) for x, u in zip(param, update)]
         args = list(args)
@@ -435,6 +436,8 @@ class SqueezeGrad(FunctionTransform):
             if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
                 kwargs[k] = [_view_preserve_ecc(x, u) for x, u in zip(a, update)]
         out = self.fn(state, group, update, grad, param, *args, **kwargs)
+        if out is _SKIP or out is None:
+            return out
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
 
@@ -449,6 +452,136 @@ class TagGuard(FunctionTransform):
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+
+def _stack_value(vals):
+    """Combine per-member values into one slab value.
+
+    Tensors with ndim >= 1 are concatenated along dim 0 — per-member tensors carry a
+    leading slot dim, so n members yield a size-n batch. Scalars (0-d) are shared. Lists
+    and tuples are recursed element-wise (so `[(shape, tensor), ...]` works). Sets are
+    merged. Anything else is taken from the first member.
+    """
+    first = next((v for v in vals if v is not None), None)
+    if first is None:
+        return None
+    if isinstance(first, Tensor):
+        if first.ndim == 0:
+            return first.clone()
+        return torch.cat([v if isinstance(v, Tensor) else torch.zeros_like(first) for v in vals], 0)
+    if isinstance(first, tuple):
+        return tuple(_stack_value([v[i] if isinstance(v, tuple) else None for v in vals]) for i in range(len(first)))
+    if isinstance(first, list):
+        return [
+            _stack_value([v[i] if isinstance(v, list) and i < len(v) else None for v in vals])
+            for i in range(len(first))
+        ]
+    if isinstance(first, set):
+        merged = set()
+        for v in vals:
+            if isinstance(v, set):
+                merged |= v
+        return merged
+    return first
+
+
+def _unstack_value(slab_val, i, n):
+    """Extract member `i` from a slab value, undoing `_stack_value`."""
+    if isinstance(slab_val, Tensor):
+        if slab_val.ndim >= 1 and slab_val.shape[0] == n:
+            return slab_val[i : i + 1].clone()
+        return slab_val.clone()
+    if isinstance(slab_val, tuple):
+        return tuple(_unstack_value(elem, i, n) for elem in slab_val)
+    if isinstance(slab_val, list):
+        return [_unstack_value(elem, i, n) for elem in slab_val]
+    if isinstance(slab_val, set):
+        return slab_val.copy()
+    return slab_val
+
+
+class BucketGuard(FunctionTransform):
+    """Group same-shape params into a leading-dim slab; run the inner chain once per bucket.
+
+    State lives flat in `state[p]` next to outer-chain state. The inner chain's keys are
+    declared by its transforms via `_val_names` (the existing `names=` protocol every
+    FunctionTransform follows), so BucketGuard can enumerate exactly what to stack/unstack
+    without any namespace marker. Each step: stack those keys across active members into a
+    transient slab, run the inner chain, unstack back. No bucket state is kept.
+    """
+
+    needs_init = False
+
+    @functools.cached_property
+    def _chain_keys(self):
+        keys = set()
+        for ft in _walk_fns(self.fn):
+            keys.update(ft._val_names.values())
+        return keys | {f"{vn}::ecc" for vn in keys}
+
+    def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        states = state if isinstance(state, list) else [state(p) for p in param]
+        shapes = group.get("_orig_shapes") or {}
+        chain_keys = self._chain_keys
+
+        buckets = {}
+        for i, p in enumerate(param):
+            info = shapes.get(id(p))
+            sig = (tuple(p.shape), p.dtype, p.device, info.owner if info is not None else None)
+            buckets.setdefault(sig, []).append(i)
+
+        out = [None] * len(param)
+        skip = False
+        for indices in buckets.values():
+            fresh, ready = [], []
+            for i in indices:
+                (fresh if chain_keys.isdisjoint(states[i]) else ready).append(i)
+            for subgroup in (fresh, ready):
+                if not subgroup:
+                    continue
+                n = len(subgroup)
+                member_states = [states[i] for i in subgroup]
+                views = [param[i] for i in subgroup]
+                grads = [grad[i] for i in subgroup]
+                updates = [update[i] for i in subgroup]
+                eccs = [getattr(v, "_ecc", None) for v in views]
+                corrs = [e.correction for e in eccs] if eccs[0] is not None else None
+
+                slab_p = views[0][None] if n == 1 else torch.stack(views, 0)
+                slab_g = grads[0][None] if n == 1 else torch.stack(grads, 0)
+                slab_u = updates[0][None] if n == 1 else torch.stack(updates, 0)
+                if corrs is not None:
+                    corr = corrs[0][None] if n == 1 else torch.stack(corrs, 0)
+                    slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
+
+                slab_state = {
+                    k: v for k in chain_keys if (v := _stack_value([m.get(k) for m in member_states])) is not None
+                }
+                slab_state["is_initialized"] = set().union(*[m.get("is_initialized") or () for m in member_states])
+
+                result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
+
+                for i_in_sg, m in enumerate(member_states):
+                    for k, val in slab_state.items():
+                        m[k] = _unstack_value(val, i_in_sg, n)
+
+                if result is _SKIP:
+                    skip = True
+                    if n > 1:  # n=1 slab is a view of the original; in-place mods already landed
+                        for k, _ in enumerate(subgroup):
+                            views[k].copy_(slab_p[k])
+                        if corrs is not None:
+                            for k, e in enumerate(eccs):
+                                e.correction.copy_(slab_p._ecc.correction[k])
+                    continue
+
+                precond_slab = result[0]
+                for k, i in enumerate(subgroup):
+                    out[i] = precond_slab[k]
+
+        if skip:
+            return _SKIP
+        return out
 
 
 class WarmupGuard(FunctionTransform):
@@ -469,7 +602,7 @@ class WarmupGuard(FunctionTransform):
             for st, a in zip(states, zip(update, grad, param, *args)):
                 fn(st, group, *a, **kwargs)
                 st[self.warmup_key] = st.get(self.warmup_key, 0) + 1
-            raise SkipUpdate from None
+            return _SKIP
         for st in states:
             if "is_initialized" not in st:
                 st["is_initialized"] = set()
@@ -478,6 +611,8 @@ class WarmupGuard(FunctionTransform):
 
 
 needs_full_param = functools.partial(TagGuard, needs_full_param=True)
+
+bucket_aware = BucketGuard
 
 
 def zero_guard(*names):
@@ -502,10 +637,6 @@ def no_state(fn):
 
 def no_state_no_multi_tensor(fn):
     return NoStateNoMultiTensor(fn)
-
-
-class SkipUpdate(ValueError):
-    pass
 
 
 @zero_guard("mars_old_grad")
@@ -544,7 +675,7 @@ def apply_update(group, update, grad, param):
         cautious_decay=group.get("cautious_weight_decay", False),
         grad=grad,
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg")
@@ -614,7 +745,7 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -660,7 +791,7 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -681,7 +812,7 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
@@ -722,7 +853,7 @@ def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, e
         group.get("beta3_warmup"),
         group.get("alpha_warmup"),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -748,7 +879,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -787,7 +918,7 @@ def update_by_schedule_free(group, update, grad, param, z):
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -808,24 +939,15 @@ def update_by_msam(group, update, grad, param, z, exp_avg):
         group["sam_step_size"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _adopt_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq):
     utils.scale_by_exp_avg_sq_([exp_avg_sq], [update], 0, group["eps"])
 
 
-def _adopt_warmup_2(state, group, update, grad, param, exp_avg, exp_avg_sq):
-    u = utils.promote(update)
-    easq = utils.promote(exp_avg_sq)
-    utils.copy_stochastic_(exp_avg, u / easq.sqrt().clamp_(min=group["eps"]))
-    utils.scale_by_exp_avg_sq_(
-        [exp_avg_sq], [update], utils.beta_debias(utils.get_beta2(group), group["step"]), group["eps"]
-    )
-
-
 @zero_guard("exp_avg", "exp_avg_sq")
-@warmup_guard(_adopt_warmup_1, _adopt_warmup_2)
+@warmup_guard(_adopt_warmup_1)
 @no_state
 def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     utils.fused_adopt_(
@@ -836,14 +958,14 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
         exp_avg,
         utils.get_beta1(group),
         utils.get_beta2(group),
-        group["step"] - 2,
+        group["step"] - 1,
         group["lr"],
         group["eps"],
         group["weight_decay"],
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _suds_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
@@ -887,7 +1009,7 @@ def scale_by_unscaled_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
-@warmup_guard(_adopt_warmup_1, _adopt_warmup_2)
+@warmup_guard(_adopt_warmup_1)
 @no_state
 def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
     return utils.adopt(
@@ -896,7 +1018,7 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
         exp_avg,
         utils.get_beta1(group),
         utils.get_beta2(group),
-        group["step"] - 2,
+        group["step"] - 1,
     )
 
 
@@ -915,7 +1037,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
@@ -937,7 +1059,7 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
         tmp.get("vector"),
         dtype=getattr(torch, group["q_dtype"]),
     )
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
     _update_psgd_precond(
@@ -970,7 +1092,7 @@ def _init_psgd_pro_kron(state, group, update, grad, param, cached: bool = False,
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = Q
-    state["running_lower_bound"] = [torch.zeros((1,), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
@@ -1034,7 +1156,7 @@ def update_by_hyperball(group, update, grad, param, init_norm):
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def _store_std(state, group, update, grad, param):
@@ -1116,20 +1238,24 @@ def _init_soap(state, group, update, grad, param):
     )
 
 
-def _apply_soap_preconditioner(group, update, Q, GG, *references, use_kl: bool = False, eps=1e-8):
+def _apply_soap_preconditioner(
+    group, update, Q, GG, *exp_avgs, use_kl: bool = False, eps=1e-8, exp_avg_sq=None, heavy: bool = False
+):
     beta = utils.beta_debias(group["shampoo_beta"], group["step"])
     max_dim, p1d = group["max_precond_dim"], group["precondition_1d"]
-    for upd, q, gg, *ref in zip(update, Q, GG, *references):
+    eas = exp_avg_sq or [None] * len(update)
+    for upd, q, gg, ea_sq, *ref in zip(update, Q, GG, eas, *exp_avgs):
         g = utils.promote(upd)
         if use_kl:
-            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps)
+            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps, heavy=heavy)
         else:
             utils.update_ggt(g, gg, max_dim, p1d, beta)
         if group["is_preconditioning"]:
-            utils.get_orthogonal_matrix_QR(gg, q, *ref)
+            utils.get_orthogonal_matrix_QR(gg, q, *ref, exp_avg_sq=ea_sq if heavy else None, heavy=heavy)
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1150,6 +1276,7 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1170,6 +1297,7 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1187,6 +1315,7 @@ def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @general_guard("Q", "GG", init_fn=_init_soap)
@@ -1213,6 +1342,7 @@ def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_prod
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1232,6 +1362,7 @@ def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG)
 
 
 @needs_full_param
+@bucket_aware
 @zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
@@ -1252,6 +1383,149 @@ def scale_by_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slo
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg_slow, exp_avg_fast)
     return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.adam_(
+        exp_avg,
+        exp_avg_sq,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+        group["eps"],
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
+    return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.adam_(
+        exp_avg,
+        exp_avg_sq,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+        group["eps"],
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(
+        group, update, Q, GG, exp_avg, use_kl=True, eps=group["eps"], exp_avg_sq=exp_avg_sq, heavy=True
+    )
+    return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
+    utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
+    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
+    dampening = group.get("dampening", 0.0)
+    accum = [utils.dampen_grad(u, dampening)[1] for u in update] if dampening > 0 else update
+    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"], heavy=True)
+    for gg in GG:
+        factors = [m for m in gg if isinstance(m, torch.Tensor)]
+        if len(factors) >= 2:
+            utils.psgd_balance_Q(factors)
+    return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.nadam_(
+        grad_projected,
+        exp_avg,
+        exp_avg_sq,
+        mu_product,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+        group["momentum_decay"],
+        group["eps"],
+        0.0,
+        False,
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
+    return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.laprop_(
+        exp_avg,
+        exp_avg_sq,
+        grad_projected,
+        utils.get_beta1(group),
+        utils.get_beta2(group),
+        group["step"] - 1,
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
+    return precond
+
+
+@needs_full_param
+@bucket_aware
+@zero_guard("exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+@general_guard("Q", "GG", init_fn=_init_soap)
+@no_state
+def scale_by_heavy_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, exp_avg_sq, Q, GG):
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    precond = utils.ademamix_(
+        exp_avg_fast,
+        exp_avg_slow,
+        exp_avg_sq,
+        grad_projected,
+        group["betas"],
+        group["step"] - 1,
+        group["eps"],
+        group["alpha"],
+        group.get("beta3_warmup"),
+        group.get("alpha_warmup"),
+    )
+    precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
+    _apply_soap_preconditioner(group, update, Q, GG, exp_avg_slow, exp_avg_fast, exp_avg_sq=exp_avg_sq, heavy=True)
+    return precond
+
+
+def _fill_q_cache(Q_cache, Q):
+    for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
+        if c_ is None:
+            Q_cache[i] = c_ = torch.empty_like(q_)
+        if q_.ndim == 3:
+            torch.matmul(q_.mT, q_, out=c_)
+        else:
+            torch.mul(q_, q_, out=c_)
 
 
 def _update_psgd_precond(
@@ -1298,23 +1572,8 @@ def _update_psgd_precond(
         float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
-    if not should_use_cache or not cached:
-        return
-
-    Q_resolved = utils.line_to_triu(Q) if store_triu_as_line else Q
-    for i, (c_, q_) in enumerate(zip(Q_cache, Q_resolved)):
-        if c_ is None:
-            c_ = (
-                torch.empty_like(q_)
-                if q_.ndim == 1
-                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
-            )
-            Q_cache[i] = c_
-        if q_.ndim == 2:
-            torch.matmul(q_.T, q_, out=c_)
-        else:
-            torch.mul(q_, q_, out=c_)
-    return
+    if should_use_cache:
+        _fill_q_cache(Q_cache, utils.line_to_triu(Q) if store_triu_as_line else Q)
 
 
 def _update_psgd_pro_precond(
@@ -1350,31 +1609,15 @@ def _update_psgd_pro_precond(
         float_prob = prob(group["step"])
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
-    if not should_use_cache or not cached:
-        return
-
-    for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
-        if c_ is None:
-            c_ = (
-                torch.empty_like(q_)
-                if q_.ndim == 1
-                else torch.empty(q_.shape[0], q_.shape[0], device=q_.device, dtype=q_.dtype)
-            )
-            Q_cache[i] = c_
-        if q_.ndim == 2:
-            torch.matmul(q_.T, q_, out=c_)
-        else:
-            torch.mul(q_, q_, out=c_)
+    if should_use_cache:
+        _fill_q_cache(Q_cache, Q)
 
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
-    kwargs = {"ea": update, "caution": group["caution"], "grad": grad}
+    kwargs = {"ea": update, "caution": False, "grad": grad}
     if group.get("is_cached", False) and Q_cache[0] is not None:
-        out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
-    else:
-        out = utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
-    group["caution"] = False  # we already cautioned here - shouldn't do it again
-    return out
+        return utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
+    return utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
 
 
 def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
@@ -1440,7 +1683,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1472,10 +1715,11 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
         grad,
         group.get("cautious_weight_decay", False),
     )
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1498,6 +1742,7 @@ def scale_by_psgd(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -1541,6 +1786,7 @@ def scale_by_lather(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1564,6 +1810,7 @@ def scale_by_delayed_psgd(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1583,7 +1830,7 @@ def update_by_psgd(
 ):
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
@@ -1599,6 +1846,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
@@ -1618,10 +1866,11 @@ def update_by_delayed_psgd(
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
@@ -1644,6 +1893,7 @@ def scale_by_psgd_pro(
 
 
 @needs_full_param
+@bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
@@ -1663,7 +1913,7 @@ def update_by_psgd_pro(
 ):
     _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    raise SkipUpdate from None
+    return _SKIP
 
 
 def palm_beta2(state, group, update, grad, param):
@@ -2026,13 +2276,14 @@ def _restore_params(views, gathers):
 def _inner_chain(state, group, update, grad, param, *fns):
     skip_update = False
     for fn in fns:
-        try:
-            update = fn(state, group, update, grad, param)
-        except SkipUpdate:
+        new = fn(state, group, update, grad, param)
+        if new is _SKIP:
             skip_update = True
             continue
-        if update is None:
+        if new is None:
+            update = None
             break
+        update = new
     return update, skip_update
 
 
@@ -2091,6 +2342,27 @@ def _walk_fns(obj):
             stack.extend(cur)
 
 
+def _walk_fns_with_bucket(obj):
+    stack = [(obj, False)]
+    while stack:
+        cur, ub = stack.pop()
+        if isinstance(cur, FunctionTransform):
+            yield cur, ub
+            stack.append((cur.fn, ub or isinstance(cur, BucketGuard)))
+        elif isinstance(cur, functools.partial):
+            stack.append((cur.func, ub))
+        elif isinstance(cur, Parallel):
+            for branch in cur.branches:
+                stack.extend((b, ub) for b in branch)
+        elif isinstance(cur, Route):
+            for _, fns in cur.routes:
+                stack.extend((f, ub) for f in fns)
+            if cur.default is not None:
+                stack.extend((f, ub) for f in cur.default)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend((c, ub) for c in cur)
+
+
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
     if retain and offset:
         raise ValueError("offset cannot be retained")
@@ -2099,9 +2371,10 @@ def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
         offset = max((ft.transform_idx for ft in _walk_fns(fns) if ft.transform_idx is not None), default=-1) + 1
 
     new_fns = [copy.deepcopy(fn) for fn in fns]
-    for ft in _walk_fns(new_fns):
+    for ft, under_bucket in _walk_fns_with_bucket(new_fns):
         if not retain or ft.transform_idx is None:
             ft.transform_idx, offset = offset, offset + 1
+        ft._under_bucket = under_bucket
         ft._build_val_names()
 
     return new_fns
@@ -2131,6 +2404,13 @@ class ChainOpt(utils.StatefulOptimizer):
             self._run_chain = torch.compile(self._run_chain, fullgraph=True)
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
+
+    def state_dict(self):
+        sd = super().state_dict()
+        for g in sd["param_groups"]:
+            for k in [k for k in g if k.startswith("_")]:
+                del g[k]
+        return sd
 
     def _init_param_ecc(self):
         for group in self.param_groups:
@@ -2213,7 +2493,7 @@ class ChainOpt(utils.StatefulOptimizer):
         self._transform_ids = frozenset(
             ft.transform_idx
             for ft in _walk_fns(self._fns)
-            if ft.transform_idx is not None and getattr(ft, "needs_init", True)
+            if ft.transform_idx is not None and getattr(ft, "needs_init", True) and not ft._under_bucket
         )
 
     def _set_indices(self, retain=True):
@@ -2228,7 +2508,7 @@ class ChainOpt(utils.StatefulOptimizer):
     def _step(self, group):
         if "base_lr" not in group:
             group["base_lr"] = group["lr"]
-        if "base_lr" in group and group["base_lr"] != group["lr"]:
+        elif group["base_lr"] != group["lr"]:
             utils.warn_once(
                 f"Learning rate changed between steps. This is an experimental feature and "
                 f"only supported with multi_tensor=True (currently multi_tensor={group['multi_tensor']})."
@@ -2240,6 +2520,7 @@ class ChainOpt(utils.StatefulOptimizer):
             self._orig_shapes = _detect_orig_shapes(all_params)
 
         views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
+        group["_orig_shapes"] = self._orig_shapes
         try:
             self._step_inner(group)
         finally:
@@ -2288,7 +2569,6 @@ class ChainOpt(utils.StatefulOptimizer):
 
     def _run_chain(self, state, group, g, p, caution):
         chain(state, group, g, p, *self.fns)
-        group["caution"] = caution
 
     def _needs_init(self, state):
         ids = self._transform_ids
@@ -2324,30 +2604,20 @@ def default(a, b):
 
 
 # not supported: update_by_schedule_free, scale_by_soap, scale_by_exp_avg_sq
-_scale_to_update_map = {
-    scale_by_delayed_psgd.get_fn(): update_by_delayed_psgd,  #
-    scale_by_psgd.get_fn(): update_by_psgd,  #
-    scale_by_psgd_lra.get_fn(): update_by_psgd_lra,  #
-    scale_by_delayed_psgd_lra.get_fn(): update_by_delayed_psgd_lra,  #
-    scale_by_adam.get_fn(): update_by_adam,  #
-    scale_by_nadam.get_fn(): update_by_nadam,  #
-    scale_by_laprop.get_fn(): update_by_laprop,  #
-    scale_by_adopt.get_fn(): update_by_adopt,  #
-    scale_by_ademamix.get_fn(): update_by_ademamix,  #
-    scale_by_psgd_pro.get_fn(): update_by_psgd_pro,  #
-}
-_scale_to_update_map_inv = {
-    update_by_delayed_psgd.get_fn(): scale_by_delayed_psgd,  #
-    update_by_psgd.get_fn(): scale_by_psgd,  #
-    update_by_psgd_lra.get_fn(): scale_by_psgd_lra,  #
-    update_by_delayed_psgd_lra.get_fn(): scale_by_delayed_psgd_lra,  #
-    update_by_adam.get_fn(): scale_by_adam,  #
-    update_by_nadam.get_fn(): scale_by_nadam,  #
-    update_by_laprop.get_fn(): scale_by_laprop,  #
-    update_by_adopt.get_fn(): scale_by_adopt,  #
-    update_by_ademamix.get_fn(): scale_by_ademamix,  #
-    update_by_psgd_pro.get_fn(): scale_by_psgd_pro,  #
-}
+_FUSION_PAIRS = (
+    (scale_by_delayed_psgd, update_by_delayed_psgd),
+    (scale_by_psgd, update_by_psgd),
+    (scale_by_psgd_lra, update_by_psgd_lra),
+    (scale_by_delayed_psgd_lra, update_by_delayed_psgd_lra),
+    (scale_by_adam, update_by_adam),
+    (scale_by_nadam, update_by_nadam),
+    (scale_by_laprop, update_by_laprop),
+    (scale_by_adopt, update_by_adopt),
+    (scale_by_ademamix, update_by_ademamix),
+    (scale_by_psgd_pro, update_by_psgd_pro),
+)
+_scale_to_update_map = {s.get_fn(): u for s, u in _FUSION_PAIRS}
+_scale_to_update_map_inv = {u.get_fn(): s for s, u in _FUSION_PAIRS}
 
 
 class BaseOpt(ChainOpt):
@@ -2415,6 +2685,10 @@ class BaseOpt(ChainOpt):
 
         self.compile_step = default(default(compile_step, defaults.pop("compile_step", use_default)), self.compile_step)
         self.promote = default(default(promote, defaults.pop("promote", use_default)), self.promote)
+        # Consumed above to wire fns — drop from defaults so they don't pollute state_dict
+        # (callables are rejected by torch.load weights_only=True).
+        defaults.pop("update_clipping", None)
+        defaults.pop("gradient_clipping", None)
         if default(palm, self.palm):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:

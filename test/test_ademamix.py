@@ -142,6 +142,11 @@ def _state_value(state, fn_name: str, label: str):
     for key, value in state.items():
         if key.startswith(prefix):
             return value
+    for key, value in state.items():
+        if key.startswith("__bucket_") and isinstance(value, dict):
+            for k2, v2 in value.items():
+                if k2.startswith(prefix):
+                    return v2
     raise KeyError(prefix)
 
 
@@ -180,7 +185,7 @@ def test_soap_ademamix_projects_gradients_into_eigenbasis():
 
     assert "grad" in captured, "AdEMAMix inner update was not invoked."
 
-    expected_projected = heavyball.utils.project(grad_step.clone(), Q, False)
+    expected_projected = heavyball.utils.project(grad_step.clone().unsqueeze(0), Q, False)
     torch.testing.assert_close(captured["grad"][0], expected_projected, atol=1e-6, rtol=1e-5)
     assert captured["betas"] == optimizer.param_groups[0]["betas"]
     assert captured["alpha"] == optimizer.param_groups[0]["alpha"]

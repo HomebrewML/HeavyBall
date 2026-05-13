@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch._dynamo import config
 
-from heavyball.utils import _max_singular_value_ndim, max_singular_value, min_singular_value
+from heavyball.utils import max_singular_value, min_singular_value
 
 config.cache_size_limit = 2**20
 config.accumulated_cache_size_limit = 2**20
@@ -78,16 +78,6 @@ def test_min_singular_value(shape, cond, dtype, power_iter, rtol):
         assert_close(approx, exact, atol=1e-6)
     else:
         assert_close(approx, exact, rtol=rtol, atol=1e-5)
-
-
-@pytest.mark.parametrize("shape", ((3, 4, 5),))
-def test_max_singular_value_ndim(shape, bound: float = 2):
-    torch.manual_seed(0x172893)
-    A = torch.randn(shape).cuda()
-    approx = _max_singular_value_ndim(A, power_iter=2)
-    exact = torch.linalg.svdvals(A.double()).max()
-    assert (approx.double() > exact.double()).item()
-    assert (exact.double() * bound > approx.double()).item()
 
 
 @pytest.mark.parametrize("shape", ((32, 32), (128, 128), (512, 512)))

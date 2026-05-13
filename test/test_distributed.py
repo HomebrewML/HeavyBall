@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
-from utils import REPRESENTATIVE_OPTS
+from utils import BUCKET_AWARE_OPTS, REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean
@@ -29,9 +29,13 @@ _FSDP_SKIP = {
 # torch.compile(dynamic=False) specializes on list length → different kernels per rank
 _FSDP_NO_COMPILE = {"MSAMLaProp"}
 
-# PSGD uses global RNG for dampening vector V which diverges across FSDP shards
-# allow tolerance-based comparison instead of bitwise identity
-_FSDP_PSGD = {n for n in REPRESENTATIVE_OPTS if "PSGD" in n and n not in _FSDP_SKIP}
+# Bucket-aware chains and Newton-Schulz/Scion sampling consume RNG in shapes that
+# depend on the slab/shard layout — single-rank slab vs sharded slab don't match bitwise.
+_FSDP_LOOSE_TOL = {
+    n
+    for n in REPRESENTATIVE_OPTS
+    if (n in BUCKET_AWARE_OPTS or any(k in n for k in ("Muon", "Scion"))) and n not in _FSDP_SKIP
+}
 
 _SPLIT_OPTS = [n for n in REPRESENTATIVE_OPTS if n not in _FSDP_SKIP]
 
@@ -289,7 +293,7 @@ def _run_fsdp_test(opt_name, tmp_path, model_fn, data_fn, label, world_size=2, t
         nprocs=world_size,
         join=True,
     )
-    base_tol = dict(rtol=1e-2, atol=1e-4) if opt_name in _FSDP_PSGD else {}
+    base_tol = dict(rtol=1e-2, atol=1e-2) if opt_name in _FSDP_LOOSE_TOL else {}
     if tol is not None:
         base_tol.update({k: max(base_tol.get(k, 0), v) for k, v in tol.items()})
     _assert_close(ref, torch.load(result_path, weights_only=True), f"{label}/{opt_name}", **base_tol)
@@ -321,7 +325,7 @@ def test_fsdp(opt_name, reference_params, tmp_path):
         nprocs=2,
         join=True,
     )
-    tol = dict(rtol=1e-2, atol=1e-4) if opt_name in _FSDP_PSGD else {}
+    tol = dict(rtol=1e-2, atol=1e-2) if opt_name in _FSDP_LOOSE_TOL else {}
     _assert_close(info["params"], torch.load(result_path, weights_only=True), f"FSDP/{opt_name}", **tol)
 
 

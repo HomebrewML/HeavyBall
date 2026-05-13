@@ -1,4 +1,3 @@
-import collections
 import contextlib
 import enum
 import functools
@@ -270,7 +269,7 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
     new_shape = [grad.shape[0], *new_shape[::-1]]
     new_grad = grad.reshape(new_shape)
     if not split:
-        return new_grad.to(memory_format=torch.contiguous_format).contiguous()
+        return new_grad
 
     grads = [new_grad]
     for i, sh in reversed(list(enumerate(new_shape[:]))):
@@ -281,7 +280,7 @@ def dim_merger(grad, max_precond_dim, split: bool = False):
             continue
         grads = [a for g in grads for a in g.split(max_precond_dim, dim=i)]
     if len(grads) == 1:
-        return new_grad.to(memory_format=torch.contiguous_format).contiguous()
+        return new_grad
     new_grads = []
     for g in grads:
         append_or_extend(new_grads, dim_merger(g, max_precond_dim, split))
@@ -788,7 +787,7 @@ def _compilable_orthogonal_(x: Tensor, mode: str | ZerothPowerMode, out: Tensor 
         mode = ZerothPowerMode(mode)
     if not isinstance(scale_mode, OrthoScaleMode):
         scale_mode = OrthoScaleMode(scale_mode)
-    if mode == ZerothPowerMode.newtonschulz or x.shape[0] != x.shape[1]:
+    if mode == ZerothPowerMode.newtonschulz or x.shape[-2] != x.shape[-1]:
         y = zeropower_via_newtonschulz5(x, 5)
     elif mode == ZerothPowerMode.thinky_polar_express:
         y = msign(x, 10)
@@ -828,42 +827,37 @@ def _compilable_scatter_set(target, source, index):
 
 
 @decorator_no_fullgraph
-def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor):
-    """
-    Computes the eigenbases of the preconditioner using one round of power iteration
-    followed by torch.linalg.qr decomposition, and updates exp_avg in-place from old to new eigenspace.
-
-    :param GG: List of accumulated gradient outer products.
-    :param Q: List of current eigenbases (updated in-place to Q_new).
-    :param exp_avg: Exponential moving average in the old eigenspace (updated in-place if provided).
-        Pass nothing (or only `None` entries) to refresh Q without rotating any state.
-    """
+def get_orthogonal_matrix_QR(
+    GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor, exp_avg_sq: Tensor = None, heavy: bool = False
+):
     if isinstance(Q, list) and not Q:
         return
 
-    ref = exp_avg[0] if exp_avg else None
-    if ref is not None and ref.dim() == 0:  # preconditioning doesn't make sense here
+    ref = exp_avg[0] if exp_avg else exp_avg_sq
+    if ref is not None and ref.dim() <= 1:
         Q.clear()
         return
 
-    if ref is not None and ref.dim() != len(Q):
-        raise ValueError(f"ref dim {ref.dim()} does not match Q length {len(Q)}")
+    if ref is not None and ref.dim() - 1 != len(Q):
+        raise ValueError(f"ref dim {ref.dim()} (excluding bucket axis) does not match Q length {len(Q)}")
 
     new_qs = []
-
     for m, q in zip(GG, Q):
         if m is None:
             new_qs.append(None)
             continue
-
         m = promote(m.data)
+        if heavy:
+            oriented = inplace_orthogonal_(m @ promote(q.data), precise_zeroth_power_mode)
+            eig = compiled_einsum("...ij,...ij->...j", oriented, m @ oriented)
+            idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(oriented)
+            new_qs.append(oriented.gather(-1, idx))
+            continue
         q_old = promote(q.data)
-
         tmp = m @ q_old
-        est_eig = compiled_einsum("ij,ij->j", q_old, tmp)
-        sort_idx = torch.argsort(est_eig, descending=True)
-
-        tmp[:, sort_idx] = inplace_orthogonal_(tmp[:, sort_idx], precise_zeroth_power_mode)
+        eig = compiled_einsum("...ij,...ij->...j", q_old, tmp)
+        idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(tmp)
+        tmp.scatter_(-1, idx, inplace_orthogonal_(tmp.gather(-1, idx), precise_zeroth_power_mode))
         new_qs.append(tmp)
 
     if ref is None:
@@ -872,23 +866,34 @@ def get_orthogonal_matrix_QR(GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor
                 copy_stochastic_(q, q_new)
         return
 
-    assert ref.ndim < 13, "ref.ndim must be less than 13"
-    in_str = einsum_base[: ref.dim()]
-    out_str = einsum_base[ref.dim() : 2 * ref.dim()]
+    assert ref.dim() < 14, "ref.ndim must be less than 14"
+    param_dim = ref.dim() - 1
+    in_str = einsum_base[:param_dim]
+    out_str = einsum_base[param_dim : 2 * param_dim]
 
-    from_shampoo = ",".join([o + i for m, i, o in zip(Q, in_str, in_str.upper()) if m is not None])
+    from_shampoo = ",".join([f"...{o}{i}" for m, i, o in zip(Q, in_str, in_str.upper()) if m is not None])
     if not from_shampoo:
         return
 
-    to_shampoo = ",".join([i + o for m, i, o in zip(new_qs, in_str.upper(), out_str) if m is not None])
-    out_str = "".join([o if o in to_shampoo else i for i, o in zip(in_str, out_str)])
+    if exp_avg:
+        to_shampoo = ",".join([f"...{i}{o}" for m, i, o in zip(new_qs, in_str.upper(), out_str) if m is not None])
+        out_lin = "".join([o if o in to_shampoo else i for i, o in zip(in_str, out_str)])
+        subs = f"...{in_str},{from_shampoo},{to_shampoo}->...{out_lin}"
+        Q_kept = [promote(q) for q in Q if q is not None]
+        Qn_kept = [q for q in new_qs if q is not None]
+        for r in exp_avg:
+            copy_stochastic_(r, compiled_einsum(subs, promote(r), *Q_kept, *Qn_kept))
 
-    subscripts = f"{in_str},{from_shampoo},{to_shampoo}->{out_str}"
-    for r in exp_avg:
-        new = compiled_einsum(
-            subscripts, promote(r), *[promote(q) for q in Q if q is not None], *[q for q in new_qs if q is not None]
-        )
-        copy_stochastic_(r, new)
+    if heavy and exp_avg_sq is not None:
+        Rsq = [
+            compiled_einsum("...ji,...jk->...ik", promote(qo.data), promote(qn)).square()
+            for qo, qn in zip(Q, new_qs)
+            if qo is not None
+        ]
+        sq_terms = ",".join([f"...{i}{o}" for q, i, o in zip(Q, in_str, out_str) if q is not None])
+        out_sq = "".join([o if o in sq_terms else i for i, o in zip(in_str, out_str)])
+        subs = f"...{in_str},{sq_terms}->...{out_sq}"
+        copy_stochastic_(exp_avg_sq, compiled_einsum(subs, promote(exp_avg_sq), *Rsq).clamp_min(0))
 
     for q, q_new in zip(Q, new_qs):
         if q is not None:
@@ -900,20 +905,21 @@ def _transform_projected_state(old_qs: List[Optional[Tensor]], new_qs: List[Opti
         return
 
     ref = states[0]
-    if ref is None or ref.dim() == 0:
+    if ref is None or ref.dim() <= 1:
         return
 
-    assert ref.ndim < 13, "ref.ndim must be less than 13"
-    in_str = einsum_base[: ref.dim()]
-    out_str = einsum_base[ref.dim() : 2 * ref.dim()]
+    assert ref.dim() < 14, "ref.ndim must be less than 14"
+    param_dim = ref.dim() - 1
+    in_str = einsum_base[:param_dim]
+    out_str = einsum_base[param_dim : 2 * param_dim]
 
-    old_basis = ",".join([o + i for q, i, o in zip(old_qs, in_str, in_str.upper()) if q is not None])
+    old_basis = ",".join([f"...{o}{i}" for q, i, o in zip(old_qs, in_str, in_str.upper()) if q is not None])
     if not old_basis:
         return
 
-    new_basis = ",".join([i + o for q, i, o in zip(new_qs, in_str.upper(), out_str) if q is not None])
+    new_basis = ",".join([f"...{i}{o}" for q, i, o in zip(new_qs, in_str.upper(), out_str) if q is not None])
     out_str = "".join([o if o in new_basis else i for i, o in zip(in_str, out_str)])
-    subscripts = f"{in_str},{old_basis},{new_basis}->{out_str}"
+    subscripts = f"...{in_str},{old_basis},{new_basis}->...{out_str}"
     old_basis = [promote(q) for q in old_qs if q is not None]
     new_basis = [promote(q) for q in new_qs if q is not None]
 
@@ -927,7 +933,7 @@ def init_psgd_eigenbasis(Q: List[Tensor]):
     out = []
 
     for q in Q:
-        if q.ndim < 2:
+        if q.ndim < 3:
             out.append(None)
             continue
 
@@ -942,7 +948,7 @@ def get_psgd_eigenbasis(Q: List[Tensor], prev: List[Optional[Tensor]]):
     out = []
 
     for q, old_basis in zip(Q, prev):
-        if q.ndim < 2:
+        if q.ndim < 3:
             out.append(None)
             continue
         if old_basis is None:
@@ -955,11 +961,12 @@ def get_psgd_eigenbasis(Q: List[Tensor], prev: List[Optional[Tensor]]):
         Y = q32.mT @ (q32 @ old_basis32)
         basis_raw = no_compile_qr(Y, mode="reduced").Q.to(dtype=q.dtype)
         projected = q32 @ promote(basis_raw)
-        sort_idx = torch.argsort(compiled_einsum("ij,ij->j", projected, projected), descending=True)
-        basis_raw = basis_raw.index_select(1, sort_idx)
-        signs = compiled_einsum("ij,ij->j", old_basis32, promote(basis_raw))
+        sort_idx = torch.argsort(compiled_einsum("...ij,...ij->...j", projected, projected), descending=True)
+        gather_idx = sort_idx.unsqueeze(-2).expand_as(basis_raw)
+        basis_raw = basis_raw.gather(-1, gather_idx)
+        signs = compiled_einsum("...ij,...ij->...j", old_basis32, promote(basis_raw))
         signs = torch.where(signs < 0, -torch.ones_like(signs), torch.ones_like(signs)).to(dtype=basis_raw.dtype)
-        basis = basis_raw * signs.view(1, -1)
+        basis = basis_raw * signs.unsqueeze(-2)
         out.append(basis)
 
     return out
@@ -971,7 +978,7 @@ def update_psgd_eigenbasis(Q: List[Tensor], Q_basis: List[Tensor], *states: Tens
     _transform_projected_state(Q_basis, new_basis, *states)
 
     for i, (old_basis, new_basis_i) in enumerate(zip(Q_basis, new_basis)):
-        if old_basis is None:  # happens only if ndim < 2
+        if old_basis is None:
             continue
         copy_stochastic_(old_basis, new_basis_i)
 
@@ -991,9 +998,9 @@ def _stable_symmetric_basis(
     eps = min_eps
     while True:
         try:
-            eye = torch.eye(m.shape[0], device=m.device, dtype=m.dtype)
+            eye = torch.eye(m.shape[-1], device=m.device, dtype=m.dtype)
             _eigval, eigvec = no_compile_eigh(m + eps * eye)
-            return torch.flip(eigvec, [1]).to(device=out_device, dtype=out_dtype)
+            return torch.flip(eigvec, [-1]).contiguous().to(device=out_device, dtype=out_dtype)
         except torch.OutOfMemoryError:
             if m.device.type == "cpu":
                 raise
@@ -1201,40 +1208,30 @@ def update_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
     Simplified by @francois-rozet in commit 704ccc4bab52429f945df421647ec82c54cdd65f
     Re-commited due to faulty merge
     """
-    if grad.dim() == 1 and (not precondition_1d or grad.shape[0] > max_precond_dim):
+    if grad.dim() == 2 and (not precondition_1d or grad.shape[1] > max_precond_dim):
         return
 
+    g0 = einsum_base[: grad.dim() - 1]
     for idx, m in enumerate(GG):
         if not isinstance(m, Tensor):
             continue
         b = einsum_base[idx]
-        g0 = einsum_base[: grad.dim()]
         g1 = g0.replace(b, b.upper())
-        outer_product = compiled_einsum(f"{g0},{g1}->{b + b.upper()}", grad, grad)
+        outer_product = compiled_einsum(f"...{g0},...{g1}->...{b + b.upper()}", grad, grad)
         stochastic_lerp_(m, outer_product, 1 - beta)
 
 
 @decorator_knowngood
 def _kl_eigvals(q: Tensor, m: Tensor) -> Tensor:
-    """diag(Q.T @ M @ Q)."""
-    q32, m32 = promote(q), promote(m)
-    return ((q32.T @ m32) * q32.T).sum(dim=1)
+    return compiled_einsum("...ji,...jk,...ki->...i", promote(q), promote(m), promote(q))
 
 
 @decorator_knowngood
-def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
-    """KL-Shampoo corrected Kronecker factor accumulation (arXiv:2509.03378).
-
-    L <- lerp(L, G @ R^{-1} @ G.T / d_b, 1-beta)
-    R <- lerp(R, G.T @ L^{-1} @ G / d_a, 1-beta)
-
-    Factor inverses approximated via eigenbasis: Q @ diag(lambda^{-1}) @ Q.T.
-    Falls back to standard outer product for non-2D grads or missing eigenbases.
-    """
-    if grad.dim() == 1 and (not precondition_1d or grad.shape[0] > max_precond_dim):
+def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps, *, heavy: bool = False):
+    if grad.dim() == 2 and (not precondition_1d or grad.shape[1] > max_precond_dim):
         return
 
-    if grad.dim() != 2 or not any(isinstance(m, Tensor) and q is not None for m, q in zip(GG, Q)):
+    if grad.dim() != 3 or not any(isinstance(m, Tensor) and q is not None for m, q in zip(GG, Q)):
         return update_ggt(grad, GG, max_precond_dim, precondition_1d, beta)
 
     g32 = promote(grad)
@@ -1243,20 +1240,22 @@ def update_ggt_kl(grad, GG, Q, max_precond_dim, precondition_1d, beta, eps):
         if not isinstance(m, Tensor) or q is None:
             infos.append(None)
             continue
-        scale = _kl_eigvals(q, m).clamp_min(eps).reciprocal() / grad.shape[idx]
-        infos.append((g32.T @ promote(q) if idx == 0 else g32 @ promote(q), scale))
+        eig = _kl_eigvals(q, m)
+        inv = torch.where(eig > eps, eig.reciprocal(), 0.0) if heavy else eig.clamp_min(eps).reciprocal()
+        proj = compiled_einsum("...ji,...jk->...ik" if idx == 0 else "...ij,...jk->...ik", g32, promote(q))
+        infos.append((proj, inv / grad.shape[idx + 1]))
 
+    g0 = einsum_base[: grad.dim() - 1]
     for idx, (m, info) in enumerate(zip(GG, reversed(infos))):
         if not isinstance(m, Tensor):
             continue
         if info is None:
             b = einsum_base[idx]
-            g0 = einsum_base[: grad.dim()]
             g1 = g0.replace(b, b.upper())
-            outer = compiled_einsum(f"{g0},{g1}->{b + b.upper()}", g32, g32)
+            outer = compiled_einsum(f"...{g0},...{g1}->...{b + b.upper()}", g32, g32)
         else:
             proj, scale = info
-            outer = (proj * scale[None, :]) @ proj.T
+            outer = compiled_einsum("...ik,...k,...jk->...ij", proj, scale, proj)
         stochastic_lerp_(m, outer, 1 - beta)
 
 
@@ -1268,16 +1267,14 @@ def _kl_shampoo_kron_scale(grad: Tensor, Q: List[Optional[Tensor]], GG: List[Opt
             continue
         d = _kl_eigvals(q, m).clamp_min(eps).rsqrt()
         shape = [1] * out.ndim
-        shape[idx] = -1
+        shape[0] = d.shape[0]
+        shape[idx + 1] = -1
         out = out * d.view(shape)
     return out.to(grad.dtype)
 
 
 def kl_shampoo_precondition(grad, Q, GG, eps):
-    """KL-Shampoo Kronecker preconditioner (arXiv:2509.03378).
-
-    Applies ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T to grad, with d_i = diag(Q[i].T @ GG[i] @ Q[i]).
-    """
+    """KL-Shampoo Kronecker preconditioner (arXiv:2509.03378): ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T"""
     return project(_kl_shampoo_kron_scale(project(grad, Q, back=False), Q, GG, eps), Q, back=True)
 
 
@@ -1371,15 +1368,18 @@ def init_preconditioner(grad, state, max_precond_dim, precondition_1d, init_fact
     outer product of grad (standard SOAP behavior).
     """
     state["GG"] = []  # Will hold all the preconditioner matrices (L and R in the paper).
-    if grad.numel() > 1 and (grad.ndim > 1 or precondition_1d):
-        for sh in grad.shape:
+    if grad.numel() > 1 and (grad.ndim > 2 or precondition_1d):
+        n = grad.shape[0]
+        for sh in grad.shape[1:]:
             if sh > max_precond_dim or sh == 1:
                 # via @francois-rozet: https://github.com/HomebrewML/HeavyBall/commit/8b86be04967e2d095136d5603724f488f2d46592#diff-a430393dd0a6ee393944a9ed16416115c175de2414cf4a96e647197697f265e9R621
                 state["GG"].append(None)
             elif init_factor > 0:
-                state["GG"].append(torch.eye(sh, device=grad.device, dtype=grad.dtype) * init_factor)
+                state["GG"].append(
+                    torch.eye(sh, device=grad.device, dtype=grad.dtype).expand(n, sh, sh).contiguous() * init_factor
+                )
             else:
-                state["GG"].append(torch.zeros(sh, sh, device=grad.device, dtype=grad.dtype))
+                state["GG"].append(torch.zeros(n, sh, sh, device=grad.device, dtype=grad.dtype))
     else:
         state["GG"].append(None)
 
@@ -1396,12 +1396,16 @@ def project(grad, Q, back: bool):
     :param back: whether to project to Shampoo eigenbases or back to original space
     :return:
     """
-    param = einsum_base[: grad.dim()]
-    preconditioners = ",".join([(g + g.upper())[:: -1 if back else 1] for m, g in zip(Q, param) if m is not None])
+    param = einsum_base[: grad.dim() - 1]
+    preconditioners = ",".join(
+        ["..." + (g + g.upper())[:: -1 if back else 1] for m, g in zip(Q, param) if m is not None]
+    )
     if preconditioners:
         out = "".join([c.upper() if c.upper() in preconditioners else c for c in param])
         out = compiled_einsum(
-            f"{param},{preconditioners}->{out}", promote(grad), *[promote(q) for q in Q if q is not None]
+            f"...{param},{preconditioners}->...{out}",
+            promote(grad),
+            *[promote(q) for q in Q if q is not None],
         )
         grad = out.to(grad.dtype)
     return grad
@@ -1556,9 +1560,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 return {}
             raise KeyError("Tensor has no tracked state.")
         state_param, index = self.mapping_inverse[key]
-        if state_param not in self.state:
-            self.state[state_param] = collections.defaultdict(dict)
-        return self.state[state_param][index]
+        return self.state.setdefault(state_param, {}).setdefault(index, {})
 
     def _init_mapping(self, group: dict | None = None):
         if group is None:
@@ -1632,15 +1634,16 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
     def state_size(self) -> int:
         total_bytes = 0
+        seen: set[int] = set()
 
         def _add(x):
             nonlocal total_bytes
-            if isinstance(x, Tensor):
+            if isinstance(x, Tensor) and id(x) not in seen:
+                seen.add(id(x))
                 total_bytes += x.numel() * x.element_size()
 
-        for group in self.param_groups:
-            for p, _ in self.split_p_and_g_in_group(group, skip_none=False):
-                tree_map(_add, self.state_(p))
+        for st in self.state.values():
+            tree_map(_add, st)
         return total_bytes
 
     def _step(self, group):
@@ -2293,13 +2296,13 @@ def _fused_compilable_adopt_(
     y, update, grad, exp_avg_sq, exp_avg, beta1, beta2, step, lr, eps, decay, caution, cautious_decay
 ):
     u32, g32, exp_avg_sq32 = [list(map(promote, x)) for x in [update, grad, exp_avg_sq]]
-    _compilable_update_(y, u32, decay, lr, caution, cautious_decay, g32)
 
     beta1 = beta_debias(beta1, step)
-    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
+    m_new = _lerp(exp_avg, [u_ / eps_sqrt(d_, eps) for u_, d_ in zip(u32, exp_avg_sq32)], beta1)
+    _compilable_update_(y, m_new, decay, lr, caution, cautious_decay, g32)
 
     beta2 = beta_debias(beta2, step + 1)
-    stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
+    stochastic_lerp_(exp_avg_sq, [u_ * u_ for u_ in u32], 1 - beta2)
 
 
 def fused_adopt_(
@@ -2315,12 +2318,13 @@ def fused_adopt_(
 @decorator_knowngood
 def _compilable_adopt_(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps):
     g32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, exp_avg_sq]]
-    update = list(map(promote, exp_avg))
 
     beta1 = beta_debias(beta1, step)
-    stochastic_lerp_(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], 1 - beta1)
+    m_new = _lerp(exp_avg, [g_ / eps_sqrt(d_, eps) for g_, d_ in zip(g32, exp_avg_sq32)], beta1)
+
+    beta2 = beta_debias(beta2, step + 1)
     stochastic_lerp_(exp_avg_sq, [g_ * g_ for g_ in g32], 1 - beta2)
-    copy_stochastic_list_(grad, update)
+    copy_stochastic_list_(grad, m_new)
 
 
 def adopt(grad, exp_avg_sq, exp_avg, beta1, beta2, step, eps: float = 1e-8):
@@ -2376,7 +2380,7 @@ def _compilable_update_(
     cautious_decay: bool,
     g: List[Optional[Tensor]],
 ):
-    for i, (u_, g_, p_) in enumerate(zip(u, g, p)):  # lr is data-dependent -> can't compile a multi-tensor op
+    for u_, g_, p_ in zip(u, g, p):  # lr is data-dependent -> can't compile a multi-tensor op
         u_ = promote(u_.view_as(p_))
         p32_ = promote(p_)
         if caution:
@@ -2550,9 +2554,10 @@ def init_Q_exprs(
     """
     scale = precond_init_scale(scale, scale_scale, scale_power, grad, hessian_vector, vector)
     dtype = dtype if dtype is not None else grad.dtype
-    shape = grad.shape
+    n = grad.shape[0]
+    shape = grad.shape[1:]
 
-    if len(shape) == 0:  # scalar
+    if len(shape) == 0:  # scalar param: bucket of N scalars
         Q = [scale * torch.ones_like(grad, dtype=dtype)]
         return Q
 
@@ -2579,22 +2584,25 @@ def init_Q_exprs(
         )
 
     Q = []
-    for i, (size, dim_d) in enumerate(zip(shape, dim_diag)):
+    for size, dim_d in zip(shape, dim_diag):
         if size == 1 or size > max_size or len(shape) < min_ndim_triangular or dim_d:
             # use diagonal matrix as preconditioner for this dim
-            Q.append(scale * torch.ones(size, dtype=promote(dtype), device=grad.device))
+            Q.append(scale * torch.ones(n, size, dtype=promote(dtype), device=grad.device))
         else:
             # use triangular matrix as preconditioner for this dim
-            Q.append(scale * torch.eye(size, dtype=dtype, device=grad.device))
+            Q.append(scale * torch.eye(size, dtype=dtype, device=grad.device).expand(n, size, size).contiguous())
     return Q
 
 
 @decorator_knowngood
 def psgd_balance_Q(Q):
-    norms = [promote(q.abs().max()).log() for q in Q]
-    geometric_mean = sum([n for n in norms]) / len(Q)
+    norms = [promote(q.abs().amax(dim=tuple(range(1, q.ndim)))).log() for q in Q]
+    geometric_mean = sum(norms) / len(Q)
     for q, n in zip(Q, norms):
-        q *= (geometric_mean - n).exp()
+        scale = (geometric_mean - n).exp()
+        shape = [1] * q.ndim
+        shape[0] = -1
+        q *= scale.view(shape)
 
 
 @decorator_knowngood
@@ -2870,25 +2878,16 @@ def _psgd_calc_scalars_(Qs: List[Tensor], conjB: Tensor):
     conjB = promote(conjB)
     for i, q in enumerate(Qs):
         q = promote(q)
-        if q.dim() <= 1:
-            if conjB.ndim == 0:
+        if q.dim() <= 2:
+            if conjB.ndim == 1:
                 conjB = conjB / q
             else:
-                shape = [1] * conjB.ndim
-                shape[i] = -1
+                shape = list(q.shape[:1]) + [1] * (conjB.ndim - 1)
+                shape[i + 1] = -1
                 conjB = conjB / q.view(shape)
         else:
-            triangular_qs.append((i, q))
+            triangular_qs.append((i + 1, q))
     return triangular_qs, conjB
-
-
-@decorator_knowngood
-def _reshape_conjB(solved: Tensor, transposed_shape: List[int], original_shape: List[int], last_dim: int, new_dim: int):
-    solved = solved.reshape(transposed_shape)
-    solved = solved.transpose(-1, last_dim)
-    solved = solved.reshape(original_shape)
-    solved = solved.transpose(-1, new_dim)
-    return solved.contiguous(), solved.shape
 
 
 def ndim_tuple(Q: list[Tensor]) -> tuple:
@@ -2900,119 +2899,105 @@ def psgd_calc_A_and_conjB(G: Tensor, Q, conjB: Tensor | None):  # conjB ("V", "v
         conjB = torch.randn_like(G)
     exprA = cached_precond_grad_expr(ndim_tuple(Q), G.ndim)  # calcA expr and cached precond expr are the same
     A = casted_einsum(exprA, *Q, G)
-    transposed_shape = original_shape = conjB.shape
-    prev_i = -1
     qs, conjB = _psgd_calc_scalars_(Q, conjB)
+    n = G.shape[0]
     for i, tri_q in qs:
-        conjB, transposed_shape = _reshape_conjB(conjB, transposed_shape, original_shape, prev_i, i)
-        prev_i = i
-        conjB = no_compile_solve_triangular(tri_q, conjB, upper=True, left=False)
-    conjB, _ = _reshape_conjB(conjB, transposed_shape, original_shape, prev_i, -1)
+        conjB = conjB.movedim(i, -1).contiguous()
+        moved_shape = conjB.shape
+        flat = conjB.reshape(n, -1, moved_shape[-1])
+        flat = no_compile_solve_triangular(tri_q, flat, upper=True, left=False)
+        conjB = flat.reshape(moved_shape).movedim(-1, i).contiguous()
     return A, conjB
 
 
 def max_singular_value_exact(A, use_lobpcg: bool = False):
     try:
         if use_lobpcg:
-            A = A @ A.T
+            A = A @ A.mT
             eigval, _ = no_compile_lobpcg(A, k=1, largest=True)
-            return eigval[0].sqrt()
+            return eigval[..., 0].sqrt()
         else:
-            return torch.linalg.svd(promote(A), driver="gesvdj")[1].max().to(A.dtype)  # == linalg.matrix_norm(A, ord=2)
+            return torch.linalg.svd(promote(A), driver="gesvdj")[1].amax(dim=-1).to(A.dtype)
     except (torch.linalg.LinAlgError, RuntimeError):
         return max_singular_value_power_iter(promote(A), iterations=2)
 
 
 @decorator_knowngood
-def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
+def max_singular_value_power_iter(A_outer: Tensor, iterations: int = 5):
     """
-    Rayleigh quotient of row with the largest norm + optional power iterations
+    Rayleigh quotient of row with the largest norm + optional power iterations.
+    Supports (..., m, n); returns (...,) — scalar for 2D, (N,) for 3D batched.
     """
-    x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+    row_norms = A_outer.norm(dim=-1)
+    x_norm, max_idx = row_norms.max(dim=-1)
     x_norm = promote(x_norm).clamp(min=torch.finfo(torch.float32).tiny)
 
-    A = A_outer
-    x = A.index_select(0, max_idx).flatten().contiguous()
-    A = stochastic_round_(A / x_norm)
-    x = x / x_norm
+    gather_idx = max_idx[..., None, None].expand(*A_outer.shape[:-2], 1, A_outer.shape[-1])
+    x = A_outer.gather(-2, gather_idx).squeeze(-2)
+    A = stochastic_round_(A_outer / x_norm[..., None, None])
+    x = x / x_norm[..., None]
 
-    def _mv(x):
-        return promote(A.T.mv(A.mv(x.to(A.dtype))))
+    def _mv(v):
+        return promote((A.mT @ (A @ v[..., None].to(A.dtype))).squeeze(-1))
 
     for _ in range(iterations):
-        # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-        x = F.normalize(_mv(x), dim=0)
-    out = (promote(x) @ _mv(x)).to(x_norm.dtype).sqrt() * x_norm
-    return out.squeeze()
+        x = F.normalize(_mv(x), dim=-1)
+    return ((x * _mv(x)).sum(dim=-1).sqrt() * x_norm).to(x_norm.dtype)
 
 
 @decorator_knowngood
 def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     """
-    Adapted from @evanatyourservice
+    Adapted from @evanatyourservice. Batched: A is (..., m, n), result is (...,).
+
+    topk-warm-start sketch: pick the k columns with largest squared norm, orthogonalize,
+    project, orthogonalize again, take the exact SV of the resulting k×k sketch.
     """
     if max_abs is None:
-        max_abs = A.abs().max().clamp(min=1e-8)
+        max_abs = A.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
 
-    # cholesky uses random projection, but this uses topk -- topk is a warm start, which may converge to a biased result
-    k = 2 ** math.ceil(math.log2(math.log2(min(A.shape))))  # next-largest-power-of-2 of log2-of-size
-    norm = A.square().sum(0)
-    indices = torch.topk(norm, k, largest=True).indices
-    Y = A.index_select(1, indices).contiguous() / max_abs
+    k = 2 ** math.ceil(math.log2(math.log2(min(A.shape[-2:]))))
+    indices = A.square().sum(-2).topk(k, largest=True).indices  # (..., k)
+    Y = A.gather(-1, indices.unsqueeze(-2).expand(*A.shape[:-1], k)) / max_abs
 
-    Q = inplace_orthogonal_(Y, precise_zeroth_power_mode)
-    Q = Q / max_abs
-    Z = A.T @ Q
+    Q = inplace_orthogonal_(Y, precise_zeroth_power_mode) / max_abs
+    Z = A.mT @ Q
     W = inplace_orthogonal_(Z, precise_zeroth_power_mode)
-    sketch_norm = max_singular_value_exact(Z.T @ W)
-    return sketch_norm * max_abs
-
-
-def _max_singular_value_ndim(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
-    if A.ndim <= 2:
-        return max_singular_value(A, max_svd, use_cholesky, power_iter)
-
-    base = einsum_base[: A.ndim]
-    A16 = stochastic_round_(A)
-    squares = [compiled_einsum(f"{base},{base.replace(b, b.upper())}->{b}{b.upper()}", A16, A16) for b in base]
-    svds = [max_singular_value(promote(s), max_svd, use_cholesky, power_iter) for s in squares]
-    svds = torch.stack(svds)
-    return svds.max().sqrt().to(A.dtype)  # sqrt because we took the SVD of a squared matrix
+    return max_singular_value_exact(Z.mT @ W) * max_abs.squeeze(-1).squeeze(-1)
 
 
 @decorator_knowngood
 def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
     if A.ndim < 2:
         return A.abs().max()
-    if A.ndim > 2:
-        raise ValueError("max_singular_value: dimension of A must be less than or equal to 2")
-    if min(A.shape) <= max_svd:
-        return max_singular_value_exact(A)  # SVD needs ~25% more runtime for size=32, but 0% error instead of 5%
+    if min(A.shape[-2:]) <= max_svd:
+        return max_singular_value_exact(A)
     if use_cholesky or power_iter < 0:
         return max_singular_value_cholesky(A)
-    return max_singular_value_power_iter(A, None, iterations=power_iter)
+    return max_singular_value_power_iter(A, iterations=power_iter)
 
 
 @decorator_knowngood
 def max_eigenvalue_spd(A_outer: Tensor, power_iter: int = 4) -> Tensor:
-    """Power iteration for the largest eigenvalue of a symmetric positive (semi)definite matrix.
-    Exploits A = A^T: A^T A = A^2, so v -> A^T(Av) = v -> A(Av), saving a transpose.
-    Uses x @ A.mT (gemm transB=true) for faster BLAS dispatch than A.mv(x)."""
+    """Power iteration for the largest eigenvalue of an SPD matrix or batch of SPD matrices.
+    Supports (..., d, d); returns (...,) — scalar for 2D, (N,) for 3D."""
     if A_outer.ndim < 2:
         return A_outer.max()
-    x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+    row_norms = A_outer.norm(dim=-1)
+    x_norm, max_idx = row_norms.max(dim=-1)
     x_norm = promote(x_norm).clamp(min=torch.finfo(torch.float32).tiny)
 
-    x = A_outer.index_select(0, max_idx).flatten().contiguous()
-    A = promote(A_outer) / x_norm
-    x = x / x_norm
+    gather_idx = max_idx[..., None, None].expand(*A_outer.shape[:-2], 1, A_outer.shape[-1])
+    x = A_outer.gather(-2, gather_idx).squeeze(-2)
+    A = promote(A_outer) / x_norm[..., None, None]
+    x = x / x_norm[..., None]
 
-    def _mv(x):
-        return promote((x @ A.mT) @ A.mT)
+    def _mv(v):
+        return promote(((v[..., None, :] @ A.mT) @ A.mT).squeeze(-2))
 
     for _ in range(power_iter):
-        x = F.normalize(_mv(x), dim=0)
-    return ((x @ _mv(x)).sqrt() * x_norm).squeeze()
+        x = F.normalize(_mv(x), dim=-1)
+    return (x * _mv(x)).sum(dim=-1).sqrt() * x_norm
 
 
 @decorator_knowngood
@@ -3075,99 +3060,18 @@ def _balance_to_triu(Q: "TriuOrLine"):
 @functools.lru_cache(maxsize=None)
 def calcG_expr(q_dim, g_dim):
     exprs = []
-    base = einsum_base[:g_dim]
+    base = einsum_base[: g_dim - 1]
     for i, q in enumerate(q_dim):
         new = list(base)
-        if q == 2:
+        if q == 3:
             new[i] = "Z"
             out = f"{base[i]}Z"
-        else:
+        elif q == 2:
             out = base[i]
-        exprs.append(f"{base},{''.join(new)}->{out}")
-    return exprs
-
-
-def eye_like(x: Tensor):
-    if x.ndim < 2:
-        return torch.ones_like(x)
-    assert x.ndim == 2
-    assert x.size(0) == x.size(1)
-    return torch.eye(x.size(0), device=x.device, dtype=x.dtype)
-
-
-@decorator_knowngood
-def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
-    """
-    Idea:
-        G should be zeroth power. So, all Qs together should approximate the G's inverse.
-        Assuming G is 2-dimensional, we'd have two preconditioning Q's: L, R
-        Optimize LGR being a zeroth power using `MSE( (LGR) (LGR).T , I ) + MSE( (LGR).T + (LGR) , I )`,
-        then backprop to L/R jointly.
-        This function computes the gradients for L/R, with an outer optimizer layer handling the rest.
-
-        `psgd_precond_grad` computes LGR for the general (n-dimensional) case
-        `exprG` contains the einsum expressions to compute (LGR)(LGR).T (and (LGR).T(LGR)) for the general n-dim case
-    Args:
-        G: Gradient that should be orthogonalized
-        Q: List of preconditioner tensors.
-
-    Returns:
-        - List of gradients with respect to Q (d_Q).
-    """
-    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-
-    G16 = stochastic_round_(G)
-    Q16 = [stochastic_round_(q) for q in Q]
-    P = psgd_precond_grad(G16, Q16)  # Q₀GQ₁
-
-    d_P = torch.zeros_like(G)
-    base = einsum_base[: G.ndim]
-    for i, exprG in enumerate(exprGs):
-        pp = compiled_einsum(exprG, P, P)
-        error = pp - eye_like(pp)
-        dim = einsum_base[i]
-        if pp.ndim == 2:
-            new = dim.upper()
-            prec = f"{new}{dim}"
         else:
-            new = dim
-            prec = dim
-        d_P += torch.einsum(f"{base},{prec}->{base.replace(dim, new)}", P, error)
-
-    d_P = stochastic_round_(d_P)  # accumulate in fp32 and round at the end
-    grads = []
-    for i, exprG in enumerate(exprGs):
-        new_q = Q16[:]
-        new_q[i] = eye_like(new_q[i])
-        pq = psgd_precond_grad(G16, new_q)
-        grad = compiled_einsum(exprG, pq, d_P)
-        if grad.ndim == 2:
-            grad = (grad + grad.T) / 2
-        grads.append(grad)
-
-    return grads, P.to(G.dtype)
-
-
-def _inverse_initial_guess(gg):
-    n = gg.shape[0]
-
-    sigma_max = promote(gg.norm())
-
-    trace_gg = promote(torch.trace(gg))
-    sigma_min_approx = trace_gg / (n * sigma_max)
-
-    return sigma_max, sigma_min_approx
-
-
-@decorator_knowngood
-def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
-    k = torch.arange(degree, dtype=torch.float64, device=device)
-    rotation = (2 * k + 1) * math.pi / (2 * degree)
-    f = (rotation.cos() + 1 + eps) ** -0.5
-    rotation = (rotation.view(-1, 1) * k[1:].view(1, -1)).cos()
-    coeff0 = f.sum() / degree
-    coeffs = f @ rotation * 2 / degree
-    return coeff0.float(), coeffs.float()
+            out = ""
+        exprs.append(f"...{base},...{''.join(new)}->...{out}")
+    return exprs
 
 
 def _update_lb(ell: Tensor, lb_state: Tensor, beta: Tensor) -> Tensor:
@@ -3201,8 +3105,10 @@ def psgd_update_precond(
         term1 = promote(compiled_einsum(exprG, A, A))
         term2 = promote(compiled_einsum(exprG, conjB, conjB))
 
-        if q.ndim < 2:
-            ell = _update_lb((term1 + term2).max(), lb_state, lower_bount_beta)
+        if q.ndim < 3:
+            sum_terms = term1 + term2
+            reduced = sum_terms if q.ndim == 1 else sum_terms.amax(dim=-1)
+            ell = _update_lb(reduced, lb_state, lower_bount_beta)
             update = promote(q) * (term1 - term2)
         else:
             ell = _update_lb(max_eigenvalue_spd(term1 + term2, power_iter=power_iter), lb_state, lower_bount_beta)
@@ -3211,6 +3117,7 @@ def psgd_update_precond(
                 update = triu_to_line([update])[0][1]
 
         real_oq = oq_i[1] if isinstance(oq_i, tuple) else oq_i
+        ell = ell.view(-1, *([1] * (update.ndim - 1)))
         copy_stochastic_(real_oq, promote(real_oq) - update / ell * precond_lr)
     return None
 
@@ -3239,65 +3146,32 @@ def psgd_pro_update_precond(
         covariance_PP = compiled_einsum(exprG, Pg, Pg)
         q_ = promote(q)
 
-        if q.ndim < 2:
+        if q.ndim < 3:
             target_energy = total_numel / max(1, q.numel())
-            ell = _update_lb(covariance_PP.max() + target_energy, lb_state, lower_bount_beta)
-            copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell * precond_lr)
+            reduced = covariance_PP if q.ndim == 1 else covariance_PP.amax(dim=-1)
+            ell = _update_lb(reduced + target_energy, lb_state, lower_bount_beta)
+            ell_b = ell if q.ndim == 1 else ell.unsqueeze(-1)
+            copy_stochastic_(q, q_ - q_ * (covariance_PP - target_energy) / ell_b * precond_lr)
             continue
 
-        target_energy = total_numel / q.shape[0]
+        target_energy = total_numel / (q.shape[0] * q.shape[-1])
         ell = max_eigenvalue_spd(covariance_PP, power_iter=power_iter)
         ell = _update_lb(ell + target_energy, lb_state, lower_bount_beta)
-        q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell * precond_lr
+        ell_b = ell.unsqueeze(-1).unsqueeze(-1)
+        q_ = q_ - (covariance_PP @ q_ - target_energy * q_) / ell_b * precond_lr
 
-        # procrustes_step
-        R = (q_.T - q_).contiguous()
-        R = R / (max_singular_value(R, power_iter=power_iter) + torch.finfo(R.dtype).smallest_normal)
+        R = (q_.mT - q_).contiguous()
+        R = R / (
+            max_singular_value(R, power_iter=power_iter).unsqueeze(-1).unsqueeze(-1)
+            + torch.finfo(R.dtype).smallest_normal
+        )
         RQ = R @ q_
         RRQ = R @ RQ
-        c1, c2 = RQ.diagonal().sum(), RRQ.diagonal().sum()
+        c1 = RQ.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        c2 = RRQ.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
         a = torch.where(c2 < 0, (-c1 / c2).clamp(min=0, max=0.5), 0.5)
-        copy_stochastic_(q, q_ + a * RQ + (0.5 * a * a) * RRQ)
-
-
-@decorator_knowngood
-def bf16_matmul(x: Tensor, y: Tensor):
-    return (promote(x) @ promote(y)).to(x.dtype)
-
-
-def if_iscompiling(fn):
-    base = getattr(torch, fn.__name__, None)
-
-    @functools.wraps(fn)
-    def _fn(*args, **kwargs):
-        if torch.compiler.is_compiling() and base is not None:
-            return base(*args, **kwargs)
-        return fn(*args, **kwargs)
-
-    return _fn
-
-
-@if_iscompiling
-def while_loop(cond, body, state):
-    """
-    dispatches to torch.while_loop if we're compiling. otherwise, falls back to a naive + slow baseline
-    useful for debugging
-    """
-    while cond(*state).item():
-        state = body(*state)
-    return state
-
-
-@if_iscompiling
-def cond(cond, true_fn, false_fn):
-    """
-    dispatches to torch.cond if we're compiling. otherwise, falls back to a naive + slow baseline
-    useful for debugging
-    """
-
-    if cond.item():
-        return true_fn()
-    return false_fn()
+        a_b = a.unsqueeze(-1).unsqueeze(-1)
+        copy_stochastic_(q, q_ + a_b * RQ + (0.5 * a_b * a_b) * RRQ)
 
 
 @decorator_knowngood
@@ -3347,43 +3221,6 @@ def oja_update(v: Tensor, g: Tensor, lr: float = 1e-2, eps: float = 1e-12) -> Te
     gv = g @ v
     v = v + lr * (gv * g - (gv * gv) * v)
     return v / v.norm().clamp(min=eps)
-
-
-def cond_n(cond_val: Tensor, *fns):
-    fns = list(fns)
-    fn = fns.pop(0)
-    if not fns:
-        return fn
-    return cond(cond_val == 0, fn, lambda: cond_n(cond_val - 1, *fns))
-
-
-@decorator_knowngood
-def _psgd_precond_update_(
-    matmuled: List[Optional[Tensor]],
-    Q: "TriuOrLine",
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: Tensor,
-    precond_lr: Tensor,
-    store_triu_as_line: bool,
-    power_iter: int,
-):
-    for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
-        if isinstance(oq, tuple):
-            oq = oq[1]
-
-        q = promote(oq)
-        if update.ndim < 2:
-            lb = update.abs().max()
-        else:
-            lb = max_singular_value(update, power_iter=power_iter)
-            update = promote(update)
-            if store_triu_as_line:
-                update = triu_to_line([update])[0][1]
-
-        lb = promote(lb)
-        lb = lb.maximum(promote(lb_state) + (lb - promote(lb_state)) * (1 - lower_bount_beta))
-        copy_stochastic_(lb_state, lb)
-        copy_stochastic_(oq, q - update / lb * precond_lr)
 
 
 @decorator_knowngood
@@ -3555,10 +3392,6 @@ def _scale_by_exp2(x, log_scale):
     return (x * torch.exp2(h)) * torch.exp2(log_scale - h)
 
 
-def identity(x):
-    return x
-
-
 @decorator_knowngood
 def _compilable_weight_decay_to_ema_(p, ema, ema_decay, weight_decay):
     ema32 = _lerp(ema, p, ema_decay)
@@ -3626,10 +3459,11 @@ def trust_region_clip_(grad, lerp=0.9, scale=1.5):
 def triu_to_line(Q_list: List[Tensor]):
     out = []
     for q in Q_list:
-        if q.dim() < 2:
+        if q.dim() < 3:
             out.append((None, q))
         else:
-            out.append((tuple(q.shape), q[tuple(torch.triu_indices(*q.shape))]))
+            rows, cols = torch.triu_indices(q.shape[-2], q.shape[-1], device=q.device)
+            out.append((tuple(q.shape), q[..., rows, cols]))
     return out
 
 
@@ -3638,9 +3472,11 @@ def line_to_triu(Q_list: List[Tuple[Optional[List[int]], Tensor]]):
     new = []
     for shape, q in Q_list:
         if shape is not None:
-            x, y = torch.triu_indices(*shape, device=q.device)
-            q_mat = torch.zeros(shape, device=q.device, dtype=q.dtype)
-            q_mat[x, y] = q
+            d0, d1 = shape[-2], shape[-1]
+            rows, cols = torch.triu_indices(d0, d1, device=q.device)
+            full_shape = q.shape[:-1] + (d0, d1)
+            q_mat = torch.zeros(full_shape, device=q.device, dtype=q.dtype)
+            q_mat[..., rows, cols] = q
             q = q_mat
         new.append(q)
     return new
@@ -3666,11 +3502,11 @@ def psgd_should_update(group, prob: Union[float, callable], name: str = "cumulat
 
 @functools.lru_cache(maxsize=None)
 def cached_precond_grad_expr(Q_dim, grad_dim):
-    expr = [f"{c.upper()}{c}" if q_ == 2 else c for c, q_ in zip(einsum_base, Q_dim)]
+    expr = [f"...{c.upper()}{c}" if q_ == 3 else f"...{c}" if q_ == 2 else "..." for c, q_ in zip(einsum_base, Q_dim)]
     expr = ",".join(expr)
-    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
+    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim - 1)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
-    return f"{expr},{grad_expr}->{out_expr}"
+    return f"{expr},...{grad_expr}->...{out_expr}"
 
 
 @decorator_knowngood
@@ -3709,12 +3545,13 @@ def fused_precond_grad_cached_(
 @functools.lru_cache(maxsize=None)
 def precond_grad_expr(Q_dim, grad_dim):
     expr = [
-        f"{c2}{c.upper()},{c2}{c}" if q_ == 2 else f"{c},{c}" for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
+        f"...{c2}{c.upper()},...{c2}{c}" if q_ == 3 else f"...{c},...{c}" if q_ == 2 else "...,..."
+        for c, c2, q_ in zip(einsum_base, einsum_base[13:], Q_dim)
     ]
     expr = ",".join(expr)
-    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim)))
+    grad_expr = "".join(c for c, _ in zip(einsum_base, range(grad_dim - 1)))
     out_expr = "".join(c.upper() if c.upper() in expr else c for c in grad_expr)
-    return f"{expr},{grad_expr}->{out_expr}"
+    return f"{expr},...{grad_expr}->...{out_expr}"
 
 
 @decorator_knowngood
@@ -4011,7 +3848,7 @@ def disable_caution_scaling():
 
 
 @decorator_knowngood
-def sam_step(parameters, ball_size, adaptive: bool = True):
+def _compilable_sam_step(parameters: List[Tensor], ball_size: Tensor, adaptive: bool):
     old_params = []
     for p in parameters:
         old_params.append(p.detach().clone())
@@ -4023,3 +3860,10 @@ def sam_step(parameters, ball_size, adaptive: bool = True):
         stochastic_add_(p.data, grad, ball_size)
         p.grad.zero_()
     return old_params
+
+
+def sam_step(parameters, ball_size, adaptive: bool = True):
+    if not parameters:
+        return []
+    ball_size = scalar_guard(ball_size, parameters[0])
+    return _compilable_sam_step(parameters, ball_size, adaptive)

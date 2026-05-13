@@ -641,10 +641,30 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler, SimpleAPIBaseSampler):
         self._hebo = HEBO(_convert_to_hebo_design_space(search_space), scramble_seed=self._seed)
         self._independent_sampler = independent_sampler or optuna.samplers.RandomSampler(seed=seed)
         self._rng = np.random.default_rng(seed)
+        self._seen_trial_ids: set[int] = set()
+
+    def _observe_trial(self, study: Study, trial: FrozenTrial, values: Sequence[float]) -> None:
+        sign = 1 if study.direction == StudyDirection.MINIMIZE else -1
+        v = np.array([values[0]])
+        worst = np.nanmax(v) if study.direction == StudyDirection.MINIMIZE else np.nanmin(v)
+        padded = sign * np.where(np.isnan(v), worst, v)[:, np.newaxis]
+        params = pd.DataFrame([trial.params])
+        for name, dist in trial.distributions.items():
+            if isinstance(dist, (IntDistribution, FloatDistribution)) and not dist.log and dist.step is not None:
+                params[name] = (params[name] - dist.low) / dist.step
+        self._hebo.observe(params, padded)
+
+    def _ingest_existing(self, study: Study) -> None:
+        for t in study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)):
+            if t._trial_id in self._seen_trial_ids or t.values is None:
+                continue
+            self._observe_trial(study, t, t.values)
+            self._seen_trial_ids.add(t._trial_id)
 
     def sample_relative(
         self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
     ) -> dict[str, Any]:
+        self._ingest_existing(study)
         params = {}
         for name, row in self._hebo.suggest().items():
             if name not in search_space:
@@ -665,18 +685,10 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler, SimpleAPIBaseSampler):
         state: TrialState,
         values: Sequence[float] | None,
     ) -> None:
-        if values is None:
+        if values is None or trial._trial_id in self._seen_trial_ids:
             return
-        sign = 1 if study.direction == StudyDirection.MINIMIZE else -1
-        values = np.array([values[0]])
-        worst_value = np.nanmax(values) if study.direction == StudyDirection.MINIMIZE else np.nanmin(values)
-        nan_padded_values = sign * np.where(np.isnan(values), worst_value, values)[:, np.newaxis]
-        params = pd.DataFrame([trial.params])
-        for name, dist in trial.distributions.items():
-            if isinstance(dist, (IntDistribution, FloatDistribution)) and not dist.log and dist.step is not None:
-                params[name] = (params[name] - dist.low) / dist.step
-
-        self._hebo.observe(params, nan_padded_values)
+        self._observe_trial(study, trial, values)
+        self._seen_trial_ids.add(trial._trial_id)
 
     def infer_relative_search_space(self, study: Study, trial: FrozenTrial) -> dict[str, BaseDistribution]:
         return self.search_space

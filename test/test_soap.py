@@ -5,7 +5,7 @@ import torch._dynamo
 import heavyball
 import heavyball.chainable as C
 from heavyball import utils
-from heavyball.chainable import SkipUpdate
+from heavyball.chainable import _SKIP
 
 
 @pytest.fixture(autouse=True)
@@ -25,14 +25,18 @@ def _state_value(state, fn_name: str, label: str):
     for key, value in state.items():
         if key.startswith(prefix):
             return value
+    for key, value in state.items():
+        if key.startswith("__bucket_") and isinstance(value, dict):
+            for k2, v2 in value.items():
+                if k2.startswith(prefix):
+                    return v2
     raise KeyError(prefix)
 
 
 def _run_initial_call(transform, state_fn, group, tensors, params):
     grads = [t.clone() for t in tensors]
     updates = [t.clone() for t in tensors]
-    with pytest.raises(SkipUpdate):
-        transform(state_fn, group, updates, grads, params)
+    assert transform(state_fn, group, updates, grads, params) is _SKIP
 
 
 def _make_state_fn():
@@ -77,6 +81,7 @@ def test_scale_by_soap_matches_adam():
         "shampoo_beta": 0.95,
         "is_preconditioning": True,
         "betas": (0.9, 0.999),
+        "storage_dtype": "float64",
     }
 
     grad0 = torch.randn_like(params[0])
@@ -93,7 +98,7 @@ def test_scale_by_soap_matches_adam():
     grads = [grad1]
     updates = [grad1.clone()]
 
-    projected = [_project(u, q) for u, q in zip(updates, Q_blocks)]
+    projected = [_project(u.unsqueeze(0), q) for u, q in zip(updates, Q_blocks)]
     expected = utils.adam_(
         exp_avg_before,
         exp_avg_sq_before,
@@ -106,7 +111,7 @@ def test_scale_by_soap_matches_adam():
     expected = [_project_back(p, q) for p, q in zip(expected, Q_blocks)]
 
     result = transform(state_fn, group, updates, grads, params)
-    torch.testing.assert_close(result[0], expected[0])
+    torch.testing.assert_close(result[0], expected[0].squeeze(0))
 
     GG_after = _state_value(param_state, "scale_by_soap", "GG")
     assert any(not torch.allclose(a, b) for a, b in zip(GG_after, GG_before))
@@ -125,6 +130,7 @@ def test_scale_by_soap_laprop_matches_laprop():
         "shampoo_beta": 0.95,
         "is_preconditioning": True,
         "betas": (0.9, 0.999),
+        "storage_dtype": "float64",
     }
 
     grad0 = torch.randn_like(params[0])
@@ -140,7 +146,7 @@ def test_scale_by_soap_laprop_matches_laprop():
     grads = [grad1]
     updates = [grad1.clone()]
 
-    projected = [_project(u, q) for u, q in zip(updates, Q_blocks)]
+    projected = [_project(u.unsqueeze(0), q) for u, q in zip(updates, Q_blocks)]
     expected = utils.laprop_(
         exp_avg_before,
         exp_avg_sq_before,
@@ -152,7 +158,7 @@ def test_scale_by_soap_laprop_matches_laprop():
     expected = [_project_back(p, q) for p, q in zip(expected, Q_blocks)]
 
     result = transform(state_fn, group, updates, grads, params)
-    torch.testing.assert_close(result[0], expected[0])
+    torch.testing.assert_close(result[0], expected[0].squeeze(0))
 
 
 def test_scale_by_soap_ademamix_matches_reference():
@@ -171,6 +177,7 @@ def test_scale_by_soap_ademamix_matches_reference():
         "alpha": 2.0,
         "beta3_warmup": None,
         "alpha_warmup": None,
+        "storage_dtype": "float64",
     }
 
     grad0 = torch.randn_like(params[0])
@@ -187,7 +194,7 @@ def test_scale_by_soap_ademamix_matches_reference():
     grads = [grad1]
     updates = [grad1.clone()]
 
-    projected = [_project(u, q) for u, q in zip(updates, Q_blocks)]
+    projected = [_project(u.unsqueeze(0), q) for u, q in zip(updates, Q_blocks)]
     expected = _ademamix_reference(
         exp_avg_fast_before,
         exp_avg_slow_before,
@@ -203,4 +210,4 @@ def test_scale_by_soap_ademamix_matches_reference():
     expected = [_project_back(p, q) for p, q in zip(expected, Q_blocks)]
 
     result = transform(state_fn, group, updates, grads, params)
-    torch.testing.assert_close(result[0], expected[0])
+    torch.testing.assert_close(result[0], expected[0].squeeze(0))
