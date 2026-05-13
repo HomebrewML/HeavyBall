@@ -1561,9 +1561,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 return {}
             raise KeyError("Tensor has no tracked state.")
         state_param, index = self.mapping_inverse[key]
-        if state_param not in self.state:
-            self.state[state_param] = collections.defaultdict(dict)
-        return self.state[state_param][index]
+        return self.state.setdefault(state_param, {}).setdefault(index, {})
 
     def _init_mapping(self, group: dict | None = None):
         if group is None:

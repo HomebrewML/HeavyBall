@@ -614,3 +614,24 @@ def test_param_ecc_load_order_optimizer_before_model():
     assert p2.isfinite().all()
     del m, o, m2, o2
     clean()
+
+
+@pytest.mark.parametrize("opt_cls", [heavyball.SOAP, heavyball.KLSOAP, heavyball.KLShampoo, heavyball.SOAPNAdam])
+def test_bucket_aware_ecc_multi_step(opt_cls):
+    """Bucket-aware transforms with @zero_guard inside must preserve `::ecc` siblings
+    across steps. Without the fix, step 2 KeyErrors on `vn::ecc` because BucketGuard
+    only re-stacked bare keys from `_val_names`."""
+    set_torch()
+    torch.manual_seed(42)
+    model = nn.Sequential(nn.Linear(16, 8, bias=False), nn.Linear(8, 4, bias=False)).cuda()
+    opt = opt_cls(model.parameters(), lr=1e-3, ecc="bf16+8")
+    x = torch.randn(4, 16, device="cuda")
+    for _ in range(4):
+        model(x).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    for p in model.parameters():
+        st, _ = _ecc_keys(opt, p)
+        assert p.isfinite().all()
+    del model, opt
+    clean()

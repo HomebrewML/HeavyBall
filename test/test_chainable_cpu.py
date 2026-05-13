@@ -125,3 +125,19 @@ def test_needs_gather_flag(opt_name):
         assert not opt._needs_gather, f"{opt_name} should be elementwise (no gather needed)"
     elif opt_name in _EXPECT_GATHER:
         assert opt._needs_gather, f"{opt_name} should require full param gather"
+
+
+def test_state_dict_loadable_weights_only(tmp_path):
+    """state_dict must round-trip through torch.load(weights_only=True): rejects non-tensor
+    objects (_ShapeInfo, defaultdict) and user-supplied callables (update_clipping)."""
+    model = torch.nn.Linear(4, 4)
+    opt = heavyball.PSGDKron(model.parameters(), lr=1e-3, compile_step=False)
+    for _ in range(2):
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    path = tmp_path / "opt.pt"
+    torch.save(opt.state_dict(), path)
+    torch.load(path, weights_only=True)
+
+

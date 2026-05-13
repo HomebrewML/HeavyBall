@@ -4,7 +4,7 @@ import pytest
 import torch
 from lightbench.utils import get_optim
 from torch import nn
-from utils import BUCKET_AWARE_OPTS, REPRESENTATIVE_OPTS
+from utils import REPRESENTATIVE_OPTS
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -92,11 +92,14 @@ def test_foreach(
         cutoff = warmup_runs * iterations
         losses = [loss_list[cutoff:] for loss_list in losses]
 
-    bucket_aware = opt.__name__ in BUCKET_AWARE_OPTS
     for peak_single, peak_multi in zip(*peaks):
-        assert peak_single < peak_multi * (1.01 if bucket_aware else 1.0)
+        assert peak_single < peak_multi, f"{peak_single=} >= {peak_multi=}"
 
-    if bucket_aware or any(k in opt.__name__ for k in ("LRA", "Muon", "Scion")):
+    # Optimizers whose chain consumes per-tensor RNG (randn_like on slab- vs param-sized
+    # tensors) cannot match across multi_tensor modes — bucket draws once for the slab,
+    # per-param loop draws once per param. Verify finite loss instead.
+    rng_divergent = any(k in opt.__name__ for k in ("LRA", "Muon", "Scion", "PSGD", "LATHER", "Shampoo"))
+    if rng_divergent:
         for loss in losses[0] + losses[1]:
             assert torch.isfinite(loss)
         return

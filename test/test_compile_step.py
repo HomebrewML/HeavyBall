@@ -12,6 +12,10 @@ EXTRA_KWARGS = {
     "AdamC": {"max_lr": 0.01},
 }
 
+# Iterative inner ops (Newton-Schulz, eigendecomp) are inherently sensitive to FP op order;
+# compile may fuse/reorder them differently than eager.
+_LOOSE_COMPILE_TOL = {"Muon", "MuonLaProp", "MuonAdamW", "KLSOAP", "KLShampoo", "HeavyKLSOAP", "HeavyKLShampoo"}
+
 
 def _optimizer_params():
     seen = set()
@@ -80,9 +84,10 @@ def test_compile_step_matches_eager(opt_name, opt_cls):
     _run_steps(model_ref, opt_ref)
     _run_steps(model_test, opt_test)
 
+    tol = 1e-2 if opt_name in _LOOSE_COMPILE_TOL else 1e-4
     for p_ref, p_test in zip(model_ref.parameters(), model_test.parameters()):
         diff = (p_ref.data - p_test.data).abs().max().item()
-        assert diff < 1.5e-2, f"compile_step diverged: max_diff={diff}"
+        assert diff < tol, f"compile_step diverged: max_diff={diff}"
 
 
 def _max_warmup(opt):

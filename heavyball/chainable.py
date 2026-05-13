@@ -517,7 +517,7 @@ class BucketGuard(FunctionTransform):
         keys = set()
         for ft in _walk_fns(self.fn):
             keys.update(ft._val_names.values())
-        return keys
+        return keys | {f"{vn}::ecc" for vn in keys}
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         states = state if isinstance(state, list) else [state(p) for p in param]
@@ -536,7 +536,7 @@ class BucketGuard(FunctionTransform):
             fresh, ready = [], []
             for i in indices:
                 (fresh if chain_keys.isdisjoint(states[i]) else ready).append(i)
-            for subgroup, is_fresh in ((fresh, True), (ready, False)):
+            for subgroup in (fresh, ready):
                 if not subgroup:
                     continue
                 n = len(subgroup)
@@ -554,24 +554,17 @@ class BucketGuard(FunctionTransform):
                     corr = corrs[0][None] if n == 1 else torch.stack(corrs, 0)
                     slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
 
-                if is_fresh:
-                    slab_state = {}
-                else:
-                    slab_state = {k: _stack_value([m.get(k) for m in member_states]) for k in chain_keys}
-                    merged_init = set()
-                    for m in member_states:
-                        merged_init |= m.get("is_initialized", set())
-                    if merged_init:
-                        slab_state["is_initialized"] = merged_init
+                slab_state = {
+                    k: v for k in chain_keys
+                    if (v := _stack_value([m.get(k) for m in member_states])) is not None
+                }
+                slab_state["is_initialized"] = set().union(*[m.get("is_initialized") or () for m in member_states])
 
                 result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
 
                 for i_in_sg, m in enumerate(member_states):
                     for k, val in slab_state.items():
-                        if k == "is_initialized":
-                            m.setdefault(k, set()).update(val)
-                        else:
-                            m[k] = _unstack_value(val, i_in_sg, n)
+                        m[k] = _unstack_value(val, i_in_sg, n)
 
                 if result is _SKIP:
                     skip = True
@@ -1622,13 +1615,10 @@ def _update_psgd_pro_precond(
 
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
-    kwargs = {"ea": update, "caution": group["caution"], "grad": grad}
+    kwargs = {"ea": update, "caution": False, "grad": grad}
     if group.get("is_cached", False) and Q_cache[0] is not None:
-        out = utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
-    else:
-        out = utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
-    group["caution"] = False  # we already cautioned here - shouldn't do it again
-    return out
+        return utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
+    return utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
 
 
 def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
@@ -2416,6 +2406,13 @@ class ChainOpt(utils.StatefulOptimizer):
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
 
+    def state_dict(self):
+        sd = super().state_dict()
+        for g in sd["param_groups"]:
+            for k in [k for k in g if k.startswith("_")]:
+                del g[k]
+        return sd
+
     def _init_param_ecc(self):
         for group in self.param_groups:
             self._init_param_ecc_group(group)
@@ -2689,6 +2686,10 @@ class BaseOpt(ChainOpt):
 
         self.compile_step = default(default(compile_step, defaults.pop("compile_step", use_default)), self.compile_step)
         self.promote = default(default(promote, defaults.pop("promote", use_default)), self.promote)
+        # Consumed above to wire fns — drop from defaults so they don't pollute state_dict
+        # (callables are rejected by torch.load weights_only=True).
+        defaults.pop("update_clipping", None)
+        defaults.pop("gradient_clipping", None)
         if default(palm, self.palm):
             fns = (palm_beta2,) + fns
         if default(gradient_clipping, self.gradient_clipping) is not None:
