@@ -1614,13 +1614,15 @@ def _update_psgd_pro_precond(
 
 
 def _cached_psgd_precond_grad(group, update, Q, Q_cache, grad):
+    sqrt = group.get("sqrt", False)
     kwargs = {"ea": update, "caution": False, "grad": grad}
-    if group.get("is_cached", False) and Q_cache[0] is not None:
+    if not sqrt and group.get("is_cached", False) and Q_cache[0] is not None:
         return utils.precond_grad_cached_(cached_q=Q_cache, **kwargs)
-    return utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
+    return utils.psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], sqrt=sqrt, **kwargs)
 
 
 def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
+    sqrt = group.get("sqrt", False)
     kwargs = {
         "ea": update,
         "caution": group["caution"],
@@ -1630,10 +1632,10 @@ def _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache):
         "decay": group["weight_decay"],
         "cautious_decay": group.get("cautious_weight_decay", False),
     }
-    if group.get("is_cached", False) and Q_cache[0] is not None:
+    if not sqrt and group.get("is_cached", False) and Q_cache[0] is not None:
         utils.fused_precond_grad_cached_(cached_q=Q_cache, **kwargs)
     else:
-        utils.fused_psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], **kwargs)
+        utils.fused_psgd_precond_grad(preconds=Q, store_triu_as_line=group["store_triu_as_line"], sqrt=sqrt, **kwargs)
 
 
 def _update_lra(

@@ -82,7 +82,7 @@ Muon, MuonAdamW, MuonLaProp, HyperBallAdamW, OrthoLaProp, LaPropOrtho
 SOAP, SOAPNAdam, SOAPAdEMAMix, SOLP
 
 **PSGD (Kronecker):**
-PSGDKron, LATHER, PSGDPRO
+PSGDKron, LATHER, PSGDPRO, QSGD
 
 **PSGD (Low-Rank):**
 PSGDLRA

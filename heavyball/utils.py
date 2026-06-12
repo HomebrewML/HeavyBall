@@ -3561,12 +3561,17 @@ def psgd_precond_grad(
     caution: bool = False,
     grad: Optional[Tensor] = None,
     store_triu_as_line: bool = False,
+    sqrt: bool = False,
 ):
+    """``sqrt`` applies each Kronecker factor once (Q·ea, the square-root factor of P = QᵀQ that
+    ``calcA`` forms while fitting Q) instead of twice (the full P·ea); see ``QSGD``."""
     if caution:
         ea = _compilable_cautioning(grad, ea)
     if store_triu_as_line:
         preconds = line_to_triu(preconds)
     args = [promote(q) for q in preconds]
+    if sqrt:
+        return compiled_einsum(cached_precond_grad_expr(ndim_tuple(args), ea.ndim), *args, promote(ea))
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
     return compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
 
@@ -3582,13 +3587,10 @@ def _compilable_fused_psgd_precond_grad(
     cautious_decay,
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
+    sqrt: bool = False,
 ):
     precond = psgd_precond_grad(
-        ea,
-        preconds,
-        caution=caution,
-        grad=grad,
-        store_triu_as_line=store_triu_as_line,
+        ea, preconds, caution=caution, grad=grad, store_triu_as_line=store_triu_as_line, sqrt=sqrt
     )
     update_param_(param, precond, lr, decay, caution=False, cautious_decay=cautious_decay)
 
@@ -3603,10 +3605,11 @@ def fused_psgd_precond_grad(
     preconds: TriuOrLine,
     store_triu_as_line: bool = False,
     cautious_decay: bool = False,
+    sqrt: bool = False,
 ):
     lr, decay = scalar_guard(lr, decay, param[0])
     _compilable_fused_psgd_precond_grad(
-        ea, param, lr, grad, decay, caution, cautious_decay, preconds, store_triu_as_line
+        ea, param, lr, grad, decay, caution, cautious_decay, preconds, store_triu_as_line, sqrt
     )
 
 

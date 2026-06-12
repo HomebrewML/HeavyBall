@@ -1370,6 +1370,7 @@ class PSGDBase(C.BaseOpt):
     delayed: bool = False
     cached: bool = False
     exp_avg_input: bool = True
+    sqrt: bool = False  # QSGD: apply Q (the matrix square root of P = QᵀQ) instead of P
 
     def _build_psgd_defaults(
         self, locals_dict, fns, *, default_update_clipping=utils.trust_region_clip_, extra_defaults=None
@@ -1385,6 +1386,8 @@ class PSGDBase(C.BaseOpt):
 
         if extra_defaults:
             defaults.update(extra_defaults)
+        if self.sqrt:  # only QSGD carries the key; everything else is plain PSGD via the .get default
+            defaults["sqrt"] = self.sqrt
 
         super().__init__(
             params,
@@ -1610,6 +1613,34 @@ class PSGDPRO(PSGDBase):
             default_update_clipping=None,
             extra_defaults={"store_triu_as_line": False},
         )
+
+
+class QSGD(PSGDPRO):
+    """
+    QSGD
+
+    PSGDPRO applying the Kronecker factor Q during live preconditioning instead of the full
+    preconditioner P = QᵀQ. Q is learned identically to PSGDPRO — only the applied update changes
+    from P·g = Qᵀ(Q·g) to Q·g. Since QᵀQ = P, ⟨g, P·g⟩ = ‖Q·g‖² exactly. PSGDPRO's PRO/Procrustes
+    update additionally keeps each Q symmetric SPD, so Q ≈ P^½ and the step is ≈ P^½·g — a
+    full-matrix generalization of Adam's √-scaling. Caching the full P (`cached=True`) is a no-op,
+    as a single factor is applied directly. Note: unrelated to "Quantized SGD".
+
+    Sources:
+        PSGD:
+            Preconditioned Stochastic Gradient Descent
+            Xi-Lin Li
+            https://arxiv.org/abs/1512.04202
+            https://github.com/lixilinx/psgd_torch
+
+        HeavyBall:
+            HeavyBall: a compile-first PyTorch optimizer library
+            Lucas Nestler and HomebrewML contributors
+            https://github.com/HomebrewML/HeavyBall
+            https://zenodo.org/records/19824360
+    """
+
+    sqrt: bool = True
 
 
 class PSGDLRA(PSGDBase):
