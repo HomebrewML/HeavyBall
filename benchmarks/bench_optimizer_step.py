@@ -58,14 +58,20 @@ def main(
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
     params = []
+    grads = []
     for dims in shapes:
         param = torch.nn.Parameter(torch.randn(dims, device="cuda", dtype=torch_dtype, generator=gen))
-        param.grad = torch.randn(dims, device="cuda", dtype=torch_dtype, generator=gen)
+        grads.append(torch.randn(dims, device="cuda", dtype=torch_dtype, generator=gen))
         params.append(param)
+
+    def set_grads():
+        for param, grad in zip(params, grads):
+            param.grad = grad
 
     module = heavyball if library is Library.heavyball else torch.optim
     step = getattr(module, optimizer)(params, **kwargs).step
     for _ in range(warmup):
+        set_grads()
         step()
 
     times = []
@@ -73,6 +79,7 @@ def main(
         torch.cuda.synchronize()
         start = perf_counter()
         for _ in range(steps):
+            set_grads()
             step()
         torch.cuda.synchronize()
         times.append((perf_counter() - start) / steps)
