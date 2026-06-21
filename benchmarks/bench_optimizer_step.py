@@ -50,7 +50,7 @@ def main(
 ):
     shapes = DEFAULT_SHAPES if shape is None else tuple(map(parse_shape, shape))
     torch_dtype = getattr(torch, dtype)
-    kwargs = {"compile_step": compile_step} if library is Library.heavyball else {}
+    kwargs = {"compile_step": compile_step, "consume_grad": False} if library is Library.heavyball else {}
     if fused is not None and library is Library.torch:
         kwargs["fused"] = fused
     if update_precond is not None and library is Library.heavyball:
