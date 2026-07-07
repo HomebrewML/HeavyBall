@@ -500,7 +500,11 @@ def set_(dst: Tensor, src: Tensor):
 
 
 def capture_param_shapes(params):
-    """Capture param shapes before FSDP/sharding. Pass as ``orig_shapes=`` to any optimizer."""
+    """Capture param shapes before sharding for non-FSDP parallelism backends.
+
+    Pass as ``orig_shapes=`` to any optimizer. Not needed under FSDP, which
+    auto-detects shapes when ``use_orig_params=True``.
+    """
     if hasattr(params, "parameters"):
         params = params.parameters()
     return {id(p): tuple(p.shape) for p in params}
@@ -1564,6 +1568,18 @@ class StatefulOptimizer(torch.optim.Optimizer):
         state_param, index = self.mapping_inverse[key]
         return self.state.setdefault(state_param, {}).setdefault(index, {})
 
+    def _clear_views(self, p):
+        self.mapping.pop(p, None)
+        for k in [k for k, (pp, _) in self.mapping_inverse.items() if pp is p]:
+            del self.mapping_inverse[k]
+
+    def _set_views(self, p, group):
+        self._clear_views(p)
+        self.mapping[p] = p_views = merge_group(group, p)
+        for i, pv in enumerate(p_views):
+            self.mapping_inverse[_tensor_key(pv)] = (p, i)
+        return p_views
+
     def _init_mapping(self, group: dict | None = None):
         if group is None:
             for group in self.param_groups:
@@ -1572,9 +1588,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
 
         for p in group["params"]:
             if p not in self.mapping:
-                self.mapping[p] = p_views = merge_group(group, p)
-                for i, pv in enumerate(p_views):
-                    self.mapping_inverse[_tensor_key(pv)] = (p, i)
+                self._set_views(p, group)
 
     def split_p_and_g_in_group(
         self,
@@ -1611,9 +1625,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                         break
                 p.data = p.data.contiguous()
 
-            self.mapping[p] = p_views = merge_group(group, p)
-            for i, pv in enumerate(p_views):
-                self.mapping_inverse[_tensor_key(pv)] = (p, i)
+            p_views = self._set_views(p, group)
 
             if state is None:
                 vector = hessian_vector = None
@@ -1810,9 +1822,10 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 if fmt is None:
                     continue
                 tensor = state["tensor"]
-                self.mapping_inverse.pop(_tensor_key(tensor), None)
+                old_entry = self.mapping_inverse.pop(_tensor_key(tensor), None)
                 tensor.data = tensor.data.to(memory_format=fmt)
-                self.mapping_inverse[_tensor_key(tensor)] = (tensor, 0)
+                if old_entry is not None:
+                    self.mapping_inverse[_tensor_key(tensor)] = old_entry
 
     def step(self, closure: Optional[Callable] = None):
         if self.precond_schedule is None:

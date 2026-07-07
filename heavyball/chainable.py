@@ -2048,6 +2048,12 @@ def _detect_orig_shapes(params):
     for param_idx, ((p, orig, total, spi), owner) in enumerate(zip(fsdp_entries, owners)):
         offset = 0 if spi.intra_param_start_idx is None else spi.intra_param_start_idx
         result[id(p)] = _ShapeInfo(orig, offset, total, owner=owner, param_idx=param_idx)
+    if fsdp_ids - result.keys():
+        utils.warn_once(
+            "FSDP parameters detected but original shapes could not be recovered. "
+            "Shape-aware optimizers (SOAP, Muon, PSGD, Scion) will fall back to per-element updates. "
+            "Pass use_orig_params=True to FSDP to enable shape recovery."
+        )
     return result
 
 
@@ -2089,10 +2095,7 @@ def _exchange_fsdp_shards(schedule, bucket_lookup, items, tensor_getter, keep_st
         flat = tensor.reshape(-1)
         bucket_idx = bucket_lookup[info.param_idx]
         device, dtype = schedule[bucket_idx]
-        if flat.device != device or flat.dtype != dtype:
-            raise RuntimeError(
-                f"FSDP bucket mismatch for param {info.param_idx}: expected {(device, dtype)}, got {(flat.device, flat.dtype)}"
-            )
+        flat = flat.to(device=device, dtype=dtype)
         per_bucket[bucket_idx].append((info.owner, info.param_idx, info.offset, flat, shard))
 
     received, states = {}, []
@@ -2261,17 +2264,6 @@ def _reshape_params(params, orig_shapes, gather=True):
 def _restore_params(views, gathers):
     if isinstance(gathers, _FSDPState):
         _restore_fsdp_params(gathers)
-    else:
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        for p, info, shard in gathers:
-            if rank == info.owner:
-                full = p.data.flatten()
-            else:
-                full = shard.new_empty(info.total)
-            torch.distributed.broadcast(full, src=info.owner, group=info.group)
-            shard.copy_(full[info.offset : info.offset + shard.numel()])
-            p.data = shard
-            p.grad = None
     for p, flat in views:
         _view_param(p, flat)
 
@@ -2395,18 +2387,29 @@ class ChainOpt(utils.StatefulOptimizer):
 
     def __init__(self, params, defaults, *fns):
         orig = defaults.pop("orig_shapes", None)
-        self._orig_shapes = (
-            {k: _ShapeInfo(v) if isinstance(v, tuple) else v for k, v in orig.items()} if orig is not None else None
-        )
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
         super().__init__(params, base)
+        self._orig_shapes = self._resolve_orig_shapes(orig)
         self.fns = fns
         self._eager_chain = self._run_chain
         if self.compile_step:
             self._run_chain = torch.compile(self._run_chain, fullgraph=True)
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
+
+    def _resolve_orig_shapes(self, orig):
+        all_params = [p for g in self.param_groups for p in g["params"]]
+        detected = _detect_orig_shapes(all_params)
+        if orig is None:
+            return detected or None
+        user = {k: _ShapeInfo(v) if isinstance(v, tuple) else v for k, v in orig.items()}
+        if detected:
+            utils.warn_once(
+                "orig_shapes was passed but FSDP was detected. "
+                "Ignoring orig_shapes in favor of auto-detection for correct gather/scatter."
+            )
+        return {**user, **detected}
 
     def state_dict(self):
         sd = super().state_dict()
@@ -2428,15 +2431,9 @@ class ChainOpt(utils.StatefulOptimizer):
             if p.dtype != ecc.primary_dtype:
                 fp32 = p.data.float()
                 p.data = p.data.to(ecc.primary_dtype)
-                old_views = self.mapping.pop(p, ())
-                for ov in old_views:
-                    self.mapping_inverse.pop(utils._tensor_key(ov), None)
-            if p not in self.mapping:
-                self.mapping[p] = p_views = utils.merge_group(group, p)
-                for i, pv in enumerate(p_views):
-                    self.mapping_inverse[utils._tensor_key(pv)] = (p, i)
+            p_views = self._set_views(p, group)
             fp32_views = None if fp32 is None else utils.merge_group(group, fp32)
-            for i, pv in enumerate(self.mapping[p]):
+            for i, pv in enumerate(p_views):
                 st = self.state_(pv)
                 if "param::ecc" in st:
                     continue
@@ -2476,11 +2473,7 @@ class ChainOpt(utils.StatefulOptimizer):
                         elif (k + "::ecc") in idx_state:
                             idx_state[k] = v.to(cfg.primary_dtype)
                 if param_ecc is not None and p.dtype != param_ecc.primary_dtype:
-                    orig_key = utils._tensor_key(p)
                     p.data = p.data.to(param_ecc.primary_dtype)
-                    bf16_key = utils._tensor_key(p)
-                    if orig_key in optimizer.mapping_inverse:
-                        optimizer.mapping_inverse[bf16_key] = optimizer.mapping_inverse.pop(orig_key)
             if param_ecc is not None:
                 optimizer._init_param_ecc_group(group)
 
@@ -2518,10 +2511,6 @@ class ChainOpt(utils.StatefulOptimizer):
             )
             group["base_lr"] = group["lr"]
 
-        if self._orig_shapes is None:
-            all_params = [p for g in self.param_groups for p in g["params"]]
-            self._orig_shapes = _detect_orig_shapes(all_params)
-
         views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
         group["_orig_shapes"] = self._orig_shapes
         try:
@@ -2529,34 +2518,35 @@ class ChainOpt(utils.StatefulOptimizer):
         finally:
             _restore_params(views, gathers)
 
+    def _recover_step(self, group):
+        for param in group["params"]:
+            param_state = self.state.get(param)
+            if not isinstance(param_state, dict):
+                continue
+            for idx_state in param_state.values():
+                if isinstance(idx_state, dict) and "step" in idx_state:
+                    return idx_state["step"]
+        return 0
+
     def _step_inner(self, group):
         caution = group["caution"]
 
         vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
 
+        step = group.get("step_count")
+        if step is None:
+            step = self._recover_step(group)
+
         if not vals:
+            group["step_count"] = step + 1
             return
         p, g = zip(*vals)
 
-        step = group.get("_group_step")
-        if step is None:
-            for param in group["params"]:
-                param_state = self.state.get(param)
-                if not isinstance(param_state, dict):
-                    continue
-                for idx_state in param_state.values():
-                    if isinstance(idx_state, dict) and "step" in idx_state:
-                        step = idx_state["step"]
-                        break
-                if step is not None:
-                    break
-            else:
-                step = 0
         if isinstance(step, torch.Tensor):
             step = step.to(device=p[0].device, dtype=torch.int64)
         else:
             step = utils.scalar_guard(step, p[0])
-        group["_group_step"] = group["step"] = step = step + 1
+        group["step_count"] = group["step"] = step = step + 1
         self.state_(p[0])["step"] = step
         group["prev_lr"] = group["lr"] = group["base_lr"] * step / step.clamp(min=group["warmup_steps"] + 1)
         try:
