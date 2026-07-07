@@ -411,7 +411,7 @@ def _view_preserve_ecc(src, target):
     v = src.view_as(target)
     ecc = getattr(src, "_ecc", None)
     if ecc is not None:
-        v._ecc = ecc
+        v._ecc = utils._ULPState(ecc.correction.view_as(v), ecc.smax)
     return v
 
 
@@ -457,18 +457,16 @@ class TagGuard(FunctionTransform):
 def _stack_value(vals):
     """Combine per-member values into one slab value.
 
-    Tensors with ndim >= 1 are concatenated along dim 0 — per-member tensors carry a
-    leading slot dim, so n members yield a size-n batch. Scalars (0-d) are shared. Lists
-    and tuples are recursed element-wise (so `[(shape, tensor), ...]` works). Sets are
+    Tensors are concatenated along dim 0 (0-d scalars are unsqueezed first so each
+    member keeps its own value). Lists and tuples are recursed element-wise. Sets are
     merged. Anything else is taken from the first member.
     """
     first = next((v for v in vals if v is not None), None)
     if first is None:
         return None
     if isinstance(first, Tensor):
-        if first.ndim == 0:
-            return first.clone()
-        return torch.cat([v if isinstance(v, Tensor) else torch.zeros_like(first) for v in vals], 0)
+        ts = [v if isinstance(v, Tensor) else torch.zeros_like(first) for v in vals]
+        return torch.cat([t.unsqueeze(0) if t.ndim == 0 else t for t in ts], 0)
     if isinstance(first, tuple):
         return tuple(_stack_value([v[i] if isinstance(v, tuple) else None for v in vals]) for i in range(len(first)))
     if isinstance(first, list):
@@ -531,7 +529,7 @@ class BucketGuard(FunctionTransform):
             buckets.setdefault(sig, []).append(i)
 
         out = [None] * len(param)
-        skip = False
+        has_output = False
         for indices in buckets.values():
             fresh, ready = [], []
             for i in indices:
@@ -566,7 +564,6 @@ class BucketGuard(FunctionTransform):
                         m[k] = _unstack_value(val, i_in_sg, n)
 
                 if result is _SKIP:
-                    skip = True
                     if n > 1:  # n=1 slab is a view of the original; in-place mods already landed
                         for k, _ in enumerate(subgroup):
                             views[k].copy_(slab_p[k])
@@ -575,13 +572,14 @@ class BucketGuard(FunctionTransform):
                                 e.correction.copy_(slab_p._ecc.correction[k])
                     continue
 
+                has_output = True
                 precond_slab = result[0]
                 for k, i in enumerate(subgroup):
                     out[i] = precond_slab[k]
 
-        if skip:
+        if not has_output:
             return _SKIP
-        return out
+        return [torch.zeros_like(u) if o is None else o for o, u in zip(out, update)]
 
 
 class WarmupGuard(FunctionTransform):

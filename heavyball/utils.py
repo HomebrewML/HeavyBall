@@ -404,6 +404,8 @@ def _nadam_compute_update(
 
     out = []
     for u_, e_, d_, mp_ in zip(update, exp_avg32, denom, mu_product32):
+        if mp_.ndim:
+            mp_ = mp_.reshape(-1, *([1] * (u_.ndim - 1)))
         gw = grad_scale / (one - mp_)
         ew = mu_next_t / (one - mp_ * mu_next_t)
         out.append(u_ / d_ * gw + e_ / d_ * ew)
