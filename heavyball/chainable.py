@@ -559,6 +559,10 @@ class BucketGuard(FunctionTransform):
 
                 result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
 
+                undeclared = slab_state.keys() - chain_keys - {"is_initialized"}
+                if undeclared:
+                    raise RuntimeError(f"Undeclared state keys under BucketGuard: {undeclared}")
+
                 for i_in_sg, m in enumerate(member_states):
                     for k, val in slab_state.items():
                         m[k] = _unstack_value(val, i_in_sg, n)
@@ -584,13 +588,12 @@ class BucketGuard(FunctionTransform):
 
 class WarmupGuard(FunctionTransform):
     def __init__(self, fn, warmup_fns):
-        super().__init__(fn, names=[])
+        super().__init__(fn, names=["warmup"])
         self.warmup_fns = warmup_fns
-        self.warmup_key = None
 
     def _build_val_names(self):
-        super()._build_val_names()
-        self.warmup_key = f"_warmup_{self.transform_idx}"
+        self._val_names = {"warmup": f"_warmup_{self.transform_idx}"}
+        self.warmup_key = self._val_names["warmup"]
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         states = state if isinstance(state, list) else [state(p) for p in param]
