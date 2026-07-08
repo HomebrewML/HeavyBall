@@ -89,7 +89,6 @@ def test_compile_step_matches_eager(opt_name, opt_cls):
         diff = (p_ref.data - p_test.data).abs().max().item()
         assert diff < tol, f"compile_step diverged: max_diff={diff}"
 
-
 def _max_warmup(opt):
     return max((len(ft.warmup_fns) for ft in _walk_fns(opt.fns) if isinstance(ft, WarmupGuard)), default=0)
 

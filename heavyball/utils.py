@@ -19,6 +19,8 @@ from torch.backends import cudnn, opt_einsum
 from torch.nn import functional as F
 from torch.utils._pytree import tree_map
 
+from . import fusions
+
 compile_mode = "max-autotune-no-cudagraphs"
 dynamic = False
 compile_mode_recommended_to_none = None
@@ -84,7 +86,7 @@ def decorator(func):
             return func(*args, **kwargs)
         nonlocal compiled
         if compiled is None:
-            compiled = torch.compile(fullgraph=True, dynamic=dynamic, mode=compile_mode_recommended_to_none)(func)
+            compiled = fusions.compile(func, fullgraph=True, dynamic=dynamic, mode=compile_mode_recommended_to_none)
         return compiled(*args, **kwargs)
 
     return _fn
@@ -99,7 +101,7 @@ def decorator_knowngood(func: Callable, fullgraph: bool = True):
             return func(*args, **kwargs)
         nonlocal compiled
         if compiled is None:
-            compiled = torch.compile(fullgraph=fullgraph, dynamic=dynamic, mode=compile_mode)(func)
+            compiled = fusions.compile(func, fullgraph=fullgraph, dynamic=dynamic, mode=compile_mode)
         return compiled(*args, **kwargs)
 
     return _fn
@@ -1680,7 +1682,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
                 y, param_ema = zip(*[(p.data, self.state_(p)["param_ema"]) for p in active_p])
                 w = beta_debias(1 - self.ema_decay, k + 1)
                 for ema_, y_ in zip(param_ema, y):
-                    ema_.lerp_(y_, w)
+                    copy_stochastic_(ema_, torch.lerp(promote(ema_), promote(y_), w))
 
     def copy_emas_to_params(self):
         with torch.no_grad():
@@ -3043,22 +3045,23 @@ def min_singular_value(
     lambda_max_hat = max_singular_value(A, power_iter=power_iter)
     lambda_upper = lambda_max_hat * safety
 
-    row_norms = A.norm(dim=1)
+    A32 = promote(A)
+    row_norms = A32.norm(dim=1)
     norm, idx = row_norms.min(dim=0)
-    v = A.index_select(0, idx).flatten()
-    v = v + torch.randn_like(v) * torch.finfo(v.dtype).tiny  # break degeneracy if zero row
+    v = A32.index_select(0, idx).flatten()
+    v = v + torch.randn_like(v) * torch.finfo(v.dtype).tiny
 
-    v = v / promote(v.norm().clamp(min=torch.finfo(torch.float32).tiny))
+    v = v / v.norm().clamp(min=torch.finfo(torch.float32).tiny)
     for _ in range(power_iter):
-        v = lambda_upper * v - promote(A.mv(v.to(A.dtype)))
-        v = v / promote(v.norm().clamp(min=torch.finfo(torch.float32).tiny))
-    mu_hat = promote(v) @ (lambda_upper * promote(v) - promote(A.mv(v.to(A.dtype))))
+        v = lambda_upper * v - A32.mv(v)
+        v = v / v.norm().clamp(min=torch.finfo(torch.float32).tiny)
+    mu_hat = v @ (lambda_upper * v - A32.mv(v))
 
     lambda_min_hat = lambda_upper - mu_hat
 
-    mu = A.trace() / n
-    sigma_square = A.square().sum() / n - mu**2
-    approx = mu - (sigma_square / (n - 1)).sqrt()
+    mu = A32.trace() / n
+    sigma_square = (A32.diagonal() - mu).square().sum() / n
+    approx = mu - (sigma_square / (n - 1)).clamp(min=0).sqrt()
 
     return torch.where((~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), approx, lambda_min_hat).squeeze()
 

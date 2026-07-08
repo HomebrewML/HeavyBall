@@ -2394,7 +2394,7 @@ class ChainOpt(utils.StatefulOptimizer):
         self.fns = fns
         self._eager_chain = self._run_chain
         if self.compile_step:
-            self._run_chain = torch.compile(self._run_chain, fullgraph=True)
+            self._run_chain = utils.fusions.compile(self._run_chain, fullgraph=True)
         self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
         self._init_param_ecc()
 
