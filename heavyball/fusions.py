@@ -4,163 +4,87 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from torch.utils._pytree import tree_map
-
 
 aten = torch.ops.aten
 
 
-def _op_targets(op) -> set[Any]:
-    targets = {op}
-    if isinstance(op, torch._ops.OpOverloadPacket):
-        if hasattr(op, "op_overloads"):
-            targets.update(op.op_overloads())
-        else:
-            targets.update(getattr(op, overload) for overload in op.overloads())
-    return targets
+def _overloads(op: Any) -> set:
+    """All overloads of an aten op packet (add -> {add, add.Tensor, add.Scalar})."""
+    ovs = {op}
+    if hasattr(op, "op_overloads"):
+        ovs.update(op.op_overloads())
+    else:
+        ovs.update(getattr(op, o) for o in op.overloads())
+    return ovs
 
 
-_ADD_TARGETS = _op_targets(aten.add)
-_SUB_TARGETS = _op_targets(aten.sub)
-_MUL_TARGETS = _op_targets(aten.mul)
-_RSUB_TARGETS = _op_targets(aten.rsub)
+_ADD = _overloads(aten.add)
+_SUB = _overloads(aten.sub)
+_MUL = _overloads(aten.mul)
+_RSUB = _overloads(aten.rsub)
+_POW = _overloads(aten.pow)
 
 
-def _get_arg(node: torch.fx.Node, index: int, name: str, default: Any = None) -> Any:
-    if len(node.args) > index:
-        return node.args[index]
-    return node.kwargs.get(name, default)
+def _arg(node: torch.fx.Node, i: int, name: str, default: Any = None) -> Any:
+    return node.args[i] if len(node.args) > i else node.kwargs.get(name, default)
 
 
-def _is_float_tensor_node(node: Any) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and isinstance(node.meta.get("val"), torch.Tensor)
-        and node.meta["val"].dtype.is_floating_point
-    )
+def _call(graph: torch.fx.Graph, target: Any, args: tuple, meta: dict,
+          kwargs: dict | None = None) -> torch.fx.Node:
+    n = graph.call_function(target, args, kwargs or {})
+    n.meta.update(meta)
+    return n
 
 
-def _fma_target() -> Callable[..., Any] | None:
-    try:
-        from torch._inductor import inductor_prims
-    except ImportError:
-        return None
-    return getattr(inductor_prims, "fma", None)
+def _is_float_tensor(x: Any) -> bool:
+    v = x.meta.get("val") if isinstance(x, torch.fx.Node) else None
+    return isinstance(v, torch.Tensor) and v.dtype.is_floating_point
 
 
-def _is_mul_operand(x: Any) -> bool:
-    """A usable fma multiply input: a tensor node or a python number.
+# ── 1 - x**y  ->  -expm1(y * log1p(x - 1)) ────────────────────────────────────
 
-    The mul node's own result being float (checked by the caller) guarantees the
-    arithmetic is in the float domain, so an integer operand (promoted by the mul)
-    and a python scalar are both fine -- prims.fma accepts scalar operands.
+def stable_one_minus_pow(graph: torch.fx.Graph) -> int:
+    """Rewrite ``1 - x**y`` (0-d float scalar ``x``) to ``where(x > 0, stable, original)``.
+
+    Exact identity, numerically stable when ``x**y`` is near 1 -- the bias-correction
+    cancellation ``1 - beta**step`` (beta in (0,1)): ~100-1000x smaller fp32 error.
+    The fallback preserves PyTorch pow semantics for bases where the log identity is
+    not valid (negative base, 0**0, etc.).
     """
-    if isinstance(x, torch.fx.Node):
-        return isinstance(x.meta.get("val"), torch.Tensor)
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
-
-
-def _single_user_mul(node: Any) -> tuple[Any, Any] | None:
-    """Match a float-result mul with no other users, returning its operands.
-
-    Operands may be tensor nodes or python scalars; an all-integer mul has an
-    integer result and is rejected by the float-result check, so it stays exact.
-    """
-    if not (isinstance(node, torch.fx.Node) and node.op == "call_function"
-            and node.target in _MUL_TARGETS and len(node.users) == 1
-            and _is_float_tensor_node(node)):
-        return None
-    a, b = _get_arg(node, 0, "input"), _get_arg(node, 1, "other")
-    if _is_mul_operand(a) and _is_mul_operand(b):
-        return a, b
-    return None
-
-
-def _is_addend(x: Any) -> bool:
-    """An operand usable as the fma addend: a float tensor node or a python number."""
-    if isinstance(x, torch.fx.Node):
-        return _is_float_tensor_node(x)
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
-
-
-def _negate(graph: torch.fx.Graph, x: Any) -> Any:
-    """Exact sign flip: aten.neg for a node, arithmetic negation for a scalar."""
-    if isinstance(x, torch.fx.Node):
-        neg = graph.call_function(aten.neg.default, (x,))
-        neg.meta.update(x.meta)
-        return neg
-    return -x
-
-
-def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
-    """Rewrite add/sub/rsub of a product into prims.fma so Inductor emits one tl.fma.
-
-      a*b + c, c + a*b        -> fma(a, b, c)
-      a*b - c                 -> fma(a, b, -c)
-      c - a*b, 1 - a*b        -> fma(-a, b, c)        (rsub: scalar minus product)
-      add(x, y, alpha=k!=1)   -> fma(y, k, x)         (prims.fma takes a scalar)
-
-    Subtraction inserts an exact ``aten.neg`` (or arithmetic negation for a scalar
-    addend), so the fused multiply-add still rounds once. The addend may be a tensor
-    node or a python scalar (e.g. the ``1`` in ``1 - d*lr``); prims.fma accepts scalar
-    operands, so scalar addends fuse without an extra node. Plain ``x +/- y`` with no
-    product is left alone: it already rounds once.
-    """
-    fma = _fma_target()
-    if fma is None:
-        return 0
-
     count = 0
     for node in list(graph.nodes):
-        if node.op != "call_function":
-            continue
-        is_rsub = node.target in _RSUB_TARGETS
-        if node.target in _ADD_TARGETS:
-            sign = 1
-        elif node.target in _SUB_TARGETS:
-            sign = -1
-        elif is_rsub:
-            sign = -1  # rsub(input, alpha) == alpha - input
+        # Match 1 - x**y (the bias-correction cancellation) in either dynamo form.
+        if node.target == torch.ops.aten.rsub.Scalar:
+            if _arg(node, 2, "alpha", 1) != 1:
+                continue
+            c = _arg(node, 1, "other", 1)
+            inner = _arg(node, 0, "input")
+        elif node.target == torch.ops.aten.sub.Tensor:
+            if _arg(node, 2, "alpha", 1) != 1:
+                continue
+            c = _arg(node, 0, "input")
+            inner = _arg(node, 1, "other")
         else:
             continue
-        if not _is_float_tensor_node(node):
+        if c != 1:  # only 1 - x**y has the near-cancellation worth the rewrite
             continue
-
-        if is_rsub:
-            mul = _single_user_mul(_get_arg(node, 0, "input"))
-            if mul is None:
-                continue
-            a, b = mul
-            c = _get_arg(node, 1, "alpha", 1)  # addend, usually the scalar 1
-            negate_a, negate_c = True, False
-        else:
-            alpha = _get_arg(node, 2, "alpha", 1)
-            scale = sign * alpha
-            lhs, rhs = _get_arg(node, 0, "input"), _get_arg(node, 1, "other")
-            lhs_mul = _single_user_mul(lhs)
-            rhs_mul = _single_user_mul(rhs)
-            if rhs_mul and abs(scale) == 1:          # lhs + scale*(a*b)
-                a, b, c = rhs_mul[0], rhs_mul[1], lhs
-                negate_a, negate_c = scale == -1, False
-            elif lhs_mul and abs(scale) == 1:        # a*b + scale*rhs
-                a, b, c = lhs_mul[0], lhs_mul[1], rhs
-                negate_a, negate_c = False, scale == -1
-            elif alpha != 1 and not (lhs_mul or rhs_mul):  # scaled add: x + k*y
-                a, b, c = rhs, scale, lhs
-                negate_a, negate_c = False, False
-            else:
-                continue
-        if not _is_addend(c):
+        if not (isinstance(inner, torch.fx.Node) and inner.op == "call_function"
+                and inner.target in _POW and len(inner.users) == 1):
             continue
-
+        base = _arg(inner, 0, "input")
+        bv = base.meta.get("val") if isinstance(base, torch.fx.Node) else None
+        if not (isinstance(bv, torch.Tensor) and bv.dim() == 0 and bv.dtype.is_floating_point):
+            continue
+        expn = _arg(inner, 1, "exponent")
         with graph.inserting_before(node):
-            if negate_a:
-                a = _negate(graph, a)
-            if negate_c:
-                c = _negate(graph, c)
-            replacement = graph.call_function(fma, (a, b, c))
-            replacement.meta.update(node.meta)
-        node.replace_all_uses_with(replacement)
+            pos = _call(graph, aten.gt.Scalar, (base, 0), {**inner.meta, "val": bv > 0})
+            fallback = _call(graph, aten.sub.Tensor, (1, inner), node.meta)
+            t = _call(graph, aten.sub.Tensor, (base, 1), inner.meta)
+            t = _call(graph, aten.log1p.default, (t,), inner.meta)
+            t = _call(graph, aten.mul.Tensor, (expn, t), inner.meta)
+            stable = _call(graph, aten.neg.default, (_call(graph, aten.expm1.default, (t,), inner.meta),), node.meta)
+            built = _call(graph, aten.where.self, (pos, stable, fallback), node.meta)
+        node.replace_all_uses_with(built)
         graph.erase_node(node)
         count += 1
 
@@ -170,96 +94,141 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
     return count
 
 
-def _is_scalar_node(node: Any) -> bool:
-    """A 0-d float result computed only from 0-d / scalar operands (a pure scalar op).
+# ── 1 - (1 - x) -> x ─────────────────────────────────────────────────────────
 
-    Excludes reductions (tensor -> 0-d): those would need a tensor->fp64 cast, which is
-    a data-movement cost. Placeholders and pointwise ops on 0-d inputs qualify.
+def _one_minus_arg(node: Any) -> Any | None:
+    if not (isinstance(node, torch.fx.Node) and node.op == "call_function"):
+        return None
+    if _arg(node, 2, "alpha", 1) != 1:
+        return None
+    if node.target in _RSUB:
+        return _arg(node, 0, "input") if _arg(node, 1, "other", 1) == 1 else None
+    if node.target in _SUB:
+        return _arg(node, 1, "other") if _arg(node, 0, "input") == 1 else None
+    return None
+
+
+def cancel_double_one_minus(graph: torch.fx.Graph) -> int:
+    count = 0
+    for node in list(graph.nodes):
+        if node.op != "call_function" or not _is_float_tensor(node):
+            continue
+        inner = _one_minus_arg(node)
+        x = _one_minus_arg(inner)
+        if not (isinstance(inner, torch.fx.Node) and len(inner.users) == 1
+                and isinstance(x, torch.fx.Node) and _is_float_tensor(x)):
+            continue
+        node.replace_all_uses_with(x)
+        graph.erase_node(node)
+        count += 1
+
+    if count:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return count
+
+
+# ── mul + add -> fma ──────────────────────────────────────────────────────────
+
+def _is_mul_operand(x: Any) -> bool:
+    """fma multiply input: a tensor node of any dtype (the mul's float result puts the
+    arithmetic in the float domain) or a python scalar."""
+    if isinstance(x, torch.fx.Node):
+        return isinstance(x.meta.get("val"), torch.Tensor)
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _is_addend(x: Any) -> bool:
+    """fma addend: a float tensor node or a python scalar."""
+    if isinstance(x, torch.fx.Node):
+        return _is_float_tensor(x)
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _single_user_mul(node: Any) -> tuple[Any, Any] | None:
+    """A float-result mul with one user; returns its operands, else None.
+
+    An all-integer mul has an integer result and is rejected, so integer arithmetic
+    stays exact.
     """
-    if not isinstance(node, torch.fx.Node):
-        return False
-    val = node.meta.get("val")
-    if not (isinstance(val, torch.Tensor) and val.dim() == 0 and val.dtype.is_floating_point):
-        return False
-    if node.op == "placeholder":
-        return True
-    if node.op != "call_function":
-        return False
-    for arg in node.args:
-        if isinstance(arg, torch.fx.Node):
-            av = arg.meta.get("val")
-            if not (isinstance(av, torch.Tensor) and av.dim() == 0):
-                return False  # consumes a real tensor -> reduction / broadcast, skip
-    return True
+    if not (isinstance(node, torch.fx.Node) and node.op == "call_function"
+            and node.target in _MUL and len(node.users) == 1 and _is_float_tensor(node)):
+        return None
+    a, b = _arg(node, 0, "input"), _arg(node, 1, "other")
+    return (a, b) if _is_mul_operand(a) and _is_mul_operand(b) else None
 
 
-def promote_scalar_ops_to_fp64(graph: torch.fx.Graph) -> int:
-    """Recompute every scalar (0-d float) op in float64, casting back at tensor edges.
+def _neg(graph: torch.fx.Graph, x: Any) -> Any:
+    if isinstance(x, torch.fx.Node):
+        return _call(graph, aten.neg.default, (x,), x.meta)
+    return -x
 
-    Rationale: a 0-d value never moves through HBM, so under a "data movement is the
-    only cost" model, scalar intermediates (bias correction, decay factors, schedules)
-    are free to compute in float64. This removes their float32 cancellation -- e.g.
-    ``1 - beta**step`` loses ~50 ULP at beta=0.999, step=2 in float32, none in float64.
 
-    Mechanism: build a parallel fp64 subgraph for scalar nodes (a placeholder becomes
-    ``.to(fp64)``; an op is reissued with fp64 operands), and splice a downcast back to
-    the original dtype only where a scalar feeds a non-scalar (tensor) user. Tensors
-    therefore never upcast (no extra data movement); the old float32 scalar chain dies.
+def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
+    """Rewrite ``add``/``sub``/``rsub`` of a product into ``prims.fma`` so Inductor
+    emits one ``tl.fma`` (one rounding, deterministic) instead of leaving mul+add
+    fusion to Triton's register-pressure heuristic.
+
+    Each add/sub/rsub is normalized to ``lhs + scale*rhs`` (scale a python scalar).
+    A single-user mul on either side is the product; a scalar ``scale`` with no mul
+    becomes ``fma(rhs, scale, lhs)``. A sign flip negates a scalar operand when free,
+    else a tensor operand.
     """
-    scalar_nodes = [n for n in graph.nodes if _is_scalar_node(n)]
-    if not scalar_nodes:
+    from torch._inductor import inductor_prims
+    fma = getattr(inductor_prims, "fma", None)
+    if fma is None:
         return 0
 
-    fp64_of: dict[torch.fx.Node, torch.fx.Node] = {}
-
-    def fp64(node: torch.fx.Node) -> torch.fx.Node:
-        if node in fp64_of:
-            return fp64_of[node]
-        if node.op == "placeholder":
-            with graph.inserting_after(node):
-                cast = graph.call_function(aten.to.dtype, (node, torch.float64))
-                cast.meta["val"] = node.meta["val"].to(torch.float64)
-            fp64_of[node] = cast
-            return cast
-
-        def promote(x: Any) -> Any:
-            return fp64(x) if (isinstance(x, torch.fx.Node) and _is_scalar_node(x)) else x
-
-        new_args = tree_map(promote, node.args)
-        new_kwargs = {}
-        for key, value in node.kwargs.items():
-            if key == "dtype" and value in (torch.float16, torch.bfloat16, torch.float32):
-                new_kwargs[key] = torch.float64  # constant constructor (full/ones) -> fp64
-            else:
-                new_kwargs[key] = tree_map(promote, value)
-        with graph.inserting_after(node):
-            rep = graph.call_function(node.target, new_args, new_kwargs)
-            rep.meta["val"] = node.meta["val"].to(torch.float64)
-        fp64_of[node] = rep
-        return rep
-
-    downcast_of: dict[torch.fx.Node, torch.fx.Node] = {}
-
-    def downcast(node: torch.fx.Node) -> torch.fx.Node:
-        if node in downcast_of:
-            return downcast_of[node]
-        hi = fp64(node)
-        dtype = node.meta["val"].dtype
-        with graph.inserting_after(hi):
-            cast = graph.call_function(aten.to.dtype, (hi, dtype))
-            cast.meta["val"] = hi.meta["val"].to(dtype)
-        downcast_of[node] = cast
-        return cast
-
     count = 0
-    for node in scalar_nodes:
-        for user in list(node.users):
-            if _is_scalar_node(user):
-                continue  # stays inside the fp64 subgraph via fp64()
-            dc = downcast(node)
-            user.args = tree_map(lambda x: dc if x is node else x, user.args)
-            user.kwargs = tree_map(lambda x: dc if x is node else x, user.kwargs)
-            count += 1
+    for node in list(graph.nodes):
+        if node.op != "call_function" or not _is_float_tensor(node):
+            continue
+        t = node.target
+        if t in _ADD:
+            lhs, rhs, alpha, sgn = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), 1
+        elif t in _SUB:
+            lhs, rhs, alpha, sgn = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), -1
+        elif t in _RSUB:
+            # rsub.Scalar/Tensor(input, other, alpha) = other - alpha*input  (same semantics).
+            rhs, lhs, alpha, sgn = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), -1
+        else:
+            continue
+        if not isinstance(alpha, (int, float)):
+            continue
+        scale = sgn * alpha
+
+        lhs_mul = _single_user_mul(lhs)
+        rhs_mul = _single_user_mul(rhs)
+        flip_product = flip_addend = False
+        if rhs_mul and abs(scale) == 1:
+            a, b, addend = rhs_mul[0], rhs_mul[1], lhs
+            flip_product = scale == -1
+        elif lhs_mul and abs(scale) == 1:
+            a, b, addend = lhs_mul[0], lhs_mul[1], rhs
+            flip_addend = scale == -1
+        elif abs(scale) != 1 and not (lhs_mul or rhs_mul):
+            a, b, addend = rhs, scale, lhs
+            if not _is_mul_operand(a):
+                continue
+        else:
+            continue
+        if not _is_addend(addend):
+            continue
+
+        with graph.inserting_before(node):
+            if flip_product:
+                if not isinstance(a, torch.fx.Node):
+                    a = -a
+                elif not isinstance(b, torch.fx.Node):
+                    b = -b
+                else:
+                    a = _neg(graph, a)
+            if flip_addend:
+                addend = _neg(graph, addend)
+            r = _call(graph, fma, (a, b, addend), node.meta)
+        node.replace_all_uses_with(r)
+        graph.erase_node(node)
+        count += 1
 
     if count:
         graph.eliminate_dead_code()
@@ -268,44 +237,36 @@ def promote_scalar_ops_to_fp64(graph: torch.fx.Graph) -> int:
 
 
 def post_grad_custom_pre_pass(graph: torch.fx.Graph) -> int:
-    return fuse_mul_add_to_fma(graph) + promote_scalar_ops_to_fp64(graph)
+    return stable_one_minus_pow(graph) + cancel_double_one_minus(graph) + fuse_mul_add_to_fma(graph)
 
 
-def _chain_graph_passes(*passes: Callable[[torch.fx.Graph], Any] | None) -> Callable[[torch.fx.Graph], int]:
-    def chained(graph: torch.fx.Graph) -> int:
-        count = 0
-        for graph_pass in passes:
-            if graph_pass is None:
-                continue
-            result = graph_pass(graph)
-            if isinstance(result, int):
-                count += result
-        return count
+def inductor_backend(gm: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any) -> Any:
+    import torch._inductor as inductor
+    import torch._inductor.config as inductor_config
 
-    return chained
-
-
-def _compile_options(mode: str | None, options: dict[str, Any] | None) -> dict[str, Any] | None:
-    merged = {}
+    mode = kwargs.pop("mode", None)
+    options = kwargs.pop("options", None)
+    if kwargs:
+        raise TypeError(f"Unexpected torch.compile backend options: {sorted(kwargs)}")
+    merged: dict[str, Any] = {}
     if mode is not None:
         merged.update(torch._inductor.list_mode_options(mode))
     if options:
         merged.update(options)
-    return merged or None
 
+    prior = inductor_config.post_grad_custom_pre_pass
 
-def inductor_backend(gm: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any) -> Callable[..., Any]:
-    import torch._inductor as inductor
-    import torch._inductor.config as inductor_config
+    def run(graph: torch.fx.Graph) -> int:
+        n = 0
+        for p in (prior, post_grad_custom_pre_pass):
+            if p is None:
+                continue
+            r = p(graph)
+            n += r if isinstance(r, int) else 0
+        return n
 
-    prior_pass = inductor_config.post_grad_custom_pre_pass
-    local_pass = _chain_graph_passes(prior_pass, post_grad_custom_pre_pass)
-    options = _compile_options(kwargs.pop("mode", None), kwargs.pop("options", None))
-    if kwargs:
-        raise TypeError(f"Unexpected torch.compile backend options: {sorted(kwargs)}")
-
-    with inductor_config.patch({"post_grad_custom_pre_pass": local_pass}):
-        return inductor.compile(gm, example_inputs, options=options)
+    with inductor_config.patch({"post_grad_custom_pre_pass": run}):
+        return inductor.compile(gm, example_inputs, options=merged or None)
 
 
 def compile(fn: Callable[..., Any], **kwargs: Any) -> Callable[..., Any]:
