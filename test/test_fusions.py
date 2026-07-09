@@ -71,7 +71,7 @@ def test_cancel_double_one_minus_rewrites_and_runs():
     _exec(lambda x: 1 - (1 - x), fusions.cancel_double_one_minus, (torch.rand(8),))
     gm = make_fx(lambda x: 1 - (1 - x))(torch.rand(8))
     assert fusions.cancel_double_one_minus(gm.graph) == 1
-    assert all(t not in fusions._SUB and t not in fusions._RSUB for t in _targets(gm))
+    assert all(getattr(t, "overloadpacket", t) not in (torch.ops.aten.sub, torch.ops.aten.rsub) for t in _targets(gm))
 
 
 def test_cancel_double_one_minus_skips_integers():
@@ -83,6 +83,39 @@ def test_beta_debias_complement_cancels():
     from heavyball.utils import beta_debias
     gm = make_fx(lambda b, s: 1 - beta_debias(b, s))(torch.tensor(0.9999), torch.tensor(10))
     assert fusions.cancel_double_one_minus(gm.graph) == 1
+
+
+def test_fold_affine_deep_one_minus():
+    _exec(lambda x: 1 - (1 - (1 - (1 - x))), fusions.fold_affine, (torch.rand(8),))
+    gm = make_fx(lambda x: 1 - (1 - (1 - (1 - x))))(torch.rand(8))
+    assert fusions.fold_affine(gm.graph) >= 2
+    assert all(getattr(t, "overloadpacket", t) != torch.ops.aten.rsub for t in _targets(gm))
+
+
+def test_fold_affine_beta_debias_ping_pong():
+    b = torch.tensor(0.9)
+    s = torch.tensor(10)
+
+    def f(b, s):
+        denom = 1 - b ** s
+        ratio = (1 - b) / denom
+        a = 1 - ratio
+        return 1 - a
+
+    _exec(f, fusions.fold_affine, (b, s))
+    gm = make_fx(f)(b, s)
+    fusions.fold_affine(gm.graph)
+    assert sum(1 for t in _targets(gm) if getattr(t, "overloadpacket", t) == torch.ops.aten.rsub) <= 2
+
+
+def test_stable_positive_scalar_skips_pow():
+    gm = make_fx(lambda b, s: 1 - b ** s)(torch.tensor(0.9999), torch.tensor(10))
+    for n in gm.graph.nodes:
+        if n.op == "placeholder" and n.name == "b_1":
+            n.meta["val"] = torch.tensor(0.9999)
+    fusions.stable_one_minus_pow(gm.graph)
+    assert torch.ops.aten.pow.Tensor_Tensor not in _targets(gm)
+    assert torch.ops.aten.where.self not in _targets(gm)
 
 
 # ── FMA fusion ───────────────────────────────────────────────────────────────
@@ -139,6 +172,28 @@ def test_fma_rsub_scalar_alpha_is_exact():
 
 
 # ── Integration: beta_debias correctness ─────────────────────────────────────
+
+def test_post_grad_debias_graph():
+    from heavyball.utils import beta_debias
+
+    b1, b2, s = torch.tensor(0.9), torch.tensor(0.999), torch.tensor(10)
+    gm = make_fx(lambda b1, b2, s: (beta_debias(b1, s), beta_debias(b2, s), 1 - beta_debias(b1, s)))(b1, b2, s)
+    fusions.post_grad_custom_pre_pass(gm.graph)
+    gm.recompile()
+    out = gm(b1, b2, s)
+    ref = (beta_debias(b1, s), beta_debias(b2, s), 1 - beta_debias(b1, s))
+    for a, b in zip(out, ref):
+        assert torch.allclose(a, b, rtol=1e-5, atol=1e-6)
+
+
+def test_fold_affine_skips_dynamic_alpha():
+    g = torch.fx.Graph()
+    a, b, alpha = g.placeholder("a"), g.placeholder("b"), g.placeholder("alpha")
+    add = g.call_function(torch.ops.aten.add.Tensor, (a, b), {"alpha": alpha})
+    g.output(add)
+    gm = torch.fx.GraphModule({}, g)
+    assert fusions.fold_affine(gm.graph) == 0
+
 
 def test_beta_zero_stays_exact():
     from heavyball.utils import beta_debias

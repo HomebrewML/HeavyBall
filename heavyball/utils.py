@@ -337,7 +337,9 @@ def _compute_ademamix_hparams(
 
 
 def beta_debias(beta, step):
-    return 1 - (1 - beta) / (1 - beta**step)
+    if isinstance(beta, torch.Tensor):
+        return 1 - (1 - beta) / (-torch.expm1(step * torch.log1p(beta - 1)))
+    return 1 - (1 - beta) / (1 - beta ** step)
 
 
 def _nadam_moments(beta1: Tensor, step: Tensor, momentum_decay: float) -> tuple[Tensor, Tensor]:
