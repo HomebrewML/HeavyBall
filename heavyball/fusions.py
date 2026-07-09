@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -7,18 +8,28 @@ import torch
 
 aten = torch.ops.aten
 
+# Functional overloads only; this excludes out= and rounding-mode division.
+_ADD = (aten.add.Tensor, aten.add.Scalar)
+_SUB = (aten.sub.Tensor, aten.sub.Scalar)
+_RSUB = (aten.rsub.Tensor, aten.rsub.Scalar)
+_MUL = (aten.mul.Tensor, aten.mul.Scalar)
+_DIV = (aten.div.Tensor, aten.div.Scalar)
+_LINEAR = _ADD + _SUB + _RSUB
+_ELEMENTWISE = _LINEAR + _MUL + _DIV + (aten.neg.default,)
+_POINTWISE_TAG = getattr(getattr(torch, "Tag", None), "pointwise", None)
+_SEEDED_TAG = getattr(getattr(torch, "Tag", None), "nondeterministic_seeded", None)
+
 
 def _arg(node: torch.fx.Node, index: int, name: str, default: Any = None) -> Any:
     return node.args[index] if len(node.args) > index else node.kwargs.get(name, default)
 
 
-def _match(target: Any, *packets: Any) -> bool:
-    packet = getattr(target, "overloadpacket", target)
-    return packet in packets
+def _schema(node: torch.fx.Node) -> Any:
+    return getattr(node.target, "_schema", None) if node.op == "call_function" else None
 
 
-def _call(graph: torch.fx.Graph, target: Any, args: tuple, meta: dict, kwargs: dict | None = None) -> torch.fx.Node:
-    node = graph.call_function(target, args, kwargs or {})
+def _call(graph: torch.fx.Graph, target: Any, args: tuple, meta: dict) -> torch.fx.Node:
+    node = graph.call_function(target, args)
     node.meta.update(meta)
     return node
 
@@ -28,105 +39,26 @@ def _is_float_tensor(x: Any) -> bool:
     return isinstance(v, torch.Tensor) and v.dtype.is_floating_point
 
 
+def _number(x: Any) -> int | float | None:
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
 def _scalar(x: Any) -> float | None:
-    if isinstance(x, bool):
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, torch.fx.Node):
-        value = x.meta.get("val")
-        if isinstance(value, torch.Tensor) and value.dim() == 0 and value.dtype.is_floating_point:
-            from torch._subclasses.fake_tensor import FakeTensor
-            if not isinstance(value, FakeTensor):
-                try:
-                    return float(value.item())
-                except Exception:
-                    return None
-    return None
+    value = _number(x)
+    return float(value) if value is not None else None
 
 
-@dataclass(frozen=True)
-class Affine:
-    base: Any
-    a: float
-    b: float
-
-    def is_const(self) -> bool:
-        return self.base is None
-
-
-def _affine_add(lhs: Affine, rhs: Affine, scale: float = 1.0) -> Affine | None:
-    ra, rb = rhs.a * scale, rhs.b * scale
-    if lhs.is_const() and rhs.is_const():
-        return Affine(None, 0.0, lhs.b + rb)
-    if lhs.is_const():
-        return Affine(rhs.base, ra, rb + lhs.b)
-    if rhs.is_const():
-        return Affine(lhs.base, lhs.a, lhs.b + rb)
-    if lhs.base is rhs.base:
-        return Affine(lhs.base, lhs.a + ra, lhs.b + rb)
-    return None
-
-
-def _affine_leaf(node: torch.fx.Node) -> Affine | None:
-    return Affine(node, 1.0, 0.0) if _is_float_tensor(node) else None
-
-
-def _affine_of(node: Any, cache: dict[Any, Affine | None]) -> Affine | None:
-    if not isinstance(node, torch.fx.Node):
-        value = _scalar(node)
-        return Affine(None, 0.0, value) if value is not None else None
-    if node in cache:
-        return cache[node]
-    cache[node] = None
-    if node.op == "placeholder":
-        aff = _affine_leaf(node)
-        cache[node] = aff
-        return aff
-    if node.op != "call_function" or not _is_float_tensor(node):
-        return None
-    aff: Affine | None = None
+def _scaled_add_args(node: torch.fx.Node) -> tuple[Any, Any, int | float] | None:
     target = node.target
-    if _match(target, aten.add):
-        alpha = _arg(node, 2, "alpha", 1)
-        if isinstance(alpha, (int, float)):
-            left = _affine_of(_arg(node, 0, "input"), cache)
-            right = _affine_of(_arg(node, 1, "other"), cache)
-            if left and right:
-                aff = _affine_add(left, right, alpha)
-    elif _match(target, aten.sub):
-        alpha = _arg(node, 2, "alpha", 1)
-        if isinstance(alpha, (int, float)):
-            left = _affine_of(_arg(node, 0, "input"), cache)
-            right = _affine_of(_arg(node, 1, "other"), cache)
-            if left and right:
-                aff = _affine_add(left, right, -alpha)
-    elif _match(target, aten.rsub):
-        alpha = _arg(node, 2, "alpha", 1)
-        if isinstance(alpha, (int, float)):
-            left = _affine_of(_arg(node, 0, "input"), cache)
-            right = _affine_of(_arg(node, 1, "other"), cache)
-            if left and right:
-                aff = _affine_add(right, left, -alpha)
-    elif _match(target, aten.mul):
-        left, right = _arg(node, 0, "input"), _arg(node, 1, "other")
-        left_scalar, right_scalar = _scalar(left), _scalar(right)
-        if left_scalar is not None:
-            inner = _affine_of(right, cache)
-            if inner:
-                aff = Affine(inner.base, inner.a * left_scalar, inner.b * left_scalar)
-        elif right_scalar is not None:
-            inner = _affine_of(left, cache)
-            if inner:
-                aff = Affine(inner.base, inner.a * right_scalar, inner.b * right_scalar)
-    elif target == aten.neg.default:
-        inner = _affine_of(_arg(node, 0, "input"), cache)
-        if inner:
-            aff = Affine(inner.base, -inner.a, -inner.b)
-    else:
-        aff = _affine_leaf(node)
-    cache[node] = aff
-    return aff
+    if target not in _LINEAR:
+        return None
+    alpha = _number(_arg(node, 2, "alpha", 1))
+    if alpha is None:
+        return None
+    left, right = _arg(node, 0, "input"), _arg(node, 1, "other")
+    if target in _RSUB:
+        left, right = right, left
+    return left, right, alpha if target in _ADD else -alpha
 
 
 def _fma() -> Any:
@@ -134,111 +66,217 @@ def _fma() -> Any:
     return getattr(inductor_prims, "fma", None)
 
 
+@dataclass(frozen=True)
+class Affine:
+    base: torch.fx.Node | None
+    a: float
+    b: float
+    depth: int = 0
+
+
+def _affine_add(lhs: Affine, rhs: Affine, scale: int | float = 1) -> Affine | None:
+    ra, rb = rhs.a * scale, rhs.b * scale
+    depth = max(lhs.depth, rhs.depth) + 1
+    if lhs.base is None:
+        return Affine(rhs.base, ra, rb + lhs.b, depth)
+    if rhs.base is None:
+        return Affine(lhs.base, lhs.a, lhs.b + rb, depth)
+    if lhs.base is rhs.base:
+        return Affine(lhs.base, lhs.a + ra, lhs.b + rb, depth)
+    return None
+
+
+def _affine_leaf(node: torch.fx.Node) -> Affine | None:
+    return Affine(node, 1.0, 0.0) if _is_float_tensor(node) else None
+
+
+def _scale_affine(affine: Affine, scale: int | float) -> Affine:
+    return Affine(affine.base, affine.a * scale, affine.b * scale, affine.depth + 1)
+
+
+def _fresh(node: torch.fx.Node) -> bool:
+    schema = _schema(node)
+    tags = getattr(node.target, "tags", ())
+    return schema is not None and schema.returns and not node.is_impure() and _SEEDED_TAG not in tags and all(
+        ret.alias_info is None for ret in schema.returns
+    ) and (
+        node.target in _ELEMENTWISE or _POINTWISE_TAG in tags or node.target == _fma()
+    )
+
+
+def _barrier(node: torch.fx.Node) -> bool:
+    return not _fresh(node) if node.op == "call_function" else node.op in {"call_method", "call_module"}
+
+
+def _epochs(graph: torch.fx.Graph) -> dict[torch.fx.Node, int]:
+    epoch = 0
+    result = {}
+    for node in graph.nodes:
+        result[node] = epoch
+        epoch += _barrier(node)
+    return result
+
+
+def _can_elide(node: torch.fx.Node, epochs: dict[torch.fx.Node, int], epoch: int) -> bool:
+    return all(epochs.get(user, epoch) == epoch and _fresh(user) for user in node.users)
+
+
+def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
+               epochs: dict[torch.fx.Node, int], epoch: int) -> Affine | None:
+    if not isinstance(node, torch.fx.Node):
+        value = _scalar(node)
+        return Affine(None, 0.0, value) if value is not None else None
+    key = node, epoch
+    if key in cache:
+        return cache[key]
+    cache[key] = None
+    if epochs.get(node, epoch) != epoch:
+        affine = _affine_leaf(node)
+        cache[key] = affine
+        return affine
+    if node.op == "placeholder":
+        aff = _affine_leaf(node)
+        cache[key] = aff
+        return aff
+    if node.op != "call_function" or not _is_float_tensor(node):
+        return None
+    aff: Affine | None = None
+    args = _scaled_add_args(node)
+    target = node.target
+    if args is not None:
+        left, right, scale = args
+        left = _affine_of(left, cache, epochs, epoch)
+        right = _affine_of(right, cache, epochs, epoch)
+        if left and right:
+            aff = _affine_add(left, right, scale)
+    elif target in _MUL:
+        left, right = _arg(node, 0, "input"), _arg(node, 1, "other")
+        scale, inner_node = _scalar(left), right
+        if scale is None:
+            scale, inner_node = _scalar(right), left
+        if scale is not None:
+            inner = _affine_of(inner_node, cache, epochs, epoch)
+            if inner:
+                aff = _scale_affine(inner, scale)
+    elif target in _DIV:
+        scale = _scalar(_arg(node, 1, "other"))
+        if scale is not None and scale != 0:
+            inner = _affine_of(_arg(node, 0, "input"), cache, epochs, epoch)
+            if inner:
+                aff = _scale_affine(inner, 1.0 / scale)
+    elif target == aten.neg.default:
+        inner = _affine_of(_arg(node, 0, "input"), cache, epochs, epoch)
+        if inner:
+            aff = _scale_affine(inner, -1.0)
+    if aff is None:
+        aff = _affine_leaf(node)
+    cache[key] = aff
+    return aff
+
+
+def _emit_affine(graph: torch.fx.Graph, affine: Affine, meta: dict,
+                 epochs: dict[torch.fx.Node, int], epoch: int) -> Any:
+    def emit(target: Any, args: tuple) -> torch.fx.Node:
+        node = _call(graph, target, args, meta)
+        epochs[node] = epoch
+        return node
+
+    base = affine.base
+    if affine.b == 0.0:
+        return emit(aten.mul.Tensor, (base, affine.a))
+    if affine.a == 1.0:
+        return emit(aten.add.Tensor, (base, affine.b))
+    scaled = emit(aten.mul.Tensor, (base, affine.a))
+    return emit(aten.add.Tensor, (scaled, affine.b))
+
+
+def _survives_cast(value: float, dtype: torch.dtype) -> bool:
+    if not math.isfinite(value):
+        return False
+    try:
+        cast = torch.tensor(value, dtype=dtype, device="cpu").item()
+    except (OverflowError, RuntimeError):
+        return False
+    return math.isfinite(cast) and (value == 0.0 or cast != 0.0)
+
+
+def _representable(affine: Affine, node: torch.fx.Node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and all(_survives_cast(x, value.dtype) for x in (affine.a, affine.b))
+
+
+def _finalize(graph: torch.fx.Graph, count: int) -> int:
+    if count:
+        graph.eliminate_dead_code(lambda node: node.op != "call_function" or not _fresh(node))
+        graph.lint()
+    return count
+
+
 def fold_affine(graph: torch.fx.Graph) -> int:
-    seen: dict[tuple[int | None, float, float], torch.fx.Node] = {}
-    cache: dict[Any, Affine | None] = {}
+    epochs = _epochs(graph)
+    fma = _fma() is not None
+    seen: dict[tuple[torch.fx.Node, str, str], torch.fx.Node] = {}
+    cache: dict[tuple[torch.fx.Node, int], Affine | None] = {}
     count = 0
-    for node in list(graph.nodes):
+    epoch = -1
+    for node, node_epoch in tuple(epochs.items()):
+        if node_epoch != epoch:
+            seen.clear()
+            epoch = node_epoch
         if node.op != "call_function" or not _is_float_tensor(node):
             continue
-        affine = _affine_of(node, cache)
-        if affine is None or affine.is_const():
+        affine = _affine_of(node, cache, epochs, epoch)
+        if affine is None or affine.base is None or not _representable(affine, node):
             continue
-        if affine.a == 1.0 and affine.b == 0.0 and isinstance(affine.base, torch.fx.Node):
-            if affine.base is not node:
+
+        key = affine.base, affine.a.hex(), affine.b.hex()
+        if affine.a == 1.0 and affine.b == 0.0:
+            if affine.base is not node and _can_elide(node, epochs, epoch):
                 node.replace_all_uses_with(affine.base)
                 graph.erase_node(node)
                 count += 1
             continue
-        key = (id(affine.base) if affine.base is not None else None, affine.a, affine.b)
+
         rep = seen.get(key)
-        if rep is not None:
+        if rep is not None and _can_elide(node, epochs, epoch) and _can_elide(rep, epochs, epoch):
             node.replace_all_uses_with(rep)
             graph.erase_node(node)
             count += 1
-        else:
-            seen[key] = node
-    if count:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return count
-
-
-def _one_minus_inner(node: Any) -> Any | None:
-    if not (isinstance(node, torch.fx.Node) and node.op == "call_function"):
-        return None
-    if _arg(node, 2, "alpha", 1) != 1:
-        return None
-    if _match(node.target, aten.rsub):
-        return _arg(node, 0, "input") if _arg(node, 1, "other", 1) == 1 else None
-    if _match(node.target, aten.sub):
-        return _arg(node, 1, "other") if _arg(node, 0, "input") == 1 else None
-    return None
-
-
-def _build_stable_one_minus(graph: torch.fx.Graph, base: Any, exponent: Any, inner: torch.fx.Node,
-        outer: torch.fx.Node) -> torch.fx.Node:
-    one_minus_base = _call(graph, aten.sub.Tensor, (base, 1), inner.meta)
-    log1p = _call(graph, aten.log1p.default, (one_minus_base,), inner.meta)
-    scaled = _call(graph, aten.mul.Tensor, (exponent, log1p), inner.meta)
-    expm1 = _call(graph, aten.expm1.default, (scaled,), inner.meta)
-    return _call(graph, aten.neg.default, (expm1,), outer.meta)
-
-
-def stable_one_minus_pow(graph: torch.fx.Graph) -> int:
-    count = 0
-    for node in list(graph.nodes):
-        inner = _one_minus_inner(node)
-        if inner is None:
             continue
-        if not (isinstance(inner, torch.fx.Node) and inner.op == "call_function" and _match(inner.target,
-                                                                                            aten.pow) and len(
-            inner.users) == 1):
+
+        cost = 1 if fma or affine.a == 1.0 or affine.b == 0.0 else 2
+        if affine.depth > cost:
+            with graph.inserting_before(node):
+                built = _emit_affine(graph, affine, node.meta, epochs, epoch)
+            node.replace_all_uses_with(built)
+            graph.erase_node(node)
+            count += 1
+            seen[key] = built
             continue
-        base = _arg(inner, 0, "input")
-        base_value = base.meta.get("val") if isinstance(base, torch.fx.Node) else None
-        if not (isinstance(base_value, torch.Tensor) and base_value.dim() == 0 and base_value.dtype.is_floating_point):
-            continue
-        exponent = _arg(inner, 1, "exponent")
-        base_scalar = _scalar(base)
-        with graph.inserting_before(node):
-            if base_scalar is not None and base_scalar > 0:
-                built = _build_stable_one_minus(graph, base, exponent, inner, node)
-            elif base_scalar is not None:
-                built = _call(graph, aten.sub.Tensor, (1, inner), node.meta)
-            else:
-                positive = _call(graph, aten.gt.Scalar, (base, 0), {**inner.meta, "val": base_value > 0})
-                stable = _build_stable_one_minus(graph, base, exponent, inner, node)
-                fallback = _call(graph, aten.sub.Tensor, (1, inner), node.meta)
-                built = _call(graph, aten.where.self, (positive, stable, fallback), node.meta)
-        node.replace_all_uses_with(built)
-        graph.erase_node(node)
-        count += 1
-    if count:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return count
+
+        seen[key] = node
+
+    return _finalize(graph, count)
 
 
-def cancel_double_one_minus(graph: torch.fx.Graph) -> int:
-    return fold_affine(graph)
+cancel_double_one_minus = fold_affine
 
 
 def _is_mul_operand(x: Any) -> bool:
     if isinstance(x, torch.fx.Node):
         return isinstance(x.meta.get("val"), torch.Tensor)
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+    return _number(x) is not None
 
 
 def _is_addend(x: Any) -> bool:
     if isinstance(x, torch.fx.Node):
         return _is_float_tensor(x)
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+    return _number(x) is not None
 
 
-def _single_user_mul(node: Any) -> tuple[Any, Any] | None:
-    if not (isinstance(node, torch.fx.Node) and node.op == "call_function" and _match(node.target, aten.mul) and len(
-        node.users) == 1 and _is_float_tensor(node)):
+def _single_user_mul(node: Any, epochs: dict[torch.fx.Node, int], epoch: int) -> tuple[Any, Any] | None:
+    if not (isinstance(node, torch.fx.Node) and node.op == "call_function" and node.target in _MUL and len(
+            node.users) == 1 and _is_float_tensor(node) and epochs.get(node, epoch) == epoch):
         return None
     a, b = _arg(node, 0, "input"), _arg(node, 1, "other")
     return (a, b) if _is_mul_operand(a) and _is_mul_operand(b) else None
@@ -252,66 +290,59 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
     fma = _fma()
     if fma is None:
         return 0
+    epochs = _epochs(graph)
     count = 0
-    for node in list(graph.nodes):
+    for node, epoch in epochs.items():
         if node.op != "call_function" or not _is_float_tensor(node):
             continue
-        target = node.target
-        if _match(target, aten.add):
-            lhs, rhs, alpha, sign = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), 1
-        elif _match(target, aten.sub):
-            lhs, rhs, alpha, sign = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), -1
-        elif _match(target, aten.rsub):
-            rhs, lhs, alpha, sign = _arg(node, 0, "input"), _arg(node, 1, "other"), _arg(node, 2, "alpha", 1), -1
-        else:
+        args = _scaled_add_args(node)
+        if args is None:
             continue
-        if not isinstance(alpha, (int, float)):
-            continue
-        scale = sign * alpha
+        lhs, rhs, scale = args
 
-        lhs_mul = _single_user_mul(lhs)
-        rhs_mul = _single_user_mul(rhs)
-        if rhs_mul and abs(scale) == 1:
-            product_a, product_b, addend = rhs_mul[0], rhs_mul[1], lhs
-            flip_product = scale == -1
-            flip_addend = False
-        elif lhs_mul and abs(scale) == 1:
-            product_a, product_b, addend = lhs_mul[0], lhs_mul[1], rhs
-            flip_product = False
-            flip_addend = scale == -1
-        elif abs(scale) != 1 and not (lhs_mul or rhs_mul):
+        if abs(scale) != 1:
             product_a, product_b, addend = rhs, scale, lhs
             flip_product = False
             flip_addend = False
-            if not _is_mul_operand(product_a):
+            if not _is_float_tensor(product_a) or product_a.meta["val"].dtype != node.meta["val"].dtype:
                 continue
         else:
-            continue
+            lhs_mul = _single_user_mul(lhs, epochs, epoch)
+            rhs_mul = _single_user_mul(rhs, epochs, epoch)
+            if lhs is rhs:
+                lhs_mul = rhs_mul = None
+            if rhs_mul:
+                product_a, product_b, addend = rhs_mul[0], rhs_mul[1], lhs
+                flip_product = scale == -1
+                flip_addend = False
+            elif lhs_mul:
+                product_a, product_b, addend = lhs_mul[0], lhs_mul[1], rhs
+                flip_product = False
+                flip_addend = scale == -1
+            else:
+                continue
         if not _is_addend(addend):
             continue
+        if flip_product:
+            if isinstance(product_a, torch.fx.Node) and not _is_float_tensor(product_a):
+                product_a, product_b = product_b, product_a
+            if isinstance(product_a, torch.fx.Node) and not _is_float_tensor(product_a):
+                continue
 
         with graph.inserting_before(node):
             if flip_product:
-                if not isinstance(product_a, torch.fx.Node):
-                    product_a = -product_a
-                elif not isinstance(product_b, torch.fx.Node):
-                    product_b = -product_b
-                else:
-                    product_a = _neg(graph, product_a)
+                product_a = _neg(graph, product_a)
             if flip_addend:
                 addend = _neg(graph, addend)
             result = _call(graph, fma, (product_a, product_b, addend), node.meta)
         node.replace_all_uses_with(result)
         graph.erase_node(node)
         count += 1
-    if count:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return count
+    return _finalize(graph, count)
 
 
 def post_grad_custom_pre_pass(graph: torch.fx.Graph) -> int:
-    return stable_one_minus_pow(graph) + fold_affine(graph) + fuse_mul_add_to_fma(graph)
+    return fold_affine(graph) + fuse_mul_add_to_fma(graph)
 
 
 def inductor_backend(graph_module: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any) -> Any:
