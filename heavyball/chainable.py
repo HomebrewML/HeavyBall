@@ -1038,7 +1038,7 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
-    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float32) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
@@ -1060,7 +1060,7 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
         tmp.get("vector"),
         dtype=getattr(torch, group["q_dtype"]),
     )
-    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float32) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
     _update_psgd_precond(
@@ -1093,7 +1093,7 @@ def _init_psgd_pro_kron(state, group, update, grad, param, cached: bool = False,
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = Q
-    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float32) for q in Q]
     state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return

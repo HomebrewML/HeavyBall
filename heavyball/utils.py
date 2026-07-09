@@ -3093,6 +3093,7 @@ def _update_lb(ell: Tensor, lb_state: Tensor, beta: Tensor) -> Tensor:
     ell = promote(ell)
     ell = ell.maximum(promote(lb_state) + (ell - promote(lb_state)) * (1 - beta))
     copy_stochastic_(lb_state, ell)
+    ell = ell.float()
     return ell
 
 
