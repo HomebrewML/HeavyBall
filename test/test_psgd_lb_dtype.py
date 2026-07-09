@@ -51,6 +51,19 @@ def test_psgd_convergence_fp32_lb(opt_cls, lr, extra_kw):
     clean()
 
 
+def _check_no_fp64(obj, path=""):
+    if isinstance(obj, torch.Tensor) and obj.is_floating_point():
+        if "step" in path:
+            return
+        assert obj.dtype != torch.float64, f"fp64 tensor at {path}: dtype={obj.dtype}"
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _check_no_fp64(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _check_no_fp64(v, f"{path}[{i}]")
+
+
 @pytest.mark.parametrize("opt_cls,lr,extra_kw", _PSGD_OPTIMIZERS, ids=[t[0].__name__ for t in _PSGD_OPTIMIZERS])
 def test_psgd_no_fp64_in_state(opt_cls, lr, extra_kw):
     set_torch()
@@ -65,20 +78,7 @@ def test_psgd_no_fp64_in_state(opt_cls, lr, extra_kw):
     _train(model, opt, data, target, 5)
 
     for param in model.parameters():
-        state = opt.state[param]
-        for key, val in state.items():
-            if isinstance(val, torch.Tensor) and val.is_floating_point():
-                if key == "step":
-                    continue
-                assert val.dtype != torch.float64, (
-                    f"fp64 tensor found in optimizer state: key={key!r}, dtype={val.dtype}"
-                )
-            if isinstance(val, list):
-                for i, v in enumerate(val):
-                    if isinstance(v, torch.Tensor) and v.is_floating_point():
-                        assert v.dtype != torch.float64, (
-                            f"fp64 tensor found in optimizer state: key={key!r}[{i}], dtype={v.dtype}"
-                        )
+        _check_no_fp64(opt.state[param])
 
     del model, opt
     clean()
