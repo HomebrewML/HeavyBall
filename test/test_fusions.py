@@ -24,11 +24,10 @@ def _exec(fn, pass_fn, args):
     assert torch.allclose(ref, out, rtol=1e-5, atol=1e-6), f"\n  eager {ref}\n  pass  {out}"
 
 
-def test_cancel_double_one_minus_rewrites_and_runs():
+def test_cancel_double_one_minus_stays_opaque():
     _exec(lambda x: (1 - (1 - x)) * 2, fusions.cancel_double_one_minus, (torch.rand(8),))
     gm = make_fx(lambda x: (1 - (1 - x)) * 2)(torch.rand(8))
-    assert fusions.cancel_double_one_minus(gm.graph) == 1
-    assert all(getattr(t, "overloadpacket", t) not in (torch.ops.aten.sub, torch.ops.aten.rsub) for t in _targets(gm))
+    assert fusions.cancel_double_one_minus(gm.graph) == 0
 
 
 def test_cancel_double_one_minus_preserves_output_storage():
@@ -49,11 +48,35 @@ def test_beta_debias_complement_cancels():
     assert fusions.cancel_double_one_minus(gm.graph) == 1
 
 
-def test_fold_affine_deep_one_minus():
+def test_fold_affine_deep_one_minus_stays_opaque():
     _exec(lambda x: (1 - (1 - (1 - (1 - x)))) * 2, fusions.fold_affine, (torch.rand(8),))
     gm = make_fx(lambda x: (1 - (1 - (1 - (1 - x)))) * 2)(torch.rand(8))
-    assert fusions.fold_affine(gm.graph) >= 2
-    assert all(getattr(t, "overloadpacket", t) != torch.ops.aten.rsub for t in _targets(gm))
+    assert fusions.fold_affine(gm.graph) == 0
+
+
+@pytest.mark.parametrize(
+    "fn,value",
+    [
+        (lambda x: torch.signbit((1 - (1 - x)) * 2), -0.0),
+        (lambda x: torch.signbit((x + -x) * 2), -1.0),
+    ],
+)
+def test_fold_affine_preserves_signed_zero(fn, value):
+    x = torch.tensor(value)
+    gm = make_fx(fn)(x)
+    expected = gm(x)
+    fusions.fold_affine(gm.graph)
+    gm.recompile()
+    assert torch.equal(gm(x), expected)
+
+
+def test_post_grad_affine_preserves_signed_zero():
+    x = torch.tensor(-0.0)
+    gm = make_fx(lambda x: torch.signbit((1 - (1 - x)) * 2))(x)
+    expected = gm(x)
+    fusions.post_grad_custom_pre_pass(gm.graph)
+    gm.recompile()
+    assert torch.equal(gm(x), expected)
 
 
 def test_fold_affine_constant_shift():
@@ -148,7 +171,7 @@ def test_fold_affine_skips_dynamic_alpha():
     assert fusions.fold_affine(gm.graph) == 0
 
 
-def test_fold_affine_beta_debias_ping_pong():
+def test_fold_affine_keeps_beta_debias_complement_boundary():
     b = torch.tensor(0.9)
     s = torch.tensor(10)
 
@@ -160,8 +183,7 @@ def test_fold_affine_beta_debias_ping_pong():
 
     _exec(f, fusions.fold_affine, (b, s))
     gm = make_fx(f)(b, s)
-    fusions.fold_affine(gm.graph)
-    assert sum(1 for t in _targets(gm) if getattr(t, "overloadpacket", t) == torch.ops.aten.rsub) <= 2
+    assert fusions.fold_affine(gm.graph) == 0
 
 
 def test_fold_affine_folds_true_division():
@@ -654,24 +676,19 @@ def test_post_grad_keeps_affine_epochs_across_alias_writes(alias):
     assert all(torch.equal(x, y) for x, y in zip(actual, expected))
 
 
-def test_compile_prefers_fp32_product_for_mixed_product_fma():
-    torch.manual_seed(17)
-    a = (torch.randn(4096) * 10).to(torch.float16)
-    b = (torch.randn(4096) * 10).to(torch.float16)
-    c = torch.randn(4096) * 10
-    d = torch.randn(4096) * 10
+def test_fma_skips_two_products_with_cancelling_rounding_errors():
+    a = torch.tensor(641.0)
+    b = torch.tensor(6700417 * 2.0**-32)
+    c, d = -a, b
 
     def fn(a, b, c, d):
-        return c * d + a * b
+        return a * b + c * d
 
-    reference = (c.double() * d.double() + a.double() * b.double()).float()
-    eager_error = (fn(a, b, c, d) - reference).abs().sum()
+    reference = (a.double() * b.double() + c.double() * d.double()).float()
+    assert torch.equal(fn(a, b, c, d), reference)
     gm = make_fx(fn)(a, b, c, d)
-    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-    fma = next(node for node in gm.graph.nodes if node.target == torch.ops.prims.fma.default)
-    assert all(arg.meta["val"].dtype == torch.float32 for arg in fma.args[:2])
-    compiled_error = (fusions.compile(fn, fullgraph=True)(a, b, c, d) - reference).abs().sum()
-    assert compiled_error < eager_error
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    assert torch.ops.prims.fma.default not in _targets(gm)
 
 
 def test_compiled_adam_like_recurrence_tracks_fp64():

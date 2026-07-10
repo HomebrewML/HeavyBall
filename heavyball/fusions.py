@@ -173,6 +173,8 @@ def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
             aff = _scale_affine(inner, -1.0)
     if aff is None:
         aff = _affine_leaf(node)
+    elif aff.base is not node and (aff.a == 0.0 or aff.a == 1.0 and aff.b == 0.0):
+        aff = _affine_leaf(node)
     cache[key] = aff
     return aff
 
@@ -253,11 +255,7 @@ def fold_affine(graph: torch.fx.Graph) -> int:
             continue
 
         key = affine.base, affine.a.hex(), affine.b.hex()
-        if affine.a == 1.0 and affine.b == 0.0:
-            if affine.base is not node and _can_elide(node, epochs, epoch):
-                node.replace_all_uses_with(affine.base)
-                graph.erase_node(node)
-                count += 1
+        if affine.a == 0.0 or affine.a == 1.0 and affine.b == 0.0:
             continue
 
         rep = seen.get(key)
@@ -342,13 +340,8 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
         else:
             lhs_mul = _single_user_mul(lhs, epochs, epoch)
             rhs_mul = _single_user_mul(rhs, epochs, epoch)
-            if lhs is rhs:
-                lhs_mul = rhs_mul = None
-            if scale == 1 and lhs_mul and rhs_mul:
-                lhs_matches = lhs.meta["val"].dtype == node.meta["val"].dtype
-                rhs_matches = rhs.meta["val"].dtype == node.meta["val"].dtype
-                if lhs_matches != rhs_matches:
-                    lhs_mul, rhs_mul = (lhs_mul, None) if lhs_matches else (None, rhs_mul)
+            if lhs_mul and rhs_mul:
+                continue
             if rhs_mul:
                 product_a, product_b, addend = rhs_mul[0], rhs_mul[1], lhs
                 flip_product = scale == -1
