@@ -83,6 +83,39 @@ def test_post_grad_affine_fuses_to_fma():
     assert torch.ops.prims.fma.default in _targets(gm)
 
 
+def test_affine_chain_collapses_before_fma():
+    def fn(x):
+        return ((x * 3 + 2) * 4 + 5) * 6 + 7
+
+    value = torch.tensor([-160948.484375])
+    gm = make_fx(fn)(value)
+    assert fusions.post_grad_custom_pre_pass(gm.graph) > 0
+    assert _targets(gm).count(torch.ops.prims.fma.default) == 1
+    gm.recompile()
+    assert torch.equal(gm(value), fn(value.double()).float())
+    assert fusions.post_grad_custom_pre_pass(gm.graph) == 0
+
+
+def test_fma_crosses_functional_fulls_in_lerp_lowering():
+    graph = torch.fx.Graph()
+    x, y = graph.placeholder("x"), graph.placeholder("y")
+    weight = graph.call_function(torch.ops.aten.full.default, ([4], 0.2), {"dtype": torch.float32})
+    delta = graph.call_function(torch.ops.aten.sub.Tensor, (y, x))
+    product = graph.call_function(torch.ops.aten.mul.Tensor, (weight, delta))
+    condition = graph.call_function(torch.ops.aten.full.default, ([4], False), {"dtype": torch.bool})
+    base = graph.call_function(torch.ops.aten.where.self, (condition, y, x))
+    result = graph.call_function(torch.ops.aten.add.Tensor, (base, product))
+    graph.output(result)
+    gm = torch.fx.GraphModule({}, graph)
+    x_value, y_value = torch.randn(4), torch.randn(4)
+    FakeTensorProp(gm).propagate(x_value, y_value)
+    expected = gm(x_value, y_value)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
+    gm.recompile()
+    torch.testing.assert_close(gm(x_value, y_value), expected)
+    assert torch.ops.prims.fma.default in _targets(gm)
+
+
 def test_fold_affine_cse_dedup():
     def f(x):
         a = 2 - (1 - x)
@@ -286,10 +319,45 @@ def test_fold_affine_keeps_unrepresentable_coefficients():
         assert torch.equal(gm(x), fn(x))
 
 
+def test_fma_handles_keyword_only_aten_arguments():
+    graph = torch.fx.Graph()
+    x, y, z = graph.placeholder("x"), graph.placeholder("y"), graph.placeholder("z")
+    product = graph.call_function(torch.ops.aten.mul.Tensor, (), {"self": x, "other": y})
+    result = graph.call_function(torch.ops.aten.add.Tensor, (), {"self": product, "other": z})
+    graph.output(result)
+    gm = torch.fx.GraphModule({}, graph)
+    values = torch.randn(4), torch.randn(4), torch.randn(4)
+    FakeTensorProp(gm).propagate(*values)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
+    gm.recompile()
+    torch.testing.assert_close(gm(*values), values[0] * values[1] + values[2])
+
+
 def test_fma_value_runs():
     _exec(lambda a, b, c: a * b + c, fusions.fuse_mul_add_to_fma,
           (torch.randn(8), torch.randn(8), torch.randn(8)))
     _exec(lambda a, b: 1 - a * b, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8)))
+
+
+def test_fma_promotes_integral_tensor_addends():
+    for dtype in (torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        a, b = torch.randn(8), torch.randn(8)
+        c = torch.randint(0, 2, (8,), dtype=dtype)
+        gm = make_fx(lambda a, b, c: a * b + c)(a, b, c)
+        assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
+        gm.recompile()
+        torch.testing.assert_close(gm(a, b, c), a * b + c)
+        assert torch.ops.prims.fma.default in _targets(gm)
+
+
+def test_fma_keeps_integral_subtraction_unfused():
+    a = torch.full((4,), 2.0)
+    b = torch.full((4,), 3.0)
+    c = torch.tensor((0, 1, 2, 255), dtype=torch.uint8)
+    gm = make_fx(lambda a, b, c: a * b - c)(a, b, c)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    gm.recompile()
+    assert torch.equal(gm(a, b, c), a * b - c)
 
 
 def test_fma_sub_and_scalar_addend_run():
@@ -308,6 +376,14 @@ def test_fma_negates_promoted_factor():
         gm = make_fx(lambda mask, x, c: c - mask * x)(mask, x, c)
         assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
         assert torch.ops.prims.fma.default in _targets(gm)
+
+
+def test_fma_negates_scalar_factor_without_a_tensor_negation():
+    gm = make_fx(lambda x, y: y - x * 64)(torch.randn(8), torch.randn(8))
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
+    fma = next(node for node in gm.graph.nodes if node.target == torch.ops.prims.fma.default)
+    assert fma.args[1] == -64
+    assert torch.ops.aten.neg.default not in _targets(gm)
 
 
 def test_fma_scaled_add_rewrites_and_runs():

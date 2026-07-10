@@ -16,12 +16,15 @@ _MUL = (aten.mul.Tensor, aten.mul.Scalar)
 _DIV = (aten.div.Tensor, aten.div.Scalar)
 _LINEAR = _ADD + _SUB + _RSUB
 _ELEMENTWISE = _LINEAR + _MUL + _DIV + (aten.neg.default,)
+_FRESH = _ELEMENTWISE + (aten.full.default,)
 _POINTWISE_TAG = getattr(getattr(torch, "Tag", None), "pointwise", None)
 _SEEDED_TAG = getattr(getattr(torch, "Tag", None), "nondeterministic_seeded", None)
 
 
 def _arg(node: torch.fx.Node, index: int, name: str, default: Any = None) -> Any:
-    return node.args[index] if len(node.args) > index else node.kwargs.get(name, default)
+    if len(node.args) > index:
+        return node.args[index]
+    return node.kwargs.get(name, node.kwargs.get("self", default) if index == 0 else default)
 
 
 def _schema(node: torch.fx.Node) -> Any:
@@ -100,7 +103,7 @@ def _fresh(node: torch.fx.Node) -> bool:
     return schema is not None and schema.returns and not node.is_impure() and _SEEDED_TAG not in tags and all(
         ret.alias_info is None for ret in schema.returns
     ) and (
-        node.target in _ELEMENTWISE or _POINTWISE_TAG in tags or node.target == _fma()
+        node.target in _FRESH or _POINTWISE_TAG in tags or node.target == _fma()
     )
 
 
@@ -190,6 +193,26 @@ def _emit_affine(graph: torch.fx.Graph, affine: Affine, meta: dict,
     return emit(aten.add.Tensor, (scaled, affine.b))
 
 
+def _is_affine_form(node: torch.fx.Node, affine: Affine) -> bool:
+    if affine.b == 0.0:
+        left, right = _arg(node, 0, "input"), _arg(node, 1, "other")
+        return node.target in _MUL and left is affine.base and _scalar(right) == affine.a
+    args = _scaled_add_args(node)
+    if args is None:
+        return False
+    left, right, scale = args
+    if affine.a == 1.0:
+        return left is affine.base and scale == 1 and _scalar(right) == affine.b
+    return (
+        scale == 1
+        and _scalar(right) == affine.b
+        and isinstance(left, torch.fx.Node)
+        and left.target in _MUL
+        and _arg(left, 0, "input") is affine.base
+        and _scalar(_arg(left, 1, "other")) == affine.a
+    )
+
+
 def _survives_cast(value: float, dtype: torch.dtype) -> bool:
     if not math.isfinite(value):
         return False
@@ -244,6 +267,10 @@ def fold_affine(graph: torch.fx.Graph) -> int:
             count += 1
             continue
 
+        if _is_affine_form(node, affine):
+            seen[key] = node
+            continue
+
         cost = 1 if fma or affine.a == 1.0 or affine.b == 0.0 else 2
         if affine.depth > cost:
             with graph.inserting_before(node):
@@ -268,12 +295,6 @@ def _is_mul_operand(x: Any) -> bool:
     return _number(x) is not None
 
 
-def _is_addend(x: Any) -> bool:
-    if isinstance(x, torch.fx.Node):
-        return _is_float_tensor(x)
-    return _number(x) is not None
-
-
 def _single_user_mul(node: Any, epochs: dict[torch.fx.Node, int], epoch: int) -> tuple[Any, Any] | None:
     if not (isinstance(node, torch.fx.Node) and node.op == "call_function" and node.target in _MUL and len(
             node.users) == 1 and _is_float_tensor(node) and epochs.get(node, epoch) == epoch):
@@ -284,6 +305,18 @@ def _single_user_mul(node: Any, epochs: dict[torch.fx.Node, int], epoch: int) ->
 
 def _neg(graph: torch.fx.Graph, x: Any) -> Any:
     return _call(graph, aten.neg.default, (x,), x.meta) if isinstance(x, torch.fx.Node) else -x
+
+
+def _negated_product(graph: torch.fx.Graph, a: Any, b: Any) -> tuple[Any, Any] | None:
+    if _number(b) is not None:
+        return a, -b
+    if _number(a) is not None:
+        return -a, b
+    if isinstance(a, torch.fx.Node) and _is_float_tensor(a):
+        return _neg(graph, a), b
+    if isinstance(b, torch.fx.Node) and _is_float_tensor(b):
+        return a, _neg(graph, b)
+    return None
 
 
 def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
@@ -311,6 +344,11 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
             rhs_mul = _single_user_mul(rhs, epochs, epoch)
             if lhs is rhs:
                 lhs_mul = rhs_mul = None
+            if scale == 1 and lhs_mul and rhs_mul:
+                lhs_matches = lhs.meta["val"].dtype == node.meta["val"].dtype
+                rhs_matches = rhs.meta["val"].dtype == node.meta["val"].dtype
+                if lhs_matches != rhs_matches:
+                    lhs_mul, rhs_mul = (lhs_mul, None) if lhs_matches else (None, rhs_mul)
             if rhs_mul:
                 product_a, product_b, addend = rhs_mul[0], rhs_mul[1], lhs
                 flip_product = scale == -1
@@ -321,17 +359,17 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
                 flip_addend = scale == -1
             else:
                 continue
-        if not _is_addend(addend):
+        if not _is_mul_operand(addend):
             continue
-        if flip_product:
-            if isinstance(product_a, torch.fx.Node) and not _is_float_tensor(product_a):
-                product_a, product_b = product_b, product_a
-            if isinstance(product_a, torch.fx.Node) and not _is_float_tensor(product_a):
-                continue
+        if flip_addend and isinstance(addend, torch.fx.Node) and not _is_float_tensor(addend):
+            continue
 
         with graph.inserting_before(node):
             if flip_product:
-                product_a = _neg(graph, product_a)
+                product = _negated_product(graph, product_a, product_b)
+                if product is None:
+                    continue
+                product_a, product_b = product
             if flip_addend:
                 addend = _neg(graph, addend)
             result = _call(graph, fma, (product_a, product_b, addend), node.meta)
