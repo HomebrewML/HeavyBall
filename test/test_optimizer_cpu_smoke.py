@@ -33,16 +33,6 @@ def _optimizer_params():
                 )
             )
             continue
-        if name == "SOAPNAdam":
-            params.append(
-                pytest.param(
-                    name,
-                    obj,
-                    id=name,
-                    marks=pytest.mark.xfail(reason="torch.compile Inductor AssertionError on CPU", strict=False),
-                )
-            )
-            continue
         params.append(pytest.param(name, obj, id=name))
     return params
 
@@ -82,20 +72,6 @@ def test_optimizer_runs_on_cpu(opt_name, opt_cls):
         clone = opt_cls(model.parameters())
         clone.load_state_dict(state_dict)
         assert clone.state_dict()["state"].keys() == state_dict["state"].keys()
-
-
-def test_optimizer_keeps_constructor_compatibility_features():
-    param = torch.nn.Parameter(torch.randn(4, 4, device=DEVICE))
-
-    with pytest.warns(FutureWarning, match="renamed to 'multi_tensor'"):
-        optimizer = heavyball.AdamW([param], foreach=True)
-    assert optimizer.param_groups[0]["multi_tensor"] is True
-
-    with pytest.raises(TypeError, match="Removed in HeavyBall"):
-        heavyball.SOAP([param], normalize_grads=True)
-
-    with pytest.raises(TypeError, match="unknown keyword arguments"):
-        heavyball.AdamW([param], totally_fake=True)
 
 
 def test_optimizer_accepts_explicit_orig_shapes():

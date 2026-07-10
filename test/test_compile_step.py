@@ -14,7 +14,16 @@ EXTRA_KWARGS = {
 
 # Iterative inner ops (Newton-Schulz, eigendecomp) are inherently sensitive to FP op order;
 # compile may fuse/reorder them differently than eager.
-_LOOSE_COMPILE_TOL = {"Muon", "MuonLaProp", "MuonAdamW", "KLSOAP", "KLShampoo", "HeavyKLSOAP", "HeavyKLShampoo"}
+_LOOSE_COMPILE_TOL = {
+    "Scion",
+    "Muon",
+    "MuonLaProp",
+    "MuonAdamW",
+    "KLSOAP",
+    "KLShampoo",
+    "HeavyKLSOAP",
+    "HeavyKLShampoo",
+}
 
 
 def _optimizer_params():
@@ -55,8 +64,8 @@ def _run_steps(model, optimizer, n=5, seed=0xDEADBEEF):
 
         def closure():
             optimizer.zero_grad(set_to_none=True)
-            data = torch.randn(4, 8, device=DEVICE)
-            target = torch.randn(4, 4, device=DEVICE)
+            data = torch.randn(32, 8, device=DEVICE)
+            target = torch.randn(32, 4, device=DEVICE)
             loss = torch.nn.functional.mse_loss(model(data), target)
             loss.backward()
             return loss

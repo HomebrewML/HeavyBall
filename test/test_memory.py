@@ -42,8 +42,6 @@ def test_memory(size, depth: int, compiled: bool, opt: str = "AdamW", iterations
         raise pytest.skip(f"Opt {opt} not supported")
 
     opt = getattr(heavyball, opt)
-    heavyball.utils.zeroth_power_mode = "qr"
-
     for i in range(outer_iterations):
         model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
         model_allocated = get_memory()

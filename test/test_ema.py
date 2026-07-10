@@ -1,9 +1,8 @@
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, set_grad
+from utils import REPRESENTATIVE_OPTS, get_optim, set_grad
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -36,10 +35,14 @@ def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, out
                     o.copy_emas_to_params()
                     o.copy_params_to_emas()
 
-            if do_ema:
-                o.copy_emas_to_params()
-
             delta = sum((p.data - p0).float().square().sum().item() for p, p0 in zip(model.parameters(), init_params))
+            if do_ema:
+                live_params = [p.detach().clone() for p in model.parameters()]
+                o.copy_emas_to_params()
+                assert any(not torch.equal(p, live) for p, live in zip(model.parameters(), live_params))
+                o.copy_params_to_emas()
+                assert all(torch.equal(p, live) for p, live in zip(model.parameters(), live_params))
+
             weights[-1].append(delta)
 
             del model, o
@@ -49,6 +52,26 @@ def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, out
         print(i, w_ema, w_no_ema)
         assert w_ema > 0, "EMA weights should have changed"
         assert w_no_ema > 0, "Non-EMA weights should have changed"
-        assert torch.isclose(torch.tensor(w_ema), torch.tensor(w_no_ema), rtol=0.1), (
-            f"EMA and non-EMA weight changes differ too much: {w_ema} vs {w_no_ema}"
-        )
+        assert torch.isclose(torch.tensor(w_ema), torch.tensor(w_no_ema), rtol=1e-6)
+
+
+def test_normalized_ema_recurrence_and_swap():
+    p = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
+    opt = heavyball.SGD([p], use_ema=True)
+    values = torch.tensor([1.0, 2.0, 4.0, 8.0], dtype=torch.float64)
+    for value in values:
+        p.data.copy_(value)
+        opt.ema_update()
+
+    beta = 1 - opt.ema_decay
+    weights = beta ** torch.arange(len(values) - 1, -1, -1, dtype=torch.float64)
+    expected = (values * weights).sum() / weights.sum()
+    ema = opt.state[p]["_root"]["param_ema"]
+    torch.testing.assert_close(ema, expected)
+
+    live = p.detach().clone()
+    opt.copy_emas_to_params()
+    torch.testing.assert_close(p, expected)
+    opt.copy_params_to_emas()
+    assert torch.equal(p, live)
+    torch.testing.assert_close(opt.state[p]["_root"]["param_ema"], expected)

@@ -6,10 +6,9 @@ import math
 
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import linalg, nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, set_grad
+from utils import REPRESENTATIVE_OPTS, get_optim, set_grad
 
 import heavyball
 from heavyball import utils

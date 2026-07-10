@@ -72,7 +72,7 @@ def test_max_singular_value(shape, cond, dtype, power_iter, rtol):
 )
 def test_min_singular_value(shape, cond, dtype, power_iter, rtol):
     A = _make_matrix(shape, cond=cond, dtype=dtype, symmetric=True)
-    approx = min_singular_value(A, power_iter=power_iter)
+    approx = min_singular_value(A)
     exact = torch.linalg.svdvals(A.double()).min()
     if exact.abs() < 1e-8:
         assert_close(approx, exact, atol=1e-6)

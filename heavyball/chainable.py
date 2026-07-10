@@ -2,8 +2,8 @@ import contextlib
 import copy
 import functools
 import math
-import warnings
 from collections.abc import Iterable as _Iterable
+from numbers import Real
 from typing import Iterable, List, Literal, Optional, Union
 
 import torch
@@ -80,60 +80,90 @@ class FunctionTransform:
         return f"{self.__class__.__name__}({self.fn}, transform_idx={self.transform_idx})"
 
 
-def _enforce_uniform_skip(results):
-    skips = [skip for _, skip, _ in results]
-    if not skips:
-        return False
-    if all(skips):
-        return True
-    if not any(skips):
-        return False
-    raise ValueError("All branches must uniformly skip or not skip updates")
-
-
 def _normalize_chain(fns):
     if fns is None:
         return None
     return fns if isinstance(fns, (list, tuple)) else (fns,)
 
 
+def _terminal_transform(fn):
+    if isinstance(fn, functools.partial):
+        fn = fn.func
+    if isinstance(fn, FunctionTransform):
+        fn = fn.get_fn()
+    name = getattr(fn, "__name__", "")
+    return name == "apply_update" or name.startswith("update_by_")
+
+
+def _terminal_chain(fns):
+    terminals = [i for i, fn in enumerate(fns or ()) if _terminal_transform(fn)]
+    if terminals and terminals != [len(fns) - 1]:
+        raise ValueError("parameter update must be the final transform")
+    return bool(terminals)
+
+
 class Parallel:
     def __init__(self, branches: List[List[callable]], merge_fn: callable):
+        if any(_terminal_chain(branch) for branch in branches):
+            raise ValueError("Parallel branches must return updates")
         self.branches = branches
         self.merge_fn = merge_fn
+
+    def __deepcopy__(self, memo):
+        return type(self)([[copy.deepcopy(fn) for fn in branch] for branch in self.branches], self.merge_fn)
 
     def __call__(self, state, group, update, grad, param):
         results = []
         for branch in self.branches:
             branch_update = [torch.clone(u, memory_format=torch.preserve_format) for u in update]
-            u, skip = _inner_chain(state, group, branch_update, grad, param, *branch)
-            results.append((u, skip, None))
-        if _enforce_uniform_skip(results):
+            result, skip = _inner_chain(state, group, branch_update, grad, param, *branch)
+            results.append((result, skip))
+        terminated = [result is None for result, _ in results]
+        if any(terminated) and not all(terminated):
+            raise ValueError("Parallel branches must terminate uniformly")
+        if all(terminated):
+            return None
+        skipped = [skip for _, skip in results]
+        if any(skipped) and not all(skipped):
+            raise ValueError("Parallel branches must skip uniformly")
+        if all(skipped):
             return _SKIP
-        return self.merge_fn([u for u, _, _ in results])
+        return self.merge_fn([result for result, _ in results])
 
 
 class Route:
-    """Route params by predicate through different fn chains.
-
-    Takes arbitrary (predicate, fns) pairs. Each param is assigned to the first
-    matching route; unmatched params use the default chain (None = passthrough).
-    All routes must uniformly either skip or not skip updates.
-    """
-
     def __init__(self, *routes, default=None):
         self.routes = [(pred, _normalize_chain(fns)) for pred, fns in routes]
         self.default = _normalize_chain(default)
+        chains = [fns for _, fns in self.routes] + [self.default]
+        terminal = [_terminal_chain(fns) for fns in chains]
+        if any(terminal) and not all(terminal):
+            raise ValueError("Route branches must terminate uniformly")
+        if all(terminal) and any(
+            getattr(ft, "skip_first", False) or hasattr(ft, "warmup_fns")
+            for fns in chains
+            for ft in _walk_fns(fns)
+        ):
+            raise ValueError("terminal Route branches cannot skip initialization")
+
+    def __deepcopy__(self, memo):
+        def clone(fns):
+            return None if fns is None else tuple(copy.deepcopy(fn) for fn in fns)
+
+        routes = ((pred, clone(fns)) for pred, fns in self.routes)
+        return type(self)(*routes, default=clone(self.default))
+
+    def _route_index(self, param):
+        return next((i for i, (pred, _) in enumerate(self.routes) if pred(param)), len(self.routes))
+
+    def _select(self, param):
+        index = self._route_index(param)
+        return self.default if index == len(self.routes) else self.routes[index][1]
 
     def __call__(self, state, group, update, grad, param):
         buckets = {}
-        assigned = set()
-        for j, (pred, _) in enumerate(self.routes):
-            for i, p in enumerate(param):
-                if i not in assigned and pred(p):
-                    buckets.setdefault(j, []).append(i)
-                    assigned.add(i)
-        default_idx = [i for i in range(len(param)) if i not in assigned]
+        for i, p in enumerate(param):
+            buckets.setdefault(self._route_index(p), []).append(i)
 
         def _sel(lst, idx):
             return [lst[i] for i in idx]
@@ -141,7 +171,7 @@ class Route:
         results = []
 
         all_chains = [(buckets.get(j), fns) for j, (_, fns) in enumerate(self.routes)]
-        if default_idx:
+        if default_idx := buckets.get(len(self.routes)):
             all_chains.append((default_idx, self.default))
 
         for idx, fns in all_chains:
@@ -155,7 +185,15 @@ class Route:
                 u, skip = _sel(update, idx), False
             results.append((u, skip, idx))
 
-        if _enforce_uniform_skip(results):
+        terminated = [result is None for result, _, _ in results]
+        if any(terminated) and not all(terminated):
+            raise ValueError("Route branches must terminate uniformly")
+        if all(terminated):
+            return None
+        skipped = [skip for _, skip, _ in results]
+        if any(skipped) and not all(skipped):
+            raise ValueError("Route branches must skip uniformly")
+        if all(skipped):
             return _SKIP
 
         out = [None] * len(param)
@@ -179,43 +217,10 @@ def _storage_dtype(group):
     return getattr(torch, dtype)
 
 
-_PASSTHROUGH_KWARGS = frozenset({"orig_shapes", *utils.StatefulOptimizer._INSTANCE_ATTRS})
-
-_RENAMED_KWARGS = {"foreach": "multi_tensor"}
-
-_REMOVED_KWARGS = frozenset(
-    {
-        "stochastic_schedule",
-        "normalize_grads",
-        "correct_bias",
-        "inverse_free",
-        "adaptive",
-    }
-)
-
-
 def _build_defaults(locals_dict):
-    d = locals_dict.copy()
-    d.pop("self", None)
+    d = {key: value for key, value in locals_dict.items() if not key.startswith("_") and key != "self"}
     params = d.pop("params")
     kwargs = d.pop("kwargs")
-
-    for old, new in _RENAMED_KWARGS.items():
-        if old in kwargs:
-            warnings.warn(
-                f"'{old}' was renamed to '{new}' in HeavyBall 3.0. Pass '{new}' instead.", FutureWarning, stacklevel=4
-            )
-            d[new] = kwargs.pop(old)
-
-    hit = _REMOVED_KWARGS & kwargs.keys()
-    if hit:
-        raise TypeError(
-            f"Removed in HeavyBall 3.0: {', '.join(sorted(hit))}. See docs/heavyball3.md for migration details."
-        )
-
-    unknown = kwargs.keys() - _PASSTHROUGH_KWARGS
-    if unknown:
-        raise TypeError(f"unknown keyword arguments: {sorted(unknown)}")
     d.update(kwargs)
     return params, d
 
@@ -231,7 +236,10 @@ class ECCConfig:
     }
 
     def __init__(self, mode):
-        self.primary_dtype, self.corr_dtype = self._MODES[mode]
+        try:
+            self.primary_dtype, self.corr_dtype = self._MODES[mode]
+        except KeyError as error:
+            raise ValueError(f"Unknown ECC mode {mode!r}; expected one of {sorted(self._MODES)}") from error
 
     @property
     def smax(self):
@@ -271,7 +279,7 @@ class ECCConfig:
 
 def _init_mu_product(state, group, update, grad, param, **kwargs):
     dtype = _storage_dtype(group)
-    state["mu_product"] = torch.ones((), dtype=dtype, device=param.device)
+    state["mu_product"] = torch.ones(1, dtype=dtype, device=param.device)
 
 
 class ZeroGuard(FunctionTransform):
@@ -279,16 +287,20 @@ class ZeroGuard(FunctionTransform):
         super().__init__(fn, names)
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
-        ecc = ECCConfig.from_group(group)
+        ecc = group.get("_ecc_config")
         for name in self.names:
             vn = self.val_name(name)
-            if ecc is None:
-                _zero_guard(state, vn, param, _storage_dtype(group))
+            wide_square = "exp_avg_sq" in name and (
+                _storage_dtype(group) == torch.float16 or ecc is not None and ecc.primary_dtype == torch.float16
+            )
+            if ecc is None or wide_square:
+                dtype = torch.float32 if wide_square else _storage_dtype(group)
+                _zero_guard(state, vn, param, dtype)
             else:
                 ecc.init_state(state, vn, param)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
-        ecc = ECCConfig.from_group(group)
+        ecc = group.get("_ecc_config")
         if ecc is None:
             return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
 
@@ -296,57 +308,52 @@ class ZeroGuard(FunctionTransform):
         primary_vars = [[st[vn] for st in state] for vn in names]
         with contextlib.ExitStack() as stack:
             for vn, plist in zip(names, primary_vars):
-                corrs = [st[vn + "::ecc"] for st in state]
-                stack.enter_context(ecc.attached(plist, corrs))
+                if all(vn + "::ecc" in st for st in state):
+                    corrs = [st[vn + "::ecc"] for st in state]
+                    stack.enter_context(ecc.attached(plist, corrs))
             return self.fn(state, group, update, grad, param, *args, *primary_vars, **kwargs)
 
 
 class PrecondGradAccumGuard(FunctionTransform):
     def __init__(self, fn):
-        super().__init__(fn, ["precond_grad_accum"])
-        self.steps_taken_key = None
+        super().__init__(fn, ["precond_grad_accum", "precond_grad_accum_steps"])
 
-    def _build_val_names(self):
-        super()._build_val_names()
-        self.steps_taken_key = f"_{self.fn_name}_steps_taken_{self.transform_idx}"
-
-    def _accum(self, group, state, new):
-        group[self.steps_taken_key] = group.get(self.steps_taken_key, 0) + 1
-        utils.stochastic_add_(state, new)
-
-    def _reset(self, group, state):
-        if group.get(self.steps_taken_key, 0) != 0:
-            group[self.steps_taken_key] = 0
-            utils.zero_(state)
+    @staticmethod
+    def _accum(state, steps, new):
+        out = []
+        for stored, count, value in zip(state, steps, new):
+            count.add_(1)
+            mean, value = utils.promote(stored), utils.promote(value)
+            dtype = torch.promote_types(mean.dtype, value.dtype)
+            mean, value = mean.to(dtype), value.to(dtype)
+            shape = (*count.shape, *([1] * (mean.ndim - count.ndim)))
+            inv_count = count.to(dtype).reciprocal().view(shape)
+            value = mean * (1 - inv_count) + value * inv_count
+            utils.copy_stochastic_(stored, value)
+            out.append(value)
+        return out
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
         if not group.get("precond_grad_accum", False):
             return
-        for name in self.names:
-            _zero_guard(state, self.val_name(name), param, _storage_dtype(group))
+        dtype = _storage_dtype(group)
+        _zero_guard(state, self.val_name("precond_grad_accum"), param, torch.float32 if dtype == torch.float16 else dtype)
+        state[self.val_name("precond_grad_accum_steps")] = torch.zeros((), dtype=torch.int64, device=param.device)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         base_grad = update if group.get("momentum_into_precond_update", True) else grad
         if not group.get("precond_grad_accum", False):
             return self.fn(state, group, update, grad, param, *args, base_grad, **kwargs)
 
-        (vars,) = vars
-        steps_taken = group.get(self.steps_taken_key, 0)
-        accum_state = None
+        accum, steps = vars
         if group["is_preconditioning"]:
-            if steps_taken:
-                self._accum(group, vars, base_grad)
-                utils.stochastic_multiply_(vars, 1 / group[self.steps_taken_key])
-                accum_state = vars
-            else:
-                vars = base_grad
+            mean = self._accum(accum, steps, base_grad)
+            out = self.fn(state, group, update, grad, param, *args, mean, **kwargs)
+            utils.zero_([*accum, *steps])
+            return out
         else:
-            self._accum(group, vars, base_grad)
-            vars = base_grad
-        out = self.fn(state, group, update, grad, param, *args, vars, **kwargs)
-        if accum_state is not None:
-            self._reset(group, accum_state)
-        return out
+            self._accum(accum, steps, base_grad)
+        return self.fn(state, group, update, grad, param, *args, base_grad, **kwargs)
 
 
 class CopyGuard(FunctionTransform):
@@ -356,8 +363,17 @@ class CopyGuard(FunctionTransform):
 
     def _init(self, state: dict, group: dict, update: Tensor, grad: Tensor, param: Tensor, *args, **kwargs):
         val = [update, grad, param, *args][self.index]
+        source = utils.promote(val)
+        ecc = group.get("_ecc_config")
         for name in self.names:
-            state[self.val_name(name)] = torch.clone(val)
+            key = self.val_name(name)
+            if ecc is None:
+                target = state[key] = torch.empty_like(val, dtype=_storage_dtype(group))
+                utils.copy_stochastic_(target, source)
+            else:
+                ecc.init_state(state, key, val)
+                with ecc.attached([state[key]], [state[key + "::ecc"]]):
+                    utils.copy_stochastic_(state[key], source)
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
         return self.fn(state, group, update, grad, param, *args, *vars, **kwargs)
@@ -455,12 +471,6 @@ class TagGuard(FunctionTransform):
 
 
 def _stack_value(vals):
-    """Combine per-member values into one slab value.
-
-    Tensors are concatenated along dim 0 (0-d scalars are unsqueezed first so each
-    member keeps its own value). Lists and tuples are recursed element-wise. Sets are
-    merged. Anything else is taken from the first member.
-    """
     first = next((v for v in vals if v is not None), None)
     if first is None:
         return None
@@ -484,7 +494,6 @@ def _stack_value(vals):
 
 
 def _unstack_value(slab_val, i, n):
-    """Extract member `i` from a slab value, undoing `_stack_value`."""
     if isinstance(slab_val, Tensor):
         if slab_val.ndim >= 1 and slab_val.shape[0] == n:
             return slab_val[i : i + 1].clone()
@@ -499,16 +508,12 @@ def _unstack_value(slab_val, i, n):
 
 
 class BucketGuard(FunctionTransform):
-    """Group same-shape params into a leading-dim slab; run the inner chain once per bucket.
-
-    State lives flat in `state[p]` next to outer-chain state. The inner chain's keys are
-    declared by its transforms via `_val_names` (the existing `names=` protocol every
-    FunctionTransform follows), so BucketGuard can enumerate exactly what to stack/unstack
-    without any namespace marker. Each step: stack those keys across active members into a
-    transient slab, run the inner chain, unstack back. No bucket state is kept.
-    """
-
     needs_init = False
+
+    def _build_val_names(self):
+        super()._build_val_names()
+        self.__dict__.pop("_chain_keys", None)
+        self.__dict__.pop("_init_guards", None)
 
     @functools.cached_property
     def _chain_keys(self):
@@ -517,72 +522,111 @@ class BucketGuard(FunctionTransform):
             keys.update(ft._val_names.values())
         return keys | {f"{vn}::ecc" for vn in keys}
 
+    @functools.cached_property
+    def _init_guards(self):
+        return tuple(ft for ft in _walk_fns(self.fn) if isinstance(ft, (GeneralGuard, WarmupGuard)))
+
+    def _init_mode(self, state):
+        initialized = state.get("is_initialized", ())
+        singleton = False
+        for ft in self._init_guards:
+            if isinstance(ft, GeneralGuard) and ft.transform_idx not in initialized:
+                if ft.skip_first:
+                    return _SKIP
+                singleton = True
+            elif isinstance(ft, WarmupGuard) and state.get(ft.warmup_key, 0) < len(ft.warmup_fns):
+                return _SKIP
+        return singleton
+
+    def _run_subgroup(self, subgroup, states, group, update, grad, param, *args, **kwargs):
+        n = len(subgroup)
+        member_states = [states[i] for i in subgroup]
+        views = [param[i] for i in subgroup]
+        grads = [grad[i] for i in subgroup]
+        updates = [update[i] for i in subgroup]
+        eccs = [getattr(v, "_ecc", None) for v in views]
+        corrs = [e.correction for e in eccs] if eccs[0] is not None else None
+
+        slab_p = views[0][None] if n == 1 else torch.stack(views, 0)
+        slab_g = grads[0][None] if n == 1 else torch.stack(grads, 0)
+        slab_u = updates[0][None] if n == 1 else torch.stack(updates, 0)
+        if corrs is not None:
+            corr = corrs[0][None] if n == 1 else torch.stack(corrs, 0)
+            slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
+
+        slab_state = {
+            k: v for k in self._chain_keys if (v := _stack_value([m.get(k) for m in member_states])) is not None
+        }
+        slab_state["is_initialized"] = set().union(*[m.get("is_initialized") or () for m in member_states])
+        result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
+
+        for i, member in enumerate(member_states):
+            for key, value in slab_state.items():
+                member[key] = _unstack_value(value, i, n)
+
+        if result is _SKIP and n > 1:
+            for i, view in enumerate(views):
+                view.copy_(slab_p[i])
+            if corrs is not None:
+                for i, ecc in enumerate(eccs):
+                    ecc.correction.copy_(slab_p._ecc.correction[i])
+        return result
+
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         states = state if isinstance(state, list) else [state(p) for p in param]
         shapes = group.get("_orig_shapes") or {}
-        chain_keys = self._chain_keys
+        caution_grad = [None] * len(param) if group.get("caution", False) else None
+
+        init_modes = [self._init_mode(member) for member in states]
+        initializing = [i for i, mode in enumerate(init_modes) if mode is _SKIP]
+        if initializing:
+            for i in initializing:
+                self._run_subgroup([i], states, group, update, grad, param, *args, **kwargs)
+            return _SKIP
+
+        if any(init_modes):
+            results = [
+                self._run_subgroup([i], states, group, update, grad, param, *args, **kwargs)
+                for i in range(len(param))
+            ]
+            skips = [result is _SKIP for result in results]
+            if all(skips):
+                return _SKIP
+            if any(skips):
+                raise ValueError("Bucket members must uniformly skip during initialization")
+            return [result[0][0] for result in results]
 
         buckets = {}
         for i, p in enumerate(param):
             info = shapes.get(id(p))
-            sig = (tuple(p.shape), p.dtype, p.device, info.owner if info is not None else None)
+            sig = (
+                tuple(p.shape),
+                p.dtype,
+                p.device,
+                info.owner if info is not None else None,
+            )
             buckets.setdefault(sig, []).append(i)
 
         out = [None] * len(param)
         has_output = False
-        for indices in buckets.values():
-            fresh, ready = [], []
-            for i in indices:
-                (fresh if chain_keys.isdisjoint(states[i]) else ready).append(i)
-            for subgroup in (fresh, ready):
-                if not subgroup:
-                    continue
-                n = len(subgroup)
-                member_states = [states[i] for i in subgroup]
-                views = [param[i] for i in subgroup]
-                grads = [grad[i] for i in subgroup]
-                updates = [update[i] for i in subgroup]
-                eccs = [getattr(v, "_ecc", None) for v in views]
-                corrs = [e.correction for e in eccs] if eccs[0] is not None else None
-
-                slab_p = views[0][None] if n == 1 else torch.stack(views, 0)
-                slab_g = grads[0][None] if n == 1 else torch.stack(grads, 0)
-                slab_u = updates[0][None] if n == 1 else torch.stack(updates, 0)
-                if corrs is not None:
-                    corr = corrs[0][None] if n == 1 else torch.stack(corrs, 0)
-                    slab_p._ecc = utils._ULPState(corr, eccs[0].smax)
-
-                slab_state = {
-                    k: v for k in chain_keys if (v := _stack_value([m.get(k) for m in member_states])) is not None
-                }
-                slab_state["is_initialized"] = set().union(*[m.get("is_initialized") or () for m in member_states])
-
-                result = self.fn([slab_state], group, [slab_u], [slab_g], [slab_p], *args, **kwargs)
-
-                undeclared = slab_state.keys() - chain_keys - {"is_initialized"}
-                if undeclared:
-                    raise RuntimeError(f"Undeclared state keys under BucketGuard: {undeclared}")
-
-                for i_in_sg, m in enumerate(member_states):
-                    for k, val in slab_state.items():
-                        m[k] = _unstack_value(val, i_in_sg, n)
-
-                if result is _SKIP:
-                    if n > 1:  # n=1 slab is a view of the original; in-place mods already landed
-                        for k, _ in enumerate(subgroup):
-                            views[k].copy_(slab_p[k])
-                        if corrs is not None:
-                            for k, e in enumerate(eccs):
-                                e.correction.copy_(slab_p._ecc.correction[k])
-                    continue
-
-                has_output = True
-                precond_slab = result[0]
+        for subgroup in buckets.values():
+            result = self._run_subgroup(subgroup, states, group, update, grad, param, *args, **kwargs)
+            source = group.pop("_caution_grad", None)
+            if caution_grad is not None and source is not None:
                 for k, i in enumerate(subgroup):
-                    out[i] = precond_slab[k]
+                    caution_grad[i] = source[0][k]
+            if result is _SKIP:
+                continue
+
+            has_output = True
+            precond_slab = result[0]
+            for k, i in enumerate(subgroup):
+                out[i] = precond_slab[k]
 
         if not has_output:
             return _SKIP
+        if caution_grad is not None and any(g is not None for g in caution_grad):
+            group["_caution_grad"] = [g if c is None else c for g, c in zip(grad, caution_grad)]
         return [torch.zeros_like(u) if o is None else o for o, u in zip(out, update)]
 
 
@@ -597,12 +641,13 @@ class WarmupGuard(FunctionTransform):
 
     def __call__(self, state, group, update, grad, param, *args, **kwargs):
         states = state if isinstance(state, list) else [state(p) for p in param]
-        warmup_step = min(st.get(self.warmup_key, 0) for st in states)
-        if warmup_step < len(self.warmup_fns):
-            fn = self.warmup_fns[warmup_step]
+        warmup_steps = [st.get(self.warmup_key, 0) for st in states]
+        if any(step < len(self.warmup_fns) for step in warmup_steps):
             for st, a in zip(states, zip(update, grad, param, *args)):
-                fn(st, group, *a, **kwargs)
-                st[self.warmup_key] = st.get(self.warmup_key, 0) + 1
+                step = st.get(self.warmup_key, 0)
+                if step < len(self.warmup_fns):
+                    self.warmup_fns[step](st, group, *a, **kwargs)
+                    st[self.warmup_key] = step + 1
             return _SKIP
         for st in states:
             if "is_initialized" not in st:
@@ -643,8 +688,9 @@ def no_state_no_multi_tensor(fn):
 @zero_guard("mars_old_grad")
 @no_state
 def mars(group, update, grad, param, mars_old_grad):
-    utils.mars_correction(update, mars_old_grad, group["mars_gamma"], utils.get_beta1(group))
+    update = utils.mars_correction(update, mars_old_grad, utils.get_beta1(group), group["mars_gamma"])
     utils.copy_stochastic_list_(grad, update)
+    grad[:] = update
     return update
 
 
@@ -753,7 +799,12 @@ def update_by_adam(group, update, grad, param, exp_avg, exp_avg_sq):
 @general_guard("mu_product", init_fn=_init_mu_product, skip_first=False)
 @no_state
 def scale_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
-    utils.nadam_(
+    coupled = group["weight_decay"] != 0 and not group.get("decoupled_weight_decay", False)
+    if coupled and group["caution"]:
+        group["_caution_grad"] = [
+            utils.promote(u) + utils.promote(p) * group["weight_decay"] for u, p in zip(update, param)
+        ]
+    return utils.nadam_(
         param,
         exp_avg,
         exp_avg_sq,
@@ -767,7 +818,6 @@ def scale_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product):
         group["weight_decay"],
         group.get("decoupled_weight_decay", False),
     )
-    return update
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -798,6 +848,8 @@ def update_by_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product)
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
+    max_lr = group["max_lr"]
+    decay = group["lr"] * group["weight_decay"] / max_lr
     utils.fused_adam_(
         param,
         exp_avg,
@@ -809,7 +861,7 @@ def update_by_adamc(group, update, grad, param, exp_avg, exp_avg_sq):
         group["step"],
         group["lr"],
         group["eps"],
-        group["lr"] * group["weight_decay"] / group["max_lr"],
+        decay,
         group["caution"],
         group.get("cautious_weight_decay", False),
     )
@@ -860,7 +912,9 @@ def update_by_ademamix(group, update, grad, param, exp_avg_fast, exp_avg_slow, e
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def scale_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
-    return utils.laprop_(exp_avg, exp_avg_sq, update, utils.get_beta1(group), utils.get_beta2(group), group["step"])
+    return utils.laprop_(
+        exp_avg, exp_avg_sq, update, utils.get_beta1(group), utils.get_beta2(group), group["step"], group["eps"]
+    )
 
 
 @zero_guard("exp_avg", "exp_avg_sq")
@@ -879,6 +933,7 @@ def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
         group["weight_decay"],
         group["caution"],
         group.get("cautious_weight_decay", False),
+        group["eps"],
     )
     return _SKIP
 
@@ -892,21 +947,8 @@ def orthogonalize_grad_to_param(group, update, grad, param):
 @copy_guard(2, "z")
 @no_state
 def update_by_schedule_free(group, update, grad, param, z):
-    # Compute weight_sum once per step, not per param in no-multi_tensor mode.
-    if group.get("_sf_step") is not group["step"]:
-        weight = abs(group["lr"]) ** group["weight_lr_power"] * group["step"].clamp(min=1) ** group["r"]
-        group["weight_sum"] = group.get("weight_sum", 0) + weight
-        group["_sf_step"] = group["step"]
-
-    weight_sum = group["weight_sum"]
-    weight = abs(group["lr"]) ** group["weight_lr_power"] * group["step"].clamp(min=1) ** group["r"]
-    try:
-        ckp1 = weight / weight_sum
-    except ZeroDivisionError:
-        ckp1 = 0
-
     update, param, z, grad = utils.list_guard(update, param, z, grad)
-    lr, ckp1, beta1 = utils.scalar_guard(group["lr"], ckp1, utils.get_beta1(group), grad[0])
+    lr, ckp1, beta1 = utils.scalar_guard(group["lr"], group["_sf_ckp1"], utils.get_beta1(group), grad[0])
     utils._compilable_schedule_free_(
         param,
         z,
@@ -970,7 +1012,7 @@ def update_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
 
 
 def _suds_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
-    utils.copy_stochastic_(fisher_approx, update / update.norm().clamp(min=1e-8))
+    utils.copy_stochastic_(fisher_approx, utils.stable_l2_normalize(update, eps=1e-8))
 
 
 @needs_full_param
@@ -978,7 +1020,9 @@ def _suds_warmup_1(state, group, update, grad, param, exp_avg, exp_avg_sq, fishe
 @warmup_guard(_suds_warmup_1)
 @no_state_no_multi_tensor
 def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx):
-    precond_update, w = utils.eigvecs_product_rank1(update.flatten(), fisher_approx.flatten().to(update.dtype))
+    update, fisher = utils.promote(update), utils.promote(fisher_approx)
+    fisher = torch.where(fisher.abs().amax() == 0, utils.stable_l2_normalize(update, eps=1e-8), fisher)
+    precond_update, w = utils.eigvecs_product_rank1(update.flatten(), fisher.flatten())
     precond_update = utils.adam_(
         exp_avg,
         exp_avg_sq,
@@ -986,10 +1030,11 @@ def scale_by_suds(group, update, grad, param, exp_avg, exp_avg_sq, fisher_approx
         utils.get_beta1(group),
         utils.get_beta2(group),
         group["step"] - 1,
+        group["eps"],
     )[0]
-    precond_update, _ = utils.eigvecs_product_rank1(precond_update.flatten(), fisher_approx.flatten(), w)
+    precond_update, _ = utils.eigvecs_product_rank1(precond_update.flatten(), fisher.flatten(), w)
 
-    new_approx = utils.oja_update(fisher_approx.flatten().to(update.dtype), update.flatten(), group["precond_lr"])
+    new_approx = utils.oja_update(fisher.flatten(), update.flatten(), group["precond_lr"])
     new_approx = new_approx.view_as(fisher_approx)
     utils.copy_stochastic_(fisher_approx, new_approx)
     return precond_update
@@ -1005,6 +1050,7 @@ def scale_by_unscaled_adam(group, update, grad, param, exp_avg, exp_avg_sq):
         utils.get_beta1(group),
         utils.get_beta2(group),
         group["step"],
+        group["eps"],
     )
     return update
 
@@ -1020,6 +1066,7 @@ def scale_by_adopt(group, update, grad, param, exp_avg, exp_avg_sq):
         utils.get_beta1(group),
         utils.get_beta2(group),
         group["step"] - 1,
+        group["eps"],
     )
 
 
@@ -1039,11 +1086,10 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
     state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
-    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
 
-    state["Q_cache"] = [torch.empty_like(q) for q in Q]
+    state["Q_cache"] = [torch.empty_like(q, dtype=utils.promote(q.dtype)) for q in Q]
 
 
 def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[callable] = None):
@@ -1061,7 +1107,6 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
-    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
 
     _update_psgd_precond(
         False,
@@ -1071,7 +1116,6 @@ def _init_psgd_eigen_kron(state, group, update, grad, param, prob: Optional[call
         update,
         Q,
         state["running_lower_bound"],
-        state["step"],
         prob,
         store_triu_as_line=False,
     )
@@ -1094,10 +1138,9 @@ def _init_psgd_pro_kron(state, group, update, grad, param, cached: bool = False,
     )
     state["Q"] = Q
     state["running_lower_bound"] = [torch.zeros((grad.shape[0],), device=q.device, dtype=torch.float64) for q in Q]
-    state["step"] = torch.zeros((), device=param.device, dtype=torch.float64)
     if not cached:
         return
-    state["Q_cache"] = [torch.empty_like(q) for q in Q]
+    state["Q_cache"] = [torch.empty_like(q, dtype=utils.promote(q.dtype)) for q in Q]
 
 
 def _init_psgd_lra(state, group, update, grad, param, cached: bool = False, prob: Optional[callable] = None):
@@ -1140,7 +1183,8 @@ def nesterov_ema(group, updates, grads, params, momentum):  # equivalent to Grok
 
 
 def _store_init_norm(state, group, update, grad, param):
-    state["init_norm"] = param.to(_storage_dtype(group)).norm()
+    scale, norm = utils.stable_l2_components(param)
+    state["init_norm"] = torch.stack((scale, norm))
 
 
 @needs_full_param
@@ -1161,7 +1205,7 @@ def update_by_hyperball(group, update, grad, param, init_norm):
 
 
 def _store_std(state, group, update, grad, param):
-    state["init_std"] = torch.std(param.to(_storage_dtype(group)))
+    state["init_std"] = torch.std(utils.promote(param), correction=0).to(_storage_dtype(group))
 
 
 @needs_full_param
@@ -1169,6 +1213,8 @@ def _store_std(state, group, update, grad, param):
 @no_state
 def mup_approx(group, updates, grads, params, init_std):
     _updates = [(u, i) for u, i in zip(updates, init_std) if u.ndim > 1]
+    if not _updates:
+        return updates
     _updates, _init_std = zip(*_updates)
     utils.stochastic_multiply_(_updates, _init_std)
     return updates
@@ -1216,26 +1262,26 @@ def heavyball_momentum(group, updates, grads, params, momentum):
     return utils.heavyball_momentum(momentum, updates, utils.get_beta1(group))
 
 
-def _init_scion_state(state, group, update, grad, param):
-    state["scion_state"] = {"initialized": False}
+def _init_scion_param(state, group, update, grad, param):
+    utils.scion_auto_init_param_(param, group.get("scale", 1.0), seed=group["_param_indices"][id(param)])
 
 
 @needs_full_param
-@general_guard("scion_state", init_fn=_init_scion_state, skip_first=False)
+@general_guard(init_fn=_init_scion_param, skip_first=False)
 @no_state
-def scion_auto_norm(group, update, grad, param, scion_state):
+def scion_auto_norm(group, update, grad, param):
     scale = group.get("scale", 1.0)
-    param_ids = {id(p): i for i, p in enumerate(group["params"])}
-    for ctx, p in zip(scion_state, param):
-        if not ctx["initialized"]:
-            utils.scion_auto_init_param_(p, scale, seed=param_ids.get(id(p), 0))
-            ctx["initialized"] = True
-    return utils.scion_auto_lmo_(update, scale)
+    return utils.scion_auto_lmo_(update, scale, group["eps"])
 
 
 def _init_soap(state, group, update, grad, param):
     utils.init_preconditioner(
-        grad, state, group["max_precond_dim"], group["precondition_1d"], group.get("init_factor", 0.0)
+        grad,
+        state,
+        group["max_precond_dim"],
+        group["precondition_1d"],
+        group.get("init_factor", 0.0),
+        state_dtype=_storage_dtype(group),
     )
 
 
@@ -1248,7 +1294,7 @@ def _apply_soap_preconditioner(
     for upd, q, gg, ea_sq, *ref in zip(update, Q, GG, eas, *exp_avgs):
         g = utils.promote(upd)
         if use_kl:
-            utils.update_ggt_kl(g, gg, q, max_dim, p1d, beta, eps, heavy=heavy)
+            utils.update_ggt_kl(g, gg, q, beta, eps, heavy=heavy)
         else:
             utils.update_ggt(g, gg, max_dim, p1d, beta)
         if group["is_preconditioning"]:
@@ -1303,11 +1349,10 @@ def scale_by_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG):
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
-    utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
-    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
-    dampening = group.get("dampening", 0.0)
-    accum = [utils.dampen_grad(u, dampening)[1] for u in update] if dampening > 0 else update
-    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"])
+    beta1 = utils.beta_debias(utils.get_beta1(group), group["step"] - 1)
+    ema = utils._lerp(exp_avg, update, beta1)
+    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(ema, Q, GG)]
+    _apply_soap_preconditioner(group, update, Q, GG, use_kl=True, eps=group["eps"])
     for gg in GG:
         factors = [m for m in gg if isinstance(m, torch.Tensor)]
         if len(factors) >= 2:
@@ -1322,7 +1367,15 @@ def scale_by_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product, Q, GG):
-    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    coupled = group["weight_decay"] != 0 and not group["decoupled_weight_decay"]
+    source = (
+        [utils.promote(u) + utils.promote(p) * group["weight_decay"] for u, p in zip(update, param)]
+        if coupled
+        else update
+    )
+    if coupled and group["caution"]:
+        group["_caution_grad"] = source
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(source, Q)]
     precond = utils.nadam_(
         grad_projected,
         exp_avg,
@@ -1338,7 +1391,7 @@ def scale_by_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_prod
         False,
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
-    _apply_soap_preconditioner(group, update, Q, GG, exp_avg)
+    _apply_soap_preconditioner(group, source, Q, GG, exp_avg)
     return precond
 
 
@@ -1356,6 +1409,7 @@ def scale_by_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG)
         utils.get_beta1(group),
         utils.get_beta2(group),
         group["step"] - 1,
+        group["eps"],
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg)
@@ -1436,11 +1490,10 @@ def scale_by_heavy_kl_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, G
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_heavy_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
-    utils.stochastic_lerp_(exp_avg, update, 1 - utils.get_beta1(group))
-    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(exp_avg, Q, GG)]
-    dampening = group.get("dampening", 0.0)
-    accum = [utils.dampen_grad(u, dampening)[1] for u in update] if dampening > 0 else update
-    _apply_soap_preconditioner(group, accum, Q, GG, use_kl=True, eps=group["eps"], heavy=True)
+    beta1 = utils.beta_debias(utils.get_beta1(group), group["step"] - 1)
+    ema = utils._lerp(exp_avg, update, beta1)
+    precond = [utils.kl_shampoo_precondition(e, q, gg, group["eps"]) for e, q, gg in zip(ema, Q, GG)]
+    _apply_soap_preconditioner(group, update, Q, GG, use_kl=True, eps=group["eps"], heavy=True)
     for gg in GG:
         factors = [m for m in gg if isinstance(m, torch.Tensor)]
         if len(factors) >= 2:
@@ -1455,7 +1508,15 @@ def scale_by_heavy_kl_shampoo(group, update, grad, param, exp_avg, Q, GG):
 @general_guard("Q", "GG", init_fn=_init_soap)
 @no_state
 def scale_by_heavy_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, mu_product, Q, GG):
-    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(update, Q)]
+    coupled = group["weight_decay"] != 0 and not group["decoupled_weight_decay"]
+    source = (
+        [utils.promote(u) + utils.promote(p) * group["weight_decay"] for u, p in zip(update, param)]
+        if coupled
+        else update
+    )
+    if coupled and group["caution"]:
+        group["_caution_grad"] = source
+    grad_projected = [utils.project(utils.promote(u), q, False) for u, q in zip(source, Q)]
     precond = utils.nadam_(
         grad_projected,
         exp_avg,
@@ -1471,7 +1532,7 @@ def scale_by_heavy_soap_nadam(group, update, grad, param, exp_avg, exp_avg_sq, m
         False,
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
-    _apply_soap_preconditioner(group, update, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
+    _apply_soap_preconditioner(group, source, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
     return precond
 
 
@@ -1489,6 +1550,7 @@ def scale_by_heavy_soap_laprop(group, update, grad, param, exp_avg, exp_avg_sq, 
         utils.get_beta1(group),
         utils.get_beta2(group),
         group["step"] - 1,
+        group["eps"],
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
     _apply_soap_preconditioner(group, update, Q, GG, exp_avg, exp_avg_sq=exp_avg_sq, heavy=True)
@@ -1515,13 +1577,23 @@ def scale_by_heavy_soap_ademamix(group, update, grad, param, exp_avg_fast, exp_a
         group.get("alpha_warmup"),
     )
     precond = [utils.project(p, q, True) for p, q in zip(precond, Q)]
-    _apply_soap_preconditioner(group, update, Q, GG, exp_avg_slow, exp_avg_fast, exp_avg_sq=exp_avg_sq, heavy=True)
+    _apply_soap_preconditioner(
+        group,
+        update,
+        Q,
+        GG,
+        exp_avg_slow,
+        exp_avg_fast,
+        exp_avg_sq=exp_avg_sq,
+        heavy=True,
+    )
     return precond
 
 
 def _fill_q_cache(Q_cache, Q):
     for i, (c_, q_) in enumerate(zip(Q_cache, Q)):
-        if c_ is None:
+        q_ = utils.promote(q_)
+        if c_ is None or c_.dtype != q_.dtype:
             Q_cache[i] = c_ = torch.empty_like(q_)
         if q_.ndim == 3:
             torch.matmul(q_.mT, q_, out=c_)
@@ -1537,12 +1609,9 @@ def _update_psgd_precond(
     grad,
     Q,
     running_lower_bound,
-    step,
     prob: Optional[callable] = None,
     store_triu_as_line: Optional[bool] = None,
 ) -> None:
-    if prob is None:
-        prob = utils.precond_update_prob_schedule()
     if store_triu_as_line is None:
         store_triu_as_line = group["store_triu_as_line"]
 
@@ -1559,18 +1628,15 @@ def _update_psgd_precond(
         group["precond_lr"],
         Q,
         store_triu_as_line,
-        utils.get_beta2(group),
         vector,
         running_lower_bound,
         group["lower_bound_beta"],
-        group["precond_update_power_iterations"],
     )
     del vector, hessian_vector
 
-    if isinstance(prob, float):
-        float_prob = prob
-    else:
-        float_prob = prob(group["step"])
+    float_prob = (
+        group.get("_precond_prob", 1.0) if prob is None else prob(group["step_count"]) if callable(prob) else prob
+    )
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if should_use_cache:
@@ -1581,16 +1647,11 @@ def _update_psgd_pro_precond(
     cached,
     Q_cache,
     group,
-    param,
     grad,
     Q,
     running_lower_bound,
-    step,
     prob: Optional[callable] = None,
 ) -> None:
-    if prob is None:
-        prob = utils.precond_update_prob_schedule()
-
     if not group["is_preconditioning"]:
         return
 
@@ -1600,14 +1661,12 @@ def _update_psgd_pro_precond(
         Q,
         running_lower_bound,
         group["lower_bound_beta"],
-        group["precond_update_power_iterations"],
         group["dampening"],
     )
 
-    if isinstance(prob, float):
-        float_prob = prob
-    else:
-        float_prob = prob(group["step"])
+    float_prob = (
+        group.get("_precond_prob", 1.0) if prob is None else prob(group["step_count"]) if callable(prob) else prob
+    )
     group["is_cached"] = should_use_cache = cached and float_prob < 0.5
 
     if should_use_cache:
@@ -1643,7 +1702,7 @@ def _update_lra(
     group, U: List[Tensor], V: List[Tensor], d: List[Tensor], params: List[Tensor], grads: List[Tensor], delayed: bool
 ):
     if not group["is_preconditioning"]:
-        return utils.multi_flatten((U, 1), (V, 1), (d, 0))
+        return utils._flatten_lra(U, V, d)
 
     if (utils.get_temporary(group, params[0]) or {}).get("hessian_vector") is not None:
         vector_hv = [utils.take_temporary(group, p, "vector", "hessian_vector") for p in params]
@@ -1725,7 +1784,7 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def scale_by_psgd(
     group,
@@ -1736,11 +1795,10 @@ def scale_by_psgd(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
@@ -1749,7 +1807,7 @@ def scale_by_psgd(
 @SqueezeGrad
 @PrecondGradAccumGuard
 @zero_guard("exp_avg", "exp_avg_sq")
-@general_guard("Q", "Q_basis", "running_lower_bound", "step", init_fn=_init_psgd_eigen_kron, skip_first=True)
+@general_guard("Q", "Q_basis", "running_lower_bound", init_fn=_init_psgd_eigen_kron, skip_first=True)
 @no_state_no_multi_tensor
 def scale_by_lather(
     group,
@@ -1762,7 +1820,6 @@ def scale_by_lather(
     Q,
     Q_basis,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     prob: Optional[callable] = None,
 ):
     projected = utils.project(utils.promote(update), Q_basis, False)
@@ -1772,17 +1829,18 @@ def scale_by_lather(
         projected,
         utils.get_beta1(group),
         utils.get_beta2(group),
-        group["step"],
+        group["step"] - 1,
         group["eps"],
     )[0]
     precond = utils.project(precond, Q_basis, True)
 
     if group["is_preconditioning"]:
-        _update_psgd_precond(False, None, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+        _update_psgd_precond(False, None, group, param, update_to_precond, Q, running_lower_bound, prob)
         utils.update_psgd_eigenbasis(
             utils.line_to_triu(Q) if group["store_triu_as_line"] else Q,
             Q_basis,
             exp_avg,
+            exp_avg_sq=exp_avg_sq,
         )
 
     return precond
@@ -1792,7 +1850,7 @@ def scale_by_lather(
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def scale_by_delayed_psgd(
     group,
@@ -1803,12 +1861,11 @@ def scale_by_delayed_psgd(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
     precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, prob)
     return precond
 
 
@@ -1816,7 +1873,7 @@ def scale_by_delayed_psgd(
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def update_by_psgd(
     group,
@@ -1827,12 +1884,11 @@ def update_by_psgd(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
-    _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, prob)
+    _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache)
     return _SKIP
 
 
@@ -1852,7 +1908,7 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_multi_tensor
 def update_by_delayed_psgd(
     group,
@@ -1863,12 +1919,11 @@ def update_by_delayed_psgd(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, prob)
     return _SKIP
 
 
@@ -1876,7 +1931,7 @@ def update_by_delayed_psgd(
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_pro_kron, skip_first=False)
 @no_state_no_multi_tensor
 def scale_by_psgd_pro(
     group,
@@ -1887,11 +1942,10 @@ def scale_by_psgd_pro(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
+    _update_psgd_pro_precond(cached, Q_cache, group, update_to_precond, Q, running_lower_bound, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
@@ -1899,7 +1953,7 @@ def scale_by_psgd_pro(
 @bucket_aware
 @SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "running_lower_bound", "step", init_fn=_init_psgd_pro_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "running_lower_bound", init_fn=_init_psgd_pro_kron, skip_first=False)
 @no_state_no_multi_tensor
 def update_by_psgd_pro(
     group,
@@ -1910,12 +1964,11 @@ def update_by_psgd_pro(
     Q,
     Q_cache,
     running_lower_bound: List[Tensor],
-    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_pro_precond(cached, Q_cache, group, param, update_to_precond, Q, running_lower_bound, step, prob)
-    _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
+    _update_psgd_pro_precond(cached, Q_cache, group, update_to_precond, Q, running_lower_bound, prob)
+    _fused_cached_psgd_precond_grad(group, grad, param, update, Q, Q_cache)
     return _SKIP
 
 
@@ -1932,9 +1985,12 @@ def apply_to_idx(fn, idx):
         fn = getattr(utils, fn, None)
         if fn is None or not callable(fn):
             raise ValueError(f"Unknown function '{name}'")
+    elif not callable(fn):
+        raise ValueError(f"Expected a callable or function name, got {fn!r}")
 
     def _fn(state, group, update, grad, param):
         args = [state, group, update, grad, param]
+        args[idx] = utils.promote(args[idx])
         return fn(args[idx])
 
     _fn.__name__ = _fn.__qualname__ = f"apply_{getattr(fn, '__name__', repr(fn))}_to_{idx}"
@@ -2283,37 +2339,83 @@ def _inner_chain(state, group, update, grad, param, *fns):
 
 
 def chain(state: list, group, grad, param, *fns):
+    grad = list(grad)
     update = [torch.clone(g, memory_format=torch.preserve_format) for g in grad]
+    decay = group["weight_decay"] if group.get("decoupled_weight_decay", True) else 0
 
-    ecc = ECCConfig.from_group(group, key="param_ecc")
+    ecc = group.get("_param_ecc_config")
     if ecc is None:
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if skip_update or update is None:
+            group.pop("_caution_grad", None)
             return
+        caution_grad = group.pop("_caution_grad", grad)
         utils.update_param_(
             param,
             update,
             group["lr"],
-            group["weight_decay"],
+            decay,
             caution=group["caution"],
             cautious_decay=group.get("cautious_weight_decay", False),
-            grad=grad,
+            grad=caution_grad,
         )
         return
 
-    corrs = [st["param::ecc"] for st in state]
+    corrs = [st["param::ecc"].view_as(pi) for st, pi in zip(state, param)]
     with ecc.attached(param, corrs):
         update, skip_update = _inner_chain(state, group, update, grad, param, *fns)
         if not skip_update and update is not None:
+            caution_grad = group.pop("_caution_grad", grad)
             utils.update_param_(
                 param,
                 update,
                 group["lr"],
-                group["weight_decay"],
+                decay,
                 caution=group["caution"],
                 cautious_decay=group.get("cautious_weight_decay", False),
-                grad=grad,
+                grad=caution_grad,
             )
+        else:
+            group.pop("_caution_grad", None)
+
+
+def _contains_route(obj):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, Route):
+            return True
+        if isinstance(cur, FunctionTransform):
+            stack.append(cur.fn)
+        elif isinstance(cur, functools.partial):
+            stack.append(cur.func)
+        elif isinstance(cur, Parallel):
+            stack.extend(cur.branches)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend(cur)
+    return False
+
+
+def _required_transform_ids(obj, param):
+    required = set()
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, FunctionTransform):
+            if cur.transform_idx is not None and getattr(cur, "needs_init", True) and not cur._under_bucket:
+                required.add(cur.transform_idx)
+            stack.append(cur.fn)
+        elif isinstance(cur, functools.partial):
+            stack.append(cur.func)
+        elif isinstance(cur, Parallel):
+            stack.extend(cur.branches)
+        elif isinstance(cur, Route):
+            selected = cur._select(param)
+            if selected is not None:
+                stack.extend(selected)
+        elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
+            stack.extend(cur)
+    return required
 
 
 def _walk_fns(obj):
@@ -2330,7 +2432,8 @@ def _walk_fns(obj):
                 stack.extend(branch)
         elif isinstance(cur, Route):
             for _, fns in cur.routes:
-                stack.extend(fns)
+                if fns is not None:
+                    stack.extend(fns)
             if cur.default is not None:
                 stack.extend(cur.default)
         elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
@@ -2351,7 +2454,8 @@ def _walk_fns_with_bucket(obj):
                 stack.extend((b, ub) for b in branch)
         elif isinstance(cur, Route):
             for _, fns in cur.routes:
-                stack.extend((f, ub) for f in fns)
+                if fns is not None:
+                    stack.extend((f, ub) for f in fns)
             if cur.default is not None:
                 stack.extend((f, ub) for f in cur.default)
         elif isinstance(cur, _Iterable) and not isinstance(cur, (str, bytes, bytearray)):
@@ -2359,6 +2463,7 @@ def _walk_fns_with_bucket(obj):
 
 
 def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
+    fns = list(fns)
     if retain and offset:
         raise ValueError("offset cannot be retained")
 
@@ -2366,9 +2471,11 @@ def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
         offset = max((ft.transform_idx for ft in _walk_fns(fns) if ft.transform_idx is not None), default=-1) + 1
 
     new_fns = [copy.deepcopy(fn) for fn in fns]
+    seen = set()
     for ft, under_bucket in _walk_fns_with_bucket(new_fns):
-        if not retain or ft.transform_idx is None:
+        if not retain or ft.transform_idx is None or ft.transform_idx in seen:
             ft.transform_idx, offset = offset, offset + 1
+        seen.add(ft.transform_idx)
         ft._under_bucket = under_bucket
         ft._build_val_names()
 
@@ -2377,6 +2484,7 @@ def set_indices(fns: Iterable[callable], retain: bool = True, offset: int = 0):
 
 class ChainOpt(utils.StatefulOptimizer):
     promote: bool = False
+    _INSTANCE_ATTRS = utils.StatefulOptimizer._INSTANCE_ATTRS + ("promote",)
     global_defaults = {
         "caution": False,
         "lr": 1,
@@ -2389,13 +2497,19 @@ class ChainOpt(utils.StatefulOptimizer):
         orig = defaults.pop("orig_shapes", None)
         base = self.global_defaults.copy()
         base.update({k: v for k, v in defaults.items() if v is not use_default})
-        super().__init__(params, base)
+        use_ema = base.pop("use_ema", False)
+        ema_decay = base.pop("ema_decay", None)
+        super().__init__(params, base, use_ema=use_ema)
+        if ema_decay is not None:
+            self.ema_decay = ema_decay
         self._orig_shapes = self._resolve_orig_shapes(orig)
+        self._refresh_param_indices()
+        self._refresh_ecc_configs()
         self.fns = fns
         self._eager_chain = self._run_chain
         if self.compile_step:
             self._run_chain = utils.fusions.compile(self._run_chain, fullgraph=True)
-        self.register_load_state_dict_post_hook(ChainOpt._restore_ecc_dtypes)
+        self.register_load_state_dict_post_hook(ChainOpt._restore_state_dtypes)
         self._init_param_ecc()
 
     def _resolve_orig_shapes(self, orig):
@@ -2423,7 +2537,7 @@ class ChainOpt(utils.StatefulOptimizer):
             self._init_param_ecc_group(group)
 
     def _init_param_ecc_group(self, group):
-        ecc = ECCConfig.from_group(group, key="param_ecc")
+        ecc = group["_param_ecc_config"]
         if ecc is None:
             return
         for p in group["params"]:
@@ -2443,39 +2557,51 @@ class ChainOpt(utils.StatefulOptimizer):
 
     def add_param_group(self, param_group):
         super().add_param_group(param_group)
-        if not hasattr(self, "mapping"):
-            return
-        self._init_param_ecc_group(self.param_groups[-1])
+        if hasattr(self, "mapping"):
+            self._refresh_param_indices()
+            self._refresh_ecc_configs()
+            self._init_param_ecc_group(self.param_groups[-1])
+
+    def _refresh_param_indices(self):
+        indices = {id(p): i for i, p in enumerate(p for group in self.param_groups for p in group["params"])}
+        for group in self.param_groups:
+            group["_param_indices"] = {id(p): indices[id(p)] for p in group["params"]}
+
+    def _refresh_ecc_configs(self):
+        for group in self.param_groups:
+            group["_ecc_config"] = ECCConfig.from_group(group)
+            group["_param_ecc_config"] = ECCConfig.from_group(group, key="param_ecc")
 
     @staticmethod
-    def _restore_ecc_dtypes(optimizer, *args):
-        for group in optimizer.param_groups:
-            ecc = ECCConfig.from_group(group, key="ecc")
-            param_ecc = ECCConfig.from_group(group, key="param_ecc")
-            if ecc is None and param_ecc is None:
-                continue
-            for p in group["params"]:
-                if p not in optimizer.state:
-                    continue
-                for idx_state in optimizer.state[p].values():
-                    if not isinstance(idx_state, dict):
-                        continue
-                    for k in list(idx_state.keys()):
-                        v = idx_state[k]
-                        if not isinstance(v, torch.Tensor):
-                            continue
-                        is_param_key = k == "param" or k.startswith("param::")
-                        cfg = param_ecc if is_param_key else ecc
-                        if cfg is None:
-                            continue
-                        if k.endswith("::ecc"):
-                            idx_state[k] = v.to(cfg.corr_dtype)
-                        elif (k + "::ecc") in idx_state:
-                            idx_state[k] = v.to(cfg.primary_dtype)
-                if param_ecc is not None and p.dtype != param_ecc.primary_dtype:
-                    p.data = p.data.to(param_ecc.primary_dtype)
-            if param_ecc is not None:
-                optimizer._init_param_ecc_group(group)
+    def _restore_state_dtypes(optimizer, *args):
+        def restore(value, source):
+            if isinstance(value, Tensor) and isinstance(source, Tensor):
+                return source.to(device=value.device).clone(memory_format=torch.preserve_format)
+            if isinstance(value, dict) and isinstance(source, dict):
+                for key, item in source.items():
+                    value[key] = restore(value[key], item)
+            elif isinstance(value, list) and isinstance(source, list):
+                value[:] = [restore(v, s) for v, s in zip(value, source, strict=True)]
+            elif isinstance(value, tuple) and isinstance(source, tuple):
+                return tuple(restore(v, s) for v, s in zip(value, source, strict=True))
+            return value
+
+        for p, dtype in optimizer._loaded_param_dtypes.items():
+            if p.dtype != dtype:
+                p.data = p.data.to(dtype)
+        del optimizer._loaded_param_dtypes
+        optimizer.mapping.clear()
+        optimizer.mapping_inverse.clear()
+
+        values = optimizer._loaded_state_values
+        for p, source in values.items():
+            if p in optimizer.state:
+                optimizer.state[p] = restore(optimizer.state[p], source)
+        del optimizer._loaded_state_values
+        if isinstance(optimizer, BaseOpt):
+            optimizer._rewire_fns()
+        optimizer._refresh_param_indices()
+        optimizer._refresh_ecc_configs()
 
     @property
     def fns(self):
@@ -2485,7 +2611,10 @@ class ChainOpt(utils.StatefulOptimizer):
     def fns(self, value):
         self._fns = value
         self._set_indices(retain=True)
+        self._route_aware_init = _contains_route(self._fns)
         self._needs_gather = any(getattr(ft, "needs_full_param", False) for ft in _walk_fns(self._fns))
+        sf_fn = update_by_schedule_free.get_fn()
+        self._uses_schedule_free = any(ft.get_fn() is sf_fn for ft in _walk_fns(self._fns))
         self._transform_ids = frozenset(
             ft.transform_idx
             for ft in _walk_fns(self._fns)
@@ -2502,78 +2631,97 @@ class ChainOpt(utils.StatefulOptimizer):
         raise KeyError(f"No transform stores '{name}'")
 
     def _step(self, group):
-        if "base_lr" not in group:
-            group["base_lr"] = group["lr"]
-        elif group["base_lr"] != group["lr"]:
-            utils.warn_once(
-                f"Learning rate changed between steps. This is an experimental feature and "
-                f"only supported with multi_tensor=True (currently multi_tensor={group['multi_tensor']})."
-            )
-            group["base_lr"] = group["lr"]
+        group["base_lr"] = group["lr"]
 
         views, gathers = _reshape_params(group["params"], self._orig_shapes, self._needs_gather)
+        changed = [p for p, _ in views]
+        if isinstance(gathers, _FSDPState):
+            changed.extend(p for p, _, _ in gathers.items)
+        for p in changed:
+            self._clear_views(p)
         group["_orig_shapes"] = self._orig_shapes
         try:
             self._step_inner(group)
         finally:
             _restore_params(views, gathers)
-
-    def _recover_step(self, group):
-        for param in group["params"]:
-            param_state = self.state.get(param)
-            if not isinstance(param_state, dict):
-                continue
-            for idx_state in param_state.values():
-                if isinstance(idx_state, dict) and "step" in idx_state:
-                    return idx_state["step"]
-        return 0
+            for p in changed:
+                self._clear_views(p)
 
     def _step_inner(self, group):
-        caution = group["caution"]
-
         vals = list(self.split_p_and_g_in_group(group, should_promote=self.promote))
-
-        step = group.get("step_count")
-        if step is None:
-            step = self._recover_step(group)
-
         if not vals:
-            group["step_count"] = step + 1
             return
-        p, g = zip(*vals)
 
-        if isinstance(step, torch.Tensor):
-            step = step.to(device=p[0].device, dtype=torch.int64)
+        group["step_count"] = group.get("step_count", 0) + 1
+        warmup = group["warmup_steps"] + 1
+        if isinstance(group["base_lr"], Real):
+            lr = group["base_lr"] * group["step_count"] / max(group["step_count"], warmup)
+            group["lr"] = utils.scalar_guard(float(lr), vals[0][0]) if group["warmup_steps"] else float(lr)
+            if self._uses_schedule_free:
+                weight = abs(lr) ** group["weight_lr_power"]
+                if group["r"] != 0:
+                    weight *= group["step_count"] ** group["r"]
+                weight_sum = group.get("weight_sum", 0.0) + weight
+                group["weight_sum"] = weight_sum
+                group["_sf_ckp1"] = utils.scalar_guard(0 if weight_sum == 0 else weight / weight_sum, vals[0][0])
         else:
-            step = utils.scalar_guard(step, p[0])
-        group["step_count"] = group["step"] = step = step + 1
-        self.state_(p[0])["step"] = step
-        group["prev_lr"] = group["lr"] = group["base_lr"] * step / step.clamp(min=group["warmup_steps"] + 1)
+            global_step_t = utils.scalar_guard(float(group["step_count"]), vals[0][0])
+            base_lr = utils.scalar_guard(group["base_lr"], vals[0][0])
+            group["lr"] = base_lr * global_step_t / global_step_t.clamp(min=warmup)
+            if self._uses_schedule_free:
+                weight = group["lr"].abs().pow(group["weight_lr_power"])
+                if group["r"] != 0:
+                    weight = weight * global_step_t.pow(group["r"])
+                weight_sum = utils.scalar_guard(group.get("weight_sum", 0.0), weight) + weight
+                group["weight_sum"] = weight_sum
+                group["_sf_ckp1"] = torch.where(weight_sum != 0, weight / weight_sum, torch.zeros_like(weight_sum))
+
+        buckets = {}
+        for param, grad in vals:
+            state = self.state_(param)
+            step_count = state.get("step_count", 0) + 1
+            state["step_count"] = step_count
+            key = step_count, param.device, utils.promote(param.dtype), param.dtype == torch.float64 and param.ndim == 0
+            buckets.setdefault(key, []).append((param, grad, state))
+
         try:
-            if not group["multi_tensor"] or len(p) == 1:
-                for param, grad in zip(p, g):
-                    self._chain(group, [grad], [param], caution)
-            else:
-                self._chain(group, g, p, caution)
+            for (step_count, _, _, _), items in buckets.items():
+                p, g, states = zip(*items)
+                states = list(states)
+                step = utils.scalar_guard(step_count, p[0])
+                group["step"] = step
+                if not group["multi_tensor"] or len(p) == 1:
+                    for param, grad, state in zip(p, g, states):
+                        self._chain(group, [grad], [param], [state])
+                else:
+                    self._chain(group, g, p, states)
         finally:
-            group["caution"] = caution
+            group.pop("_caution_grad", None)
             group["lr"] = group["base_lr"]
             group["step"] = None
 
-    def _run_chain(self, state, group, g, p, caution):
+    def _run_chain(self, state, group, g, p):
         chain(state, group, g, p, *self.fns)
 
-    def _needs_init(self, state):
+    def _required_ids(self, param):
+        return _required_transform_ids(self.fns, param)
+
+    def _needs_init(self, state, param=None):
         ids = self._transform_ids
         if not ids:
             return False
-        all_initialized = set()
-        for st in state:
-            all_initialized.update(st.get("is_initialized", ()))
-        return not ids.issubset(all_initialized)
+        if self._route_aware_init:
+            if param is None:
+                initialized = set().union(*(st.get("is_initialized", ()) for st in state))
+                return not ids.issubset(initialized)
+            return any(
+                not self._required_ids(p).issubset(st.get("is_initialized", ()))
+                for st, p in zip(state, param)
+            )
+        return any(not ids.issubset(st.get("is_initialized", ())) for st in state)
 
-    def _needs_eager(self, group, state):
-        if self._needs_init(state):
+    def _needs_eager(self, group, state, param):
+        if self._needs_init(state, param):
             return True
         if group.get("is_preconditioning", False):
             return True
@@ -2581,12 +2729,15 @@ class ChainOpt(utils.StatefulOptimizer):
             return True
         return False
 
-    def _chain(self, group, g, p, caution):
-        state = [self.state_(pi) for pi in p]
+    def _chain(self, group, g, p, state):
+        if p[0].dtype == torch.float64 and p[0].ndim == 0:
+            with utils.force_eager():
+                self._eager_chain(state, group, g, p)
+            return
         fn = self._run_chain
-        if self.compile_step and self._needs_eager(group, state):
+        if self.compile_step and self._needs_eager(group, state, p):
             fn = self._eager_chain
-        fn(state, group, g, p, caution)
+        fn(state, group, g, p)
 
 
 str_or_fn = Union[str, callable, None, Literal[use_default]]
@@ -2635,6 +2786,70 @@ class BaseOpt(ChainOpt):
     update_clipping: str_or_fn = None
     palm: bool = False
     auto_fuse: bool = True
+    _TOPOLOGY_KEYS = ("palm", "gradient_clipping", "update_clipping", "mars")
+
+    def _core_fns_from_group(self, group):
+        return self._core_fns
+
+    def _checkpoint_topology(self):
+        return {key: ("custom",) if callable(value) else value for key, value in self._topology.items()}
+
+    def _restore_topology(self):
+        for key, value in self._loaded_topology.items():
+            if value != ("custom",):
+                self._topology[key] = value
+        self._loaded_topology = None
+
+    @staticmethod
+    def _checkpoint_option(value):
+        if callable(value) and getattr(value, "__module__", None) == utils.__name__:
+            return value.__name__
+        return value
+
+    def _wire_fns(self, fns, group):
+        fns = tuple(fns)
+        fn = fns[-1]
+        args = kwargs = None
+        if isinstance(fn, functools.partial):
+            fn, args, kwargs = fn.func, fn.args, fn.keywords
+        if isinstance(fn, FunctionTransform):
+            fn = fn.get_fn()
+
+        update_clipping = group["update_clipping"]
+        if update_clipping is None and self.auto_fuse and fn in _scale_to_update_map:
+            fn = _scale_to_update_map[fn]
+            if args is not None:
+                fn = functools.partial(fn, *args, **kwargs)
+            fns = fns[:-1] + (fn,)
+        elif update_clipping is not None and fn in _scale_to_update_map_inv:
+            fn = _scale_to_update_map_inv[fn]
+            if args is not None:
+                fn = functools.partial(fn, *args, **kwargs)
+            fns = fns[:-1] + (fn,)
+
+        if group["palm"]:
+            fns = (palm_beta2,) + fns
+        if group["gradient_clipping"] is not None:
+            fns = (apply_to_idx(group["gradient_clipping"], 2),) + fns
+        if group.get("mars", False):
+            fns = (mars,) + fns
+        if update_clipping is not None:
+            fns += (apply_to_idx(update_clipping, 2),)
+        return fns
+
+    def _rewire_fns(self):
+        self._restore_topology()
+        self.fns = self._wire_fns(self._core_fns_from_group(self._topology), self._topology)
+
+    def add_param_group(self, param_group):
+        for key, expected in self._topology.items():
+            if key not in param_group:
+                continue
+            value = param_group.pop(key)
+            value = expected if value is use_default else self._checkpoint_option(value)
+            if value != expected:
+                raise ValueError(f"{key} is optimizer-wide")
+        super().add_param_group(param_group)
 
     def __init__(
         self,
@@ -2650,54 +2865,23 @@ class BaseOpt(ChainOpt):
         if not fns:
             raise ValueError("No functions provided. If that's on purpose (SGD-like), use `identity`")
 
-        args, kwargs = None, None
-        fns = tuple(fns)
-        fn = fns[-1]
-        if isinstance(fn, functools.partial):
-            fn, args, kwargs = fn.func, fn.args, fn.keywords
-        if isinstance(fn, FunctionTransform):
-            fn = fn.get_fn()
-
-        if default(update_clipping, self.update_clipping) is None:
-            if self.auto_fuse:
-                if fn in _scale_to_update_map:
-                    fn = _scale_to_update_map[fn]
-                    if args is not None:
-                        fn = functools.partial(fn, *args, **kwargs)
-                    fns = tuple(fns)[:-1] + (fn,)
-        elif fn in _scale_to_update_map_inv:
-            if not self.auto_fuse:
-                raise ValueError(
-                    "update_clipping is currently not compatible with update_by_* functions. "
-                    "Manually select scale_by_* functions or set auto_fuse=True."
-                )
-            fn = _scale_to_update_map_inv[fn]
-            if args is not None:
-                fn = functools.partial(fn, *args, **kwargs)
-            fns = tuple(fns)[:-1] + (fn,)
-
         self.compile_step = default(default(compile_step, defaults.pop("compile_step", use_default)), self.compile_step)
         self.promote = default(default(promote, defaults.pop("promote", use_default)), self.promote)
-        # Consumed above to wire fns — drop from defaults so they don't pollute state_dict
-        # (callables are rejected by torch.load weights_only=True).
-        defaults.pop("update_clipping", None)
-        defaults.pop("gradient_clipping", None)
-        if default(palm, self.palm):
-            fns = (palm_beta2,) + fns
-        if default(gradient_clipping, self.gradient_clipping) is not None:
-            fns = (apply_to_idx(gradient_clipping, 2),) + fns
-        if defaults.get("mars", False):
-            fns = (mars,) + fns
-        if default(update_clipping, self.update_clipping) is not None:
-            fns = fns + (apply_to_idx(update_clipping, 2),)
-
-        super().__init__(params, defaults, *fns)
+        defaults["palm"] = default(palm, self.palm)
+        defaults["gradient_clipping"] = self._checkpoint_option(default(gradient_clipping, self.gradient_clipping))
+        defaults["update_clipping"] = self._checkpoint_option(default(update_clipping, self.update_clipping))
+        self._topology = {key: defaults[key] for key in self._TOPOLOGY_KEYS if key in defaults}
+        for key in self._topology:
+            defaults.pop(key)
+        self._core_fns = tuple(fns)
+        super().__init__(params, defaults, *self._wire_fns(self._core_fns, self._topology))
 
 
 class ScheduleFree(BaseOpt):
     def eval(self):
         return self.train(False)
 
+    @torch.no_grad()
     def train(self, mode: bool = True):
         z_key = self._find_val_name("z")
         for group in self.param_groups:
@@ -2710,12 +2894,20 @@ class ScheduleFree(BaseOpt):
                 continue
             weight = 1 - beta1 if mode else 1 - 1 / beta1
             for p in group["params"]:
-                state = self.state_(p)
-                if z_key in state:
-                    z = utils.promote(state[z_key])
-                    p32 = utils.promote(p.data)
-                    p32.lerp_(end=z, weight=weight)
-                    utils.copy_stochastic_(p.data, p32)
+                for pv in self._set_views(p, group):
+                    state = self.state_(pv)
+                    if z_key not in state:
+                        continue
+                    z = state[z_key]
+                    with contextlib.ExitStack() as stack:
+                        param_ecc = group.get("_param_ecc_config")
+                        if param_ecc is not None:
+                            stack.enter_context(param_ecc.attached([pv], [state["param::ecc"].view_as(pv)]))
+                        state_ecc = group.get("_ecc_config")
+                        if state_ecc is not None:
+                            stack.enter_context(state_ecc.attached([z], [state[z_key + "::ecc"]]))
+                        p32, z32 = utils.promote(pv), utils.promote(z)
+                        utils.copy_stochastic_(pv, p32 + (z32 - p32) * weight)
         return self
 
 
@@ -2723,6 +2915,7 @@ class MSAM(BaseOpt):
     def eval(self):
         return self.train(False)
 
+    @torch.no_grad()
     def train(self, mode: bool = True):
         z_key = self._find_val_name("z")
         for group in self.param_groups:
@@ -2731,9 +2924,19 @@ class MSAM(BaseOpt):
                 continue
             group["train_mode"] = mode
             for p in group["params"]:
-                state = self.state_(p)
-                if z_key in state:
-                    p_copy = p.data.clone()
-                    utils.copy_stochastic_(p.data, state[z_key])
-                    utils.copy_stochastic_(state[z_key], p_copy)
+                for pv in self._set_views(p, group):
+                    state = self.state_(pv)
+                    if z_key not in state:
+                        continue
+                    z = state[z_key]
+                    with contextlib.ExitStack() as stack:
+                        param_ecc = group.get("_param_ecc_config")
+                        if param_ecc is not None:
+                            stack.enter_context(param_ecc.attached([pv], [state["param::ecc"].view_as(pv)]))
+                        state_ecc = group.get("_ecc_config")
+                        if state_ecc is not None:
+                            stack.enter_context(state_ecc.attached([z], [state[z_key + "::ecc"]]))
+                        value = utils.promote(pv).clone()
+                        utils.copy_stochastic_(pv, utils.promote(z))
+                        utils.copy_stochastic_(z, value)
         return self

@@ -2,8 +2,8 @@ from typing import List
 
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import nn
+from utils import get_optim
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -25,8 +25,6 @@ def test_merge(opt, size: List[int], merge, split, depth: int = 2, iterations: i
     clean()
     set_torch()
     opt = getattr(heavyball, opt)
-    heavyball.utils.zeroth_power_mode = "qr"
-
     model = nn.Sequential(*[Param(size) for _ in range(depth)]).cuda()
     initial = [p.detach().clone() for p in model.parameters()]
     o = get_optim(

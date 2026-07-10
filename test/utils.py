@@ -1,4 +1,5 @@
 import functools
+import inspect
 import warnings
 from typing import Callable, List
 
@@ -19,6 +20,33 @@ _SKIP_GET_OPTIM = {
     "SplitOpt",
     "SAMWrapper",
 }
+
+_OPTIM_DEFAULTS = {
+    "betas": (0.9, 0.999),
+    "precondition_frequency": 16,
+    "merge_dims": True,
+    "warmup_steps": 100,
+    "max_precond_dim": 2**16,
+    "beta": 0.9,
+    "max_size_triangular": 2**16,
+    "split": False,
+    "precond_grad_accum": False,
+    "momentum_into_precond_update": True,
+    "eps": 1e-8,
+    "weight_decay": 0,
+    "dampening": 2**-24,
+    "preconditioner_update_probability": 1.0,
+    "precond_init_scale": 1.0,
+    "store_triu_as_line": False,
+    "update_clipping": None,
+    "delayed": True,
+}
+
+
+def get_optim(optim, params, **kwargs):
+    args = {**_OPTIM_DEFAULTS, **kwargs}
+    sig = inspect.signature(optim)
+    return optim(params, **{key: value for key, value in args.items() if key in sig.parameters})
 
 
 def _fn_key(f):
@@ -54,7 +82,13 @@ def _deduplicate_by_chain(names):
 
 
 REPRESENTATIVE_OPTS, BUCKET_AWARE_OPTS = _deduplicate_by_chain(
-    [name for name in heavyball.__all__ if name not in _SKIP_GET_OPTIM]
+    [
+        name
+        for name in heavyball.__all__
+        if name not in _SKIP_GET_OPTIM
+        and isinstance(getattr(heavyball, name), type)
+        and issubclass(getattr(heavyball, name), torch.optim.Optimizer)
+    ]
 )
 
 

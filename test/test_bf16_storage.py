@@ -1,9 +1,8 @@
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, set_grad
+from utils import REPRESENTATIVE_OPTS, get_optim, set_grad
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -34,14 +33,15 @@ def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, out
     all_params = []
 
     for dtype_name in ["float32", "bfloat16"]:
-        torch.manual_seed(0x2131290)
         all_params.append([])
 
         for i in range(outer_iterations):
+            torch.manual_seed(0x2131290 + i)
             model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
             o = get_optim(opt, model.parameters(), lr=1e-3, storage_dtype=dtype_name)
 
-            for _ in range(iterations):
+            for j in range(iterations):
+                torch.manual_seed(0x2131290 + outer_iterations + i * iterations + j)
                 set_grad(model)
                 o.step()
                 o.zero_grad()

@@ -39,6 +39,5 @@ EOF
 if [[ ${1:-} == push ]]; then
   run_list <<'EOF'
 test/test_toy_training.py
-test/test_migrate_cli.py
 EOF
 fi

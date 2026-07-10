@@ -158,12 +158,10 @@ class Runner:
                     hessian_vector,
                     cfg["precond_lr"],
                     Q,
-                    False,  # store_triu_as_line
-                    cfg["beta2"],
+                    False,
                     vector,
                     running_lb,
                     cfg["lower_bound_beta"],
-                    cfg["power_iter"],
                 )
             # rel_err expects per-dim Q matrices; strip leading stack dim
             err = rel_err([q[0] if q.ndim == 3 else torch.diag(q[0]) for q in Q], hs)

@@ -65,7 +65,7 @@ def bench_min_sv(rows):
                     A = make_matrix(shape, cond=cond, dtype=dtype, symmetric=True)
                     exact = torch.linalg.svdvals(A.double()).min()
                     try:
-                        approx = min_singular_value(A, power_iter=pi)
+                        approx = min_singular_value(A)
                         if exact.abs() < 1e-8:
                             rerr = abs(approx.double() - exact).item()
                         else:

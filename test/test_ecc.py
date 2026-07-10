@@ -428,7 +428,8 @@ def test_param_ecc_dtype_at_construction():
     clean()
 
 
-def test_param_ecc_save_restore():
+@pytest.mark.parametrize("optimizer_first", [False, True], ids=["model_first", "optimizer_first"])
+def test_param_ecc_save_restore(optimizer_first):
     from copy import deepcopy
 
     set_torch()
@@ -438,113 +439,37 @@ def test_param_ecc_save_restore():
     sd_opt, sd_model = deepcopy(o.state_dict()), deepcopy(m.state_dict())
 
     m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    m2.load_state_dict(sd_model)
-    o2.load_state_dict(sd_opt)
-    p2 = list(m2.parameters())[0]
-    assert p2.dtype == torch.bfloat16, "param dtype not restored after load_state_dict"
-    losses_after = _train(m2, o2, data, target, 10)
-    losses_continued = _train(m, o, data, target, 10)
-    assert 0.5 < losses_after[-1] / max(losses_continued[-1], 1e-12) < 2.0
-    del m, o, m2, o2
-    clean()
+    if optimizer_first:
+        o2.load_state_dict(sd_opt)
+        m2.load_state_dict(sd_model)
+    else:
+        m2.load_state_dict(sd_model)
+        o2.load_state_dict(sd_opt)
+    p, p2 = next(m.parameters()), next(m2.parameters())
+    assert torch.equal(p, p2)
+    state, state2 = _flat_state(o, p), _flat_state(o2, p2)
+    assert state.keys() == state2.keys()
+    for key in state:
+        if isinstance(state[key], torch.Tensor):
+            assert state[key].dtype == state2[key].dtype
+            assert torch.equal(state[key], state2[key])
+        else:
+            assert state[key] == state2[key]
 
-
-def test_param_ecc_partial_state_restore():
-    from copy import deepcopy
-
-    set_torch()
-    data, target = _problem()
-    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
+    rng = torch.cuda.get_rng_state()
     _train(m, o, data, target, 10)
-    sd_opt = deepcopy(o.state_dict())
-    sd_model = deepcopy(m.state_dict())
-    for param_state in sd_opt["state"].values():
-        for idx_state in param_state.values():
-            if isinstance(idx_state, dict):
-                idx_state.pop("param::ecc", None)
-    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    m2.load_state_dict(sd_model)
-    o2.load_state_dict(sd_opt)
-    st2 = _flat_state(o2, list(m2.parameters())[0])
-    assert "param::ecc" in st2, "param::ecc not rehydrated after partial restore"
-    _train(m2, o2, data, target, 5)
+    torch.cuda.set_rng_state(rng)
+    _train(m2, o2, data, target, 10)
     p2 = list(m2.parameters())[0]
     assert p2.dtype == torch.bfloat16
-    assert p2.isfinite().all()
+    assert torch.equal(p, p2)
+    state, state2 = _flat_state(o, p), _flat_state(o2, p2)
+    for key in state:
+        if isinstance(state[key], torch.Tensor):
+            assert torch.equal(state[key], state2[key])
+        else:
+            assert state[key] == state2[key]
     del m, o, m2, o2
-    clean()
-
-
-def test_param_ecc_empty_state_restore():
-    from copy import deepcopy
-
-    set_torch()
-    data, target = _problem()
-    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    _train(m, o, data, target, 10)
-    sd_opt = deepcopy(o.state_dict())
-    sd_model = deepcopy(m.state_dict())
-    sd_opt["state"] = {}
-    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    m2.load_state_dict(sd_model)
-    o2.load_state_dict(sd_opt)
-    p2 = list(m2.parameters())[0]
-    st2 = _flat_state(o2, p2)
-    assert "param::ecc" in st2, "param::ecc not created after empty state restore"
-    assert st2["param::ecc"].dtype == torch.int8
-    _train(m2, o2, data, target, 5)
-    assert p2.dtype == torch.bfloat16
-    assert p2.isfinite().all()
-    del m, o, m2, o2
-    clean()
-
-
-def test_param_ecc_merged_view_partial_restore():
-    from copy import deepcopy
-
-    set_torch()
-    torch.manual_seed(42)
-    model = nn.Sequential(
-        nn.Conv2d(3, 64, 3, bias=False),
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Linear(64, 8, bias=False),
-    ).cuda()
-    opt = heavyball.SOAP(model.parameters(), lr=1e-3, param_ecc="bf16+8")
-    data = torch.randn(4, 3, 8, 8, device="cuda")
-    target = torch.randn(4, 8, device="cuda")
-    conv_p = list(model.parameters())[0]
-    for _ in range(5):
-        d = data.to(conv_p.dtype)
-        ((model(d) - target.to(d.dtype)) ** 2).mean().backward()
-        opt.step()
-        opt.zero_grad()
-    sd_opt = deepcopy(opt.state_dict())
-    sd_model = deepcopy(model.state_dict())
-    for param_state in sd_opt["state"].values():
-        for idx_state in param_state.values():
-            if isinstance(idx_state, dict):
-                idx_state.pop("param::ecc", None)
-    model2 = nn.Sequential(
-        nn.Conv2d(3, 64, 3, bias=False),
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Linear(64, 8, bias=False),
-    ).cuda()
-    opt2 = heavyball.SOAP(model2.parameters(), lr=1e-3, param_ecc="bf16+8")
-    model2.load_state_dict(sd_model)
-    opt2.load_state_dict(sd_opt)
-    conv_p2 = list(model2.parameters())[0]
-    st2 = _flat_state(opt2, conv_p2)
-    assert "param::ecc" in st2, "param::ecc not rehydrated for merged-view param"
-    assert st2["param::ecc"].shape == torch.Size([64, 27])
-    for _ in range(5):
-        d = data.to(conv_p2.dtype)
-        ((model2(d) - target.to(d.dtype)) ** 2).mean().backward()
-        opt2.step()
-        opt2.zero_grad()
-    assert conv_p2.isfinite().all()
-    del model, opt, model2, opt2
     clean()
 
 
@@ -557,62 +482,6 @@ def test_optimizer_kwargs_not_in_param_groups():
     assert "compile_step" not in o.param_groups[0]
     assert "promote" not in o.param_groups[0]
     del o
-    clean()
-
-
-def test_param_ecc_load_order_model_before_optimizer():
-    """Model-first load: param::ecc rehydrated as zeros (fp32 ref lost), training self-corrects."""
-    from copy import deepcopy
-
-    set_torch()
-    data, target = _problem()
-    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    _train(m, o, data, target, 10)
-    sd_opt = deepcopy(o.state_dict())
-    sd_model = deepcopy(m.state_dict())
-    for param_state in sd_opt["state"].values():
-        for idx_state in param_state.values():
-            if isinstance(idx_state, dict):
-                idx_state.pop("param::ecc", None)
-    # model-first: load model, then optimizer
-    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    m2.load_state_dict(sd_model)
-    o2.load_state_dict(sd_opt)
-    p2 = list(m2.parameters())[0]
-    st2 = _flat_state(o2, p2)
-    assert "param::ecc" in st2
-    assert p2.dtype == torch.bfloat16
-    _train(m2, o2, data, target, 10)
-    assert p2.isfinite().all()
-    st2_after = _flat_state(o2, list(m2.parameters())[0])
-    assert st2_after["param::ecc"].any(), "correction should be non-zero after training"
-    del m, o, m2, o2
-    clean()
-
-
-def test_param_ecc_load_order_optimizer_before_model():
-    """Optimizer-first with stripped param::ecc: correction computed from stale params."""
-    from copy import deepcopy
-
-    set_torch()
-    data, target = _problem()
-    m, o = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    _train(m, o, data, target, 10)
-    sd_opt = deepcopy(o.state_dict())
-    sd_model = deepcopy(m.state_dict())
-    for param_state in sd_opt["state"].values():
-        for idx_state in param_state.values():
-            if isinstance(idx_state, dict):
-                idx_state.pop("param::ecc", None)
-    # optimizer-first: load optimizer, then model
-    m2, o2 = _model_opt(heavyball.SFAdamW, 16, 8, 1e-2, param_ecc="bf16+8")
-    o2.load_state_dict(sd_opt)
-    m2.load_state_dict(sd_model)
-    p2 = list(m2.parameters())[0]
-    assert p2.dtype == torch.bfloat16
-    _train(m2, o2, data, target, 10)
-    assert p2.isfinite().all()
-    del m, o, m2, o2
     clean()
 
 

@@ -27,7 +27,6 @@ from heavyball.utils import (
     merge_group,
     orthogonalize_grad_to_param,
     precond_update_prob_schedule,
-    psgd_should_update,
     sam_step,
     stochastic_add_,
     stochastic_add_divide_,
@@ -130,8 +129,9 @@ def test_sam_step_accumulates_and_zeros_gradients():
     for clone, original in zip(returned, originals, strict=True):
         assert torch.allclose(clone, original)
 
+    grad_norm = (3 * 0.5**2 + 3 * 1.0**2) ** 0.5
     for param, original, scale in zip(params, originals, (0.5, 1.0), strict=True):
-        expected = original + scale * 0.1
+        expected = original + scale * (0.1 / grad_norm)
         assert torch.allclose(param.detach(), expected, atol=1e-6)
         assert torch.allclose(param.grad, torch.zeros_like(param.grad), atol=0, rtol=0)
 
@@ -217,15 +217,6 @@ def test_warn_once_only_emits_single_warning(monkeypatch):
         warnings.simplefilter("always")
         warn_once("run once")
     assert captured == []
-
-
-def test_psgd_should_update_accumulates_probability():
-    group = {}
-    outcomes = [psgd_should_update(group, 0.4) for _ in range(4)]
-    assert outcomes[:2] == [False, False]
-    assert outcomes[2] is True
-    assert outcomes[3] in (False, True)
-    assert group["cumulative_prob_prob_step"] == 4
 
 
 def test_stochastic_math_helpers_match_expected_results(n=1024):

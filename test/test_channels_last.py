@@ -4,15 +4,13 @@ os.environ["TORCH_LOGS"] = "+recompiles"
 
 import pytest
 import torch
-from lightbench.utils import get_optim
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS
+from utils import REPRESENTATIVE_OPTS, get_optim
 
 import heavyball
 from heavyball.utils import clean, set_torch
 
-heavyball.utils.zeroth_power_mode = "newtonschulz"
 heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 

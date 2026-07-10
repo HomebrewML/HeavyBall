@@ -82,6 +82,7 @@ def test_scale_by_soap_matches_adam():
         "is_preconditioning": True,
         "betas": (0.9, 0.999),
         "storage_dtype": "float64",
+        "caution": False,
     }
 
     grad0 = torch.randn_like(params[0])
@@ -131,6 +132,7 @@ def test_scale_by_soap_laprop_matches_laprop():
         "is_preconditioning": True,
         "betas": (0.9, 0.999),
         "storage_dtype": "float64",
+        "caution": False,
     }
 
     grad0 = torch.randn_like(params[0])
@@ -178,6 +180,7 @@ def test_scale_by_soap_ademamix_matches_reference():
         "beta3_warmup": None,
         "alpha_warmup": None,
         "storage_dtype": "float64",
+        "caution": False,
     }
 
     grad0 = torch.randn_like(params[0])

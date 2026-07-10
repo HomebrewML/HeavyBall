@@ -120,19 +120,6 @@ These compatibility kwargs were removed from `heavyball.helpers` samplers and no
 
 ---
 
-## Checkpoint migration
-
-Use the migration CLI to convert 1.x or 2.x checkpoints:
-
-```bash
-python scripts/migrate_optimizer_state.py <checkpoint.pt> <OptimizerClass>
-```
-
-Old class names (including all aliases listed above) are resolved automatically.
-The `foreach` → `multi_tensor` key rename in param groups is handled automatically.
-
----
-
 ## Upgrade checklist
 
 1. Replace `from heavyball import Foreach*` with the short name (e.g., `ForeachAdamW` → `AdamW`)
@@ -140,7 +127,6 @@ The `foreach` → `multi_tensor` key rename in param groups is handled automatic
 3. Replace removed subclass instantiations with parent + kwargs (see table above)
 4. Remove any `stochastic_schedule`, `normalize_grads`, `correct_bias`, `inverse_free`, or `adaptive` kwargs
 5. Replace `Branch(...)` with `Parallel(...)` in custom chainable code
-6. Migrate checkpoints: `python scripts/migrate_optimizer_state.py <ckpt> heavyball.<Optimizer>`
-7. If you relied on `eval(); eval()` toggling back to train mode, update your code
-8. If your training loop reads `p.grad` after `step()`, pass `consume_grad=False`
-9. Remove obsolete compatibility kwargs from `heavyball.helpers` samplers
+6. If you relied on `eval(); eval()` toggling back to train mode, update your code
+7. If your training loop reads `p.grad` after `step()`, pass `consume_grad=False`
+8. Remove obsolete compatibility kwargs from `heavyball.helpers` samplers

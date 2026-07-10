@@ -1,5 +1,6 @@
 import functools
 import math
+from numbers import Real
 from typing import Optional, Type, Union
 
 import torch.optim
@@ -168,8 +169,8 @@ class UnscaledAdamW(C.BaseOpt):
     """
     UnscaledAdamW
 
-    AdamW without bias correction on the second moment — useful when the bias-correction
-    transient interacts poorly with downstream clipping or warmup.
+    An AdamW variant that accumulates first-moment momentum in variance-normalized
+    coordinates, then restores the current second-moment scale before applying the update.
 
     Sources:
         HeavyBall:
@@ -277,7 +278,7 @@ class Scion(C.BaseOpt):
         self,
         params,
         lr: float = 0.0025,
-        betas: tuple[float, float] = (0.9, 0.99),
+        beta: float = 0.9,
         eps: float = 1e-8,
         weight_decay: float = 0,
         cautious_weight_decay: bool = False,
@@ -297,20 +298,7 @@ class Scion(C.BaseOpt):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        if lr < 0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if len(betas) == 0:
-            raise ValueError("Scion expects at least one beta.")
-
-        beta1 = betas[0]
-        if not 0 <= beta1 <= 1:
-            raise ValueError(f"Invalid momentum value: {beta1}")
-        beta2 = betas[1] if len(betas) > 1 else beta1
-
         params, defaults = C._build_defaults(locals())
-        defaults["betas"] = (beta1, beta2)
-        defaults["scale"] = scale
-
         super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm))
 
 
@@ -318,8 +306,8 @@ class AdamC(C.BaseOpt):
     """
     AdamC
 
-    Adam with weight-decay scaled by `lr / max_lr` so the effective decay stays constant
-    as the learning rate decays.
+    Adam with weight decay scaled by `lr / max_lr` to preserve the normalized-layer
+    steady-state gradient-to-weight ratio under a decaying learning rate.
 
     Sources:
         AdamC: Confused Adam Optimizers
@@ -354,9 +342,6 @@ class AdamC(C.BaseOpt):
         **kwargs,
     ):
         if max_lr is None:
-            utils.warn_once(
-                "max_lr was not set. setting it to the current learning rate, under the assumption that it strictly decreases"
-            )
             max_lr = lr
 
         params, defaults = C._build_defaults(locals())
@@ -382,8 +367,6 @@ class RMSprop(C.BaseOpt):
         weight_decay=0,
         cautious_weight_decay: bool = False,
         warmup_steps=0,
-        r=0.0,
-        weight_lr_power=2.0,
         multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
@@ -455,18 +438,20 @@ class HyperBallAdamW(C.BaseOpt):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
+        _update_clipping = C.default(update_clipping, None)
+        if _update_clipping is not None:
+            raise ValueError("HyperBallAdamW does not support update_clipping")
         params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
             gradient_clipping,
-            update_clipping,
+            None,
             palm,
             fns=(
-                C.scale_by_exp_avg_sq,
                 C.route(
-                    (lambda p: p.ndim >= 2, C.update_by_hyperball),
-                    default=C.apply_update,
+                    (lambda p: p.ndim >= 2, (C.scale_by_exp_avg_sq, C.update_by_hyperball)),
+                    default=C.update_by_adam,
                 ),
             ),
         )
@@ -497,6 +482,17 @@ class MuonAdamW(C.BaseOpt):
             https://arxiv.org/abs/1711.05101
     """
 
+    _TOPOLOGY_KEYS = C.BaseOpt._TOPOLOGY_KEYS + ("nesterov",)
+
+    def _core_fns_from_group(self, group):
+        _ema = C.nesterov_ema if group["nesterov"] else C.exp_avg
+        return (
+            C.route(
+                (lambda p: p.ndim >= 2, (_ema, C.orthogonalize_update)),
+                default=C.scale_by_adam,
+            ),
+        )
+
     def __init__(
         self,
         params,
@@ -524,7 +520,7 @@ class MuonAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        ema = C.nesterov_ema if nesterov else C.exp_avg
+        _ema = C.nesterov_ema if nesterov else C.exp_avg
         super().__init__(
             params,
             defaults,
@@ -533,7 +529,7 @@ class MuonAdamW(C.BaseOpt):
             palm,
             fns=(
                 C.route(
-                    (lambda p: p.ndim >= 2, (ema, C.orthogonalize_update)),
+                    (lambda p: p.ndim >= 2, (_ema, C.orthogonalize_update)),
                     default=C.scale_by_adam,
                 ),
             ),
@@ -611,8 +607,6 @@ class MSAMLaProp(C.MSAM):
         weight_decay=0,
         cautious_weight_decay: bool = False,
         warmup_steps=0,
-        r=0.0,
-        weight_lr_power=2.0,
         multi_tensor: bool = True,
         storage_dtype: str = "float32",
         mars: bool = False,
@@ -691,12 +685,22 @@ class Muon(C.BaseOpt):
         https://kellerjordan.github.io/posts/muon/
     """
 
+    _TOPOLOGY_KEYS = C.BaseOpt._TOPOLOGY_KEYS + ("nesterov", "heavyball_momentum")
+
+    def _core_fns_from_group(self, group):
+        if group["heavyball_momentum"]:
+            _ema = C.nesterov_momentum if group["nesterov"] else C.heavyball_momentum
+        elif group["nesterov"]:
+            _ema = C.nesterov_ema
+        else:
+            _ema = C.exp_avg
+        return (_ema, C.orthogonalize_update)
+
     def __init__(
         self,
         params,
         lr=0.0025,
-        betas=(0.9, 0.99),
-        eps=1e-8,
+        beta=0.9,
         weight_decay=0,
         cautious_weight_decay: bool = False,
         warmup_steps=0,
@@ -707,8 +711,6 @@ class Muon(C.BaseOpt):
         mars_gamma: float = 0.0025,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
-        palm: bool = C.use_default,
-        beta2_scale: float = 0.8,
         nesterov: bool = True,
         heavyball_momentum: bool = False,
         compile_step: bool = C.use_default,
@@ -719,21 +721,12 @@ class Muon(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-
-        if heavyball_momentum:
-            ema = C.nesterov_momentum if nesterov else C.heavyball_momentum
-        elif nesterov:
-            ema = C.nesterov_ema
-        else:
-            ema = C.exp_avg
-
         super().__init__(
             params,
             defaults,
             gradient_clipping,
             update_clipping,
-            palm,
-            fns=(ema, C.orthogonalize_update),
+            fns=self._core_fns_from_group(defaults),
         )
 
 
@@ -838,16 +831,23 @@ class MuonLaProp(C.BaseOpt):
 
 class SOAPBase(C.BaseOpt):
     use_precond_schedule: bool = False
+    init_factor: float = 0.0
 
     def _build_soap_defaults(self, locals_dict, fns):
-        use_precond_schedule = C.default(locals_dict["use_precond_schedule"], self.use_precond_schedule)
+        _use_precond_schedule = C.default(locals_dict["use_precond_schedule"], self.use_precond_schedule)
+        locals_dict = {**locals_dict, "init_factor": C.default(locals_dict.get("init_factor", C.use_default), self.init_factor)}
         params, defaults = C._build_defaults(locals_dict)
-        if use_precond_schedule:
+        defaults.pop("use_precond_schedule")
+        if _use_precond_schedule:
             del defaults["precondition_frequency"]
-            self.precond_schedule = utils.get_soap_precond_schedule(defaults.pop("precond_scheduler"))
+            _scheduler = defaults.pop("precond_scheduler")
+            self.precond_schedule = utils.get_soap_precond_schedule(_scheduler)
+            self._precond_schedule_spec = ("soap", _scheduler)
         else:
             del defaults["precond_scheduler"]
-            self.precond_schedule = 1 / defaults.pop("precondition_frequency")
+            _frequency = defaults.pop("precondition_frequency")
+            self.precond_schedule = 1 / _frequency
+            self._precond_schedule_spec = ("constant", self.precond_schedule)
         super().__init__(
             params,
             defaults,
@@ -898,7 +898,7 @@ class SOAP(SOAPBase):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        precond_grad_accum: bool = False,
+        init_factor: float = C.use_default,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
         ecc: str | None = None,
@@ -930,6 +930,7 @@ class KLSOAP(SOAP):
     """
 
     _chain_fns = (C.scale_by_kl_soap,)
+    init_factor: float = 0.1
 
 
 class KLShampoo(SOAPBase):
@@ -939,8 +940,8 @@ class KLShampoo(SOAPBase):
     Shampoo with KL-corrected Kronecker factor accumulation, applied directly as
     ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T to a momentum-EMA gradient. Unlike KL-SOAP,
     no Adam runs in the projected space, and the eigenvalues d_i = diag(Q[i].T @ GG[i] @ Q[i])
-    are the preconditioner. GG is seeded with init_factor * I to keep the first preconditioner
-    uniform (= 1/sqrt(init_factor) * I) instead of exploding along the rank-1 null space.
+    are the preconditioner. Each active GG factor is seeded with init_factor * I, giving a
+    Kronecker gain of init_factor ** (-k/2) across k active modes.
 
     Sources:
         KL-Shampoo:
@@ -955,7 +956,7 @@ class KLShampoo(SOAPBase):
         self,
         params,
         lr: float = 3e-3,
-        betas=(0.9, 0.95),
+        beta=0.9,
         shampoo_beta: float = 0.95,
         eps: float = 1e-8,
         weight_decay: float = 0.01,
@@ -970,21 +971,17 @@ class KLShampoo(SOAPBase):
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
-        palm: bool = C.use_default,
         precond_scheduler=(1 / 3, 9),
-        beta2_scale: float = 0.8,
         use_precond_schedule: bool = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        precond_grad_accum: bool = False,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
         ecc: str | None = None,
         param_ecc: str | None = None,
         orig_shapes: ShapeMap | None = None,
         init_factor: float = 0.1,
-        dampening: float = 1e-9,
         **kwargs,
     ):
         self._build_soap_defaults(locals(), fns=self._chain_fns)
@@ -1043,7 +1040,6 @@ class SOAPNAdam(SOAP):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        precond_grad_accum: bool = False,
         momentum_decay: float = 4e-3,
         decoupled_weight_decay: bool = False,
         compile_step: bool = C.use_default,
@@ -1109,7 +1105,6 @@ class SOAPAdEMAMix(SOAP):
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         storage_dtype: str = "float32",
-        precond_grad_accum: bool = False,
         alpha: float = 2.0,
         beta3_warmup: int | None = None,
         alpha_warmup: int | None = None,
@@ -1371,31 +1366,56 @@ class PSGDBase(C.BaseOpt):
     cached: bool = False
     exp_avg_input: bool = True
     sqrt: bool = False  # QSGD: apply Q (the matrix square root of P = QᵀQ) instead of P
+    _TOPOLOGY_KEYS = C.BaseOpt._TOPOLOGY_KEYS + ("delayed", "cached", "exp_avg_input")
+
+    def _psgd_core_fns_from_group(self, group):
+        return self._psgd_core_fns
+
+    def _core_fns_from_group(self, group):
+        return (*(C.exp_avg,) * group["exp_avg_input"], *self._psgd_core_fns_from_group(group))
 
     def _build_psgd_defaults(
-        self, locals_dict, fns, *, default_update_clipping=utils.trust_region_clip_, extra_defaults=None
+        self,
+        locals_dict,
+        fns,
+        *,
+        default_update_clipping=utils.trust_region_clip_,
+        extra_defaults=None,
     ):
-        exp_avg_input = C.default(locals_dict.get("exp_avg_input", C.use_default), self.exp_avg_input)
-        update_clipping = C.default(locals_dict["update_clipping"], default_update_clipping)
-        locals_dict = {**locals_dict, "exp_avg_input": exp_avg_input, "update_clipping": update_clipping}
+        _exp_avg_input = C.default(locals_dict.get("exp_avg_input", C.use_default), self.exp_avg_input)
+        _update_clipping = C.default(locals_dict["update_clipping"], default_update_clipping)
+        locals_dict = {**locals_dict, "exp_avg_input": _exp_avg_input, "update_clipping": _update_clipping}
         params, defaults = C._build_defaults(locals_dict)
 
         self.precond_schedule = C.default(
             defaults.pop("preconditioner_update_probability"), utils.precond_update_prob_schedule()
         )
+        if isinstance(self.precond_schedule, Real):
+            self._precond_schedule_spec = ("constant", float(self.precond_schedule))
+        elif self.precond_schedule is None:
+            self._precond_schedule_spec = ("none", None)
+        elif (
+            isinstance(self.precond_schedule, functools.partial)
+            and self.precond_schedule.func is utils._inner_precond_update_prob_schedule
+            and not self.precond_schedule.args
+        ):
+            self._precond_schedule_spec = ("psgd", dict(self.precond_schedule.keywords or {}))
+        else:
+            raise ValueError("preconditioner_update_probability must be a number or a HeavyBall schedule")
 
         if extra_defaults:
             defaults.update(extra_defaults)
         if self.sqrt:  # only QSGD carries the key; everything else is plain PSGD via the .get default
             defaults["sqrt"] = self.sqrt
 
+        self._psgd_core_fns = tuple(fns)
         super().__init__(
             params,
             defaults,
             locals_dict["gradient_clipping"],
-            update_clipping,
+            _update_clipping,
             False,
-            fns=(*(C.exp_avg,) * exp_avg_input, *fns),
+            fns=(*(C.exp_avg,) * _exp_avg_input, *fns),
         )
 
 
@@ -1417,12 +1437,15 @@ class PSGDKron(PSGDBase):
             https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
     """
 
+    def _psgd_core_fns_from_group(self, group):
+        fn = C.scale_by_delayed_psgd if group["delayed"] else C.scale_by_psgd
+        return (functools.partial(fn, cached=group["cached"]),)
+
     def __init__(
         self,
         params,
         lr=0.001,
-        beta=None,
-        betas=(0.9, 0.999),
+        beta=0.9,
         weight_decay=0.0,
         cautious_weight_decay: bool = False,
         preconditioner_update_probability=C.use_default,
@@ -1448,7 +1471,6 @@ class PSGDKron(PSGDBase):
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
-        precond_update_power_iterations: int = 2,
         # expert parameters
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
@@ -1498,7 +1520,6 @@ class LATHER(PSGDBase):
         self,
         params,
         lr=0.001,
-        beta=None,
         betas=(0.9, 0.999),
         eps: float = 1e-8,
         weight_decay=0.0,
@@ -1523,7 +1544,6 @@ class LATHER(PSGDBase):
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
-        precond_update_power_iterations: int = 2,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,
@@ -1565,12 +1585,14 @@ class PSGDPRO(PSGDBase):
         https://github.com/lixilinx/psgd_torch
     """
 
+    def _psgd_core_fns_from_group(self, group):
+        return (functools.partial(C.scale_by_psgd_pro, cached=False if self.sqrt else group["cached"]),)
+
     def __init__(
         self,
         params,
         lr=0.001,
-        beta=None,
-        betas=(0.9, 0.999),
+        beta=0.9,
         weight_decay=0.0,
         cautious_weight_decay: bool = False,
         preconditioner_update_probability=C.use_default,
@@ -1594,7 +1616,6 @@ class PSGDPRO(PSGDBase):
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
-        precond_update_power_iterations: int = 2,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
         precond_init_scale_power: Optional[float] = None,
@@ -1607,6 +1628,8 @@ class PSGDPRO(PSGDBase):
         **kwargs,
     ):
         cached = C.default(cached, self.cached)
+        if self.sqrt and cached:
+            cached = False
         self._build_psgd_defaults(
             locals(),
             fns=(functools.partial(C.scale_by_psgd_pro, cached=cached),),
@@ -1665,6 +1688,9 @@ class PSGDLRA(PSGDBase):
             https://github.com/evanatyourservice/kron_torch/blob/97a2b5ee8a1a4c29e4780bbf6c521e545189eff9/kron_torch/kron.py
     """
 
+    def _psgd_core_fns_from_group(self, group):
+        return (C.scale_by_delayed_psgd_lra if group["delayed"] else C.scale_by_psgd_lra,)
+
     def __init__(
         self,
         params,
@@ -1705,12 +1731,17 @@ class PSGDLRA(PSGDBase):
     ):
         delayed = C.default(delayed, self.delayed)
         if rank is None:
-            utils.warn_once(
-                f"{rank=}. It will be set to log2(param_count). This requires `params` to be of type list. Currently, {type(params)=}"
-            )
-            params = list(params)
-            rank = max(1, round(math.log2(sum(p.numel() for p in params))))
-            utils.warn_once(f"rank was set to {rank}")
+            _normalized, _flat = [], []
+            for _item in params:
+                if isinstance(_item, dict):
+                    _group_params = list(_item["params"])
+                    _normalized.append({**_item, "params": _group_params})
+                    _flat.extend(_group_params)
+                else:
+                    _normalized.append(_item)
+                    _flat.append(_item)
+            params = _normalized
+            rank = max(1, round(math.log2(max(1, sum(p.numel() for p in _flat)))))
 
         self._build_psgd_defaults(
             locals(),
@@ -1734,14 +1765,31 @@ class SplitOpt(utils.StatefulOptimizer):
             spec = dict(spec)
             params = list(spec.pop("params"))
             if params:
-                self.optimizers.append(spec.pop("optimizer")(params, **spec))
+                optimizer = spec.pop("optimizer")(params, **spec)
+                if not isinstance(optimizer, utils.StatefulOptimizer):
+                    raise ValueError("SplitOpt only supports HeavyBall optimizers")
+                self.optimizers.append(optimizer)
                 all_params.extend(params)
         if not self.optimizers:
             raise ValueError("No optimizers created")
+        if len({id(p) for p in all_params}) != len(all_params):
+            raise ValueError("A parameter cannot belong to multiple SplitOpt optimizers")
+        if any(opt.hessian_approx for opt in self.optimizers):
+            raise ValueError("SplitOpt does not support Hessian-approximation optimizers")
+        self._split_ready = False
         super().__init__(all_params, {"multi_tensor": True})
+        self._split_ready = True
+
+    def add_param_group(self, param_group):
+        if getattr(self, "_split_ready", False):
+            raise RuntimeError("SplitOpt does not support add_param_group; recreate it with all parameter groups")
+        super().add_param_group(param_group)
 
     def _handle_closure(self, closure):
-        return self.optimizers[0]._handle_closure(closure)
+        if closure is None:
+            return None
+        with torch.enable_grad():
+            return closure()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1754,11 +1802,39 @@ class SplitOpt(utils.StatefulOptimizer):
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=set_to_none)
 
+    def ema_update(self):
+        for opt in self.optimizers:
+            opt.ema_update()
+
+    def copy_emas_to_params(self):
+        for opt in self.optimizers:
+            opt.copy_emas_to_params()
+
+    def copy_params_to_emas(self):
+        for opt in self.optimizers:
+            opt.copy_params_to_emas()
+
+    def state_size(self):
+        return sum(opt.state_size() for opt in self.optimizers)
+
+    def train(self, mode: bool = True):
+        for opt in self.optimizers:
+            train = getattr(opt, "train", None)
+            if train is not None:
+                train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
     def state_dict(self):
         return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
 
     def load_state_dict(self, state_dict):
-        for opt, s in zip(self.optimizers, state_dict["optimizers"], strict=True):
+        states = state_dict["optimizers"]
+        if len(states) != len(self.optimizers):
+            raise ValueError(f"Expected {len(self.optimizers)} optimizer states, got {len(states)}")
+        for opt, s in zip(self.optimizers, states):
             opt.load_state_dict(s)
 
 
@@ -1783,17 +1859,30 @@ class SAMWrapper(torch.optim.Optimizer):
         wrapped_optimizer: Union[utils.StatefulOptimizer, Type[utils.StatefulOptimizer]] = AdamW,
         ball: float = 0.1,
     ):
-        params = list(params)
-        super().__init__(params, {"ball": ball})
+        _items = list(params)
+        if _items and isinstance(_items[0], dict):
+            _groups = [{**item, "params": list(item["params"])} for item in _items]
+            _wrapper_params = [{"params": list(group["params"])} for group in _groups]
+            _inner_params = [{k: v for k, v in group.items() if k != "ball"} for group in _groups]
+        else:
+            _wrapper_params = _inner_params = _items
+        super().__init__(_wrapper_params, {})
 
         if isinstance(wrapped_optimizer, type):
-            if not issubclass(wrapped_optimizer, utils.StatefulOptimizer):
-                raise ValueError(f"{wrapped_optimizer.__name__} is not a HeavyBall optimizer")
-            wrapped_optimizer = wrapped_optimizer(params)
-        elif not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
-            raise ValueError(f"{wrapped_optimizer.__class__.__name__} is not a HeavyBall optimizer")
+            wrapped_optimizer = wrapped_optimizer(_inner_params)
 
+        _wrapper_ids = sorted(id(p) for group in self.param_groups for p in group["params"])
+        _inner_ids = sorted(id(p) for group in wrapped_optimizer.param_groups for p in group["params"])
+        if _wrapper_ids != _inner_ids:
+            raise ValueError("SAMWrapper and its optimizer must contain the same parameters")
+
+        self.ball = ball
         self.wrapped_optimizer = wrapped_optimizer
+
+    def add_param_group(self, param_group):
+        if hasattr(self, "wrapped_optimizer"):
+            raise RuntimeError("SAMWrapper does not support add_param_group; recreate the wrapper with all parameters")
+        super().add_param_group(param_group)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1801,16 +1890,19 @@ class SAMWrapper(torch.optim.Optimizer):
             raise ValueError("SAM requires closure")
         with torch.enable_grad():
             closure()
-        old_params = [utils.sam_step(group["params"], group["ball"]) for group in self.param_groups]
+        params = [p for group in self.param_groups for p in group["params"]]
+        old_params = utils.sam_step(params, self.ball)
 
         original_handle_closure = self.wrapped_optimizer._handle_closure
+        restored = False
 
         def _handle_closure(closure):
+            nonlocal restored
             try:
                 _loss = original_handle_closure(closure)
             finally:
-                for group, old in zip(self.param_groups, old_params):
-                    utils.copy_stochastic_list_(group["params"], old)
+                utils.copy_stochastic_list_(params, old_params)
+                restored = True
             return _loss
 
         try:
@@ -1818,24 +1910,36 @@ class SAMWrapper(torch.optim.Optimizer):
             loss = self.wrapped_optimizer.step(closure)
         finally:
             self.wrapped_optimizer._handle_closure = original_handle_closure
+            if not restored:
+                utils.copy_stochastic_list_(params, old_params)
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
         self.wrapped_optimizer.zero_grad(set_to_none=set_to_none)
 
+    def ema_update(self):
+        self.wrapped_optimizer.ema_update()
+
+    def copy_emas_to_params(self):
+        self.wrapped_optimizer.copy_emas_to_params()
+
+    def copy_params_to_emas(self):
+        self.wrapped_optimizer.copy_params_to_emas()
+
+    def state_size(self):
+        return self.wrapped_optimizer.state_size()
+
     def state_dict(self):
-        return {
-            "wrapped": self.wrapped_optimizer.state_dict(),
-            "ball": [g["ball"] for g in self.param_groups],
-        }
+        return {"wrapped": self.wrapped_optimizer.state_dict(), "ball": self.ball}
 
     def load_state_dict(self, state_dict):
         self.wrapped_optimizer.load_state_dict(state_dict["wrapped"])
-        for g, b in zip(self.param_groups, state_dict["ball"]):
-            g["ball"] = b
+        self.ball = state_dict["ball"]
 
     def train(self, mode: bool = True):
-        self.wrapped_optimizer.train(mode)
+        train = getattr(self.wrapped_optimizer, "train", None)
+        if train is not None:
+            train(mode)
         return self
 
     def eval(self):

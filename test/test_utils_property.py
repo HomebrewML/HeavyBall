@@ -54,10 +54,11 @@ def _tensor_list(
 ) -> List[torch.Tensor]:
     dtype = draw(st.sampled_from(FLOAT_DTYPES))
     length = draw(st.integers(min_value=min_len, max_value=max_len))
+    generator = torch.Generator().manual_seed(draw(st.integers(min_value=0, max_value=2**32 - 1)))
     tensors = []
     for _ in range(length):
         shape = draw(_tensor_shape(min_rank=min_rank, max_rank=max_rank, max_side=max_side))
-        tensor = torch.randn(shape, dtype=torch.float32)
+        tensor = torch.randn(shape, dtype=torch.float32, generator=generator)
         tensors.append(tensor.to(dtype))
     return tensors
 
@@ -67,15 +68,16 @@ def _stochastic_inputs(draw) -> tuple[torch.dtype, List[torch.Tensor], List[torc
     dtype = draw(st.sampled_from(FLOAT_DTYPES))
     length = draw(st.integers(min_value=1, max_value=3))
     shared_shape = draw(st.booleans())
+    generator = torch.Generator().manual_seed(draw(st.integers(min_value=0, max_value=2**32 - 1)))
     tensors: List[torch.Tensor] = []
     if shared_shape:
         shape = draw(_tensor_shape(max_side=5))
-        tensors = [torch.randn(shape, dtype=torch.float32).to(dtype) for _ in range(length)]
+        tensors = [torch.randn(shape, dtype=torch.float32, generator=generator).to(dtype) for _ in range(length)]
     else:
         for _ in range(length):
             shape = draw(_tensor_shape(max_side=5))
-            tensors.append(torch.randn(shape, dtype=torch.float32).to(dtype))
-    partner = [torch.randn_like(tensor, dtype=torch.float32).to(dtype) for tensor in tensors]
+            tensors.append(torch.randn(shape, dtype=torch.float32, generator=generator).to(dtype))
+    partner = [torch.randn(tensor.shape, dtype=torch.float32, generator=generator).to(dtype) for tensor in tensors]
     if shared_shape and len(partner) > 1 and draw(st.booleans()):
         partner = [partner[0]]
     return dtype, [tensor.clone() for tensor in tensors], partner
@@ -84,7 +86,8 @@ def _stochastic_inputs(draw) -> tuple[torch.dtype, List[torch.Tensor], List[torc
 @st.composite
 def _caution_inputs(draw) -> tuple[torch.Tensor, torch.Tensor]:
     tensor = draw(_tensor_list(min_len=1, max_len=1, min_rank=1, max_rank=3, max_side=6))[0]
-    update = torch.randn_like(tensor, dtype=torch.float32).to(tensor.dtype)
+    generator = torch.Generator().manual_seed(draw(st.integers(min_value=0, max_value=2**32 - 1)))
+    update = torch.randn(tensor.shape, dtype=torch.float32, generator=generator).to(tensor.dtype)
     return tensor, update
 
 
@@ -208,7 +211,9 @@ def test_stochastic_multiply_matches_expected(data):
     expected_partner = _expand_like(expected_inputs, partner)
     expected = [xi * yi for xi, yi in zip(expected_inputs, expected_partner, strict=True)]
     max_error = max((result.float() - exp).abs().max().item() for result, exp in zip(x, expected, strict=True))
-    assert max_error <= DTYPE_TOLERANCE[dtype] + 1e-6
+    max_magnitude = max(exp.abs().max().item() for exp in expected) if expected else 0.0
+    ulp = max_magnitude * (2**-7 if dtype is torch.bfloat16 else 2**-23)
+    assert max_error <= max(DTYPE_TOLERANCE[dtype], 2 * ulp) + 1e-6
 
 
 @settings(deadline=None, max_examples=75)
@@ -277,10 +282,10 @@ def test_caution_masks_disagreeing_directions(data):
     grad_tensor, update_tensor = data
     result = caution(grad_tensor, update_tensor)
     assert result.shape == grad_tensor.shape
-    mask = grad_tensor.signbit() ^ update_tensor.signbit()
-    scale = mask.numel() / max(mask.numel() - mask.sum().item(), 1)
+    aligned = ((grad_tensor > 0) & (update_tensor > 0)) | ((grad_tensor < 0) & (update_tensor < 0))
+    scale = aligned.numel() / max(aligned.sum().item(), 1)
     expected = update_tensor.clone()
-    expected[mask] = 0
+    expected[~aligned] = 0
     expected = expected * scale
     diff = (result.float() - expected.float()).abs().max().item()
     assert diff <= DTYPE_TOLERANCE[result.dtype] + 1e-6
