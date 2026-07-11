@@ -1,7 +1,6 @@
 import functools
 import math
 from numbers import Real
-from typing import Optional, Type, Union
 
 import torch.optim
 
@@ -9,6 +8,11 @@ from . import chainable as C
 from . import utils
 
 ShapeMap = dict[int, tuple[int, ...]]
+
+
+def _class_path(value):
+    cls = value if isinstance(value, type) else type(value)
+    return f"{cls.__module__}.{cls.__qualname__}"
 
 
 class SGD(C.BaseOpt):
@@ -141,8 +145,8 @@ class AdEMAMix(C.BaseOpt):
         weight_decay=0,
         cautious_weight_decay: bool = False,
         alpha: float = 2.0,
-        beta3_warmup: Optional[int] = None,
-        alpha_warmup: Optional[int] = None,
+        beta3_warmup: int | None = None,
+        alpha_warmup: int | None = None,
         warmup_steps=0,
         multi_tensor: bool = True,
         storage_dtype: str = "float32",
@@ -160,7 +164,6 @@ class AdEMAMix(C.BaseOpt):
     ):
         if len(betas) != 3:
             raise ValueError("AdEMAMix expects betas with three coefficients.")
-
         params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.update_by_ademamix,))
 
@@ -278,7 +281,7 @@ class Scion(C.BaseOpt):
         self,
         params,
         lr: float = 0.0025,
-        beta: float = 0.9,
+        betas: tuple[float, float] = (0.9, 0.99),
         eps: float = 1e-8,
         weight_decay: float = 0,
         cautious_weight_decay: bool = False,
@@ -298,6 +301,15 @@ class Scion(C.BaseOpt):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if len(betas) == 0:
+            raise ValueError("Scion expects at least one beta.")
+        beta1 = betas[0]
+        if not 0 <= beta1 <= 1:
+            raise ValueError(f"Invalid momentum value: {beta1}")
+        beta2 = betas[1] if len(betas) > 1 else beta1
+        betas = (beta1, beta2)
         params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, gradient_clipping, update_clipping, fns=(C.exp_avg, C.scion_auto_norm))
 
@@ -341,8 +353,7 @@ class AdamC(C.BaseOpt):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        if max_lr is None:
-            max_lr = lr
+        max_lr = lr if max_lr is None else max_lr
 
         params, defaults = C._build_defaults(locals())
         super().__init__(params, defaults, gradient_clipping, update_clipping, palm, fns=(C.update_by_adamc,))
@@ -438,15 +449,12 @@ class HyperBallAdamW(C.BaseOpt):
         orig_shapes: ShapeMap | None = None,
         **kwargs,
     ):
-        _update_clipping = C.default(update_clipping, None)
-        if _update_clipping is not None:
-            raise ValueError("HyperBallAdamW does not support update_clipping")
         params, defaults = C._build_defaults(locals())
         super().__init__(
             params,
             defaults,
             gradient_clipping,
-            None,
+            update_clipping,
             palm,
             fns=(
                 C.route(
@@ -520,19 +528,13 @@ class MuonAdamW(C.BaseOpt):
         **kwargs,
     ):
         params, defaults = C._build_defaults(locals())
-        _ema = C.nesterov_ema if nesterov else C.exp_avg
         super().__init__(
             params,
             defaults,
             gradient_clipping,
             update_clipping,
             palm,
-            fns=(
-                C.route(
-                    (lambda p: p.ndim >= 2, (_ema, C.orthogonalize_update)),
-                    default=C.scale_by_adam,
-                ),
-            ),
+            fns=self._core_fns_from_group(defaults),
         )
 
 
@@ -700,7 +702,7 @@ class Muon(C.BaseOpt):
         self,
         params,
         lr=0.0025,
-        beta=0.9,
+        betas=(0.9, 0.99),
         weight_decay=0,
         cautious_weight_decay: bool = False,
         warmup_steps=0,
@@ -835,7 +837,10 @@ class SOAPBase(C.BaseOpt):
 
     def _build_soap_defaults(self, locals_dict, fns):
         _use_precond_schedule = C.default(locals_dict["use_precond_schedule"], self.use_precond_schedule)
-        locals_dict = {**locals_dict, "init_factor": C.default(locals_dict.get("init_factor", C.use_default), self.init_factor)}
+        locals_dict = {
+            **locals_dict,
+            "init_factor": C.default(locals_dict.get("init_factor", C.use_default), self.init_factor),
+        }
         params, defaults = C._build_defaults(locals_dict)
         defaults.pop("use_precond_schedule")
         if _use_precond_schedule:
@@ -915,7 +920,7 @@ class KLSOAP(SOAP):
 
     SOAP with KL-Shampoo's corrected Kronecker factor accumulation: a two-sided fixed
     point from KL-divergence minimization replaces the one-sided outer products G@G.T,
-    weighting each factor's update by the inverse of the other factor's eigenvalues.
+    weighting each factor's update by the inverse of the other factor's eigenvalue EMA.
 
     Sources:
         KL-Shampoo:
@@ -938,10 +943,9 @@ class KLShampoo(SOAPBase):
     KL-Shampoo
 
     Shampoo with KL-corrected Kronecker factor accumulation, applied directly as
-    ⊗_i Q[i] diag(d_i^{-1/2}) Q[i].T to a momentum-EMA gradient. Unlike KL-SOAP,
-    no Adam runs in the projected space, and the eigenvalues d_i = diag(Q[i].T @ GG[i] @ Q[i])
-    are the preconditioner. Each active GG factor is seeded with init_factor * I, giving a
-    Kronecker gain of init_factor ** (-k/2) across k active modes.
+    ⊗_i Q[i] diag(λ_i^{-1/2}) Q[i].T to a momentum-EMA gradient. Unlike KL-SOAP,
+    no Adam runs in the projected space. Each covariance factor starts at zero while its
+    eigenvalue EMA starts at init_factor.
 
     Sources:
         KL-Shampoo:
@@ -956,8 +960,7 @@ class KLShampoo(SOAPBase):
         self,
         params,
         lr: float = 3e-3,
-        beta=0.9,
-        shampoo_beta: float = 0.95,
+        betas=(0.9, 0.95),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
         cautious_weight_decay: bool = False,
@@ -1445,7 +1448,7 @@ class PSGDKron(PSGDBase):
         self,
         params,
         lr=0.001,
-        beta=0.9,
+        betas=(0.9, 0.999),
         weight_decay=0.0,
         cautious_weight_decay: bool = False,
         preconditioner_update_probability=C.use_default,
@@ -1463,18 +1466,19 @@ class PSGDKron(PSGDBase):
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
-        delayed: Optional[bool] = C.use_default,
-        cached: Optional[bool] = C.use_default,
-        exp_avg_input: Optional[bool] = C.use_default,
+        delayed: bool | None = C.use_default,
+        cached: bool | None = C.use_default,
+        exp_avg_input: bool | None = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,  #
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
+        precond_update_power_iterations: int = 2,
         # expert parameters
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
-        precond_init_scale_power: Optional[float] = None,
+        precond_init_scale_power: float | None = None,
         precond_lr: float = 0.1,
         finite_differences: bool = C.use_default,
         fallback_to_finite_differences: bool = C.use_default,
@@ -1491,7 +1495,7 @@ class PSGDKron(PSGDBase):
         cached = C.default(cached, self.cached)
         self._build_psgd_defaults(
             locals(),
-            fns=(functools.partial(C.scale_by_delayed_psgd if delayed else C.scale_by_psgd, cached=cached),),
+            fns=self._psgd_core_fns_from_group(locals()),
         )
 
 
@@ -1544,9 +1548,10 @@ class LATHER(PSGDBase):
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
+        precond_update_power_iterations: int = 2,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
-        precond_init_scale_power: Optional[float] = None,
+        precond_init_scale_power: float | None = None,
         precond_lr: float = 0.1,
         finite_differences: bool = C.use_default,
         fallback_to_finite_differences: bool = C.use_default,
@@ -1592,7 +1597,7 @@ class PSGDPRO(PSGDBase):
         self,
         params,
         lr=0.001,
-        beta=0.9,
+        betas=(0.9, 0.999),
         weight_decay=0.0,
         cautious_weight_decay: bool = False,
         preconditioner_update_probability=C.use_default,
@@ -1609,16 +1614,17 @@ class PSGDPRO(PSGDBase):
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
-        cached: Optional[bool] = C.use_default,
-        exp_avg_input: Optional[bool] = C.use_default,
+        cached: bool | None = C.use_default,
+        exp_avg_input: bool | None = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         precond_grad_accum: bool = False,
         lower_bound_beta: float = 0.9,
         dampening: float = 1e-9,
+        precond_update_power_iterations: int = 2,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
-        precond_init_scale_power: Optional[float] = None,
+        precond_init_scale_power: float | None = None,
         precond_lr: float = 0.1,
         compile_step: bool = C.use_default,
         promote: bool = C.use_default,
@@ -1632,7 +1638,7 @@ class PSGDPRO(PSGDBase):
             cached = False
         self._build_psgd_defaults(
             locals(),
-            fns=(functools.partial(C.scale_by_psgd_pro, cached=cached),),
+            fns=self._psgd_core_fns_from_group(locals()),
             default_update_clipping=None,
             extra_defaults={"store_triu_as_line": False},
         )
@@ -1700,7 +1706,7 @@ class PSGDLRA(PSGDBase):
         cautious_weight_decay: bool = False,
         preconditioner_update_probability=C.use_default,
         momentum_into_precond_update=True,
-        rank: Optional[int] = None,
+        rank: int | None = None,
         warmup_steps: int = 0,
         multi_tensor: bool = True,  # True: global LRA across all params. False: independent per-param LRA.
         q_dtype="float32",
@@ -1708,15 +1714,15 @@ class PSGDLRA(PSGDBase):
         mars: bool = False,
         caution: bool = False,
         mars_gamma: float = 0.0025,
-        delayed: Optional[bool] = C.use_default,
-        exp_avg_input: Optional[bool] = C.use_default,
+        delayed: bool | None = C.use_default,
+        exp_avg_input: bool | None = C.use_default,
         gradient_clipping: C.str_or_fn = C.use_default,
         update_clipping: C.str_or_fn = C.use_default,
         eps: float = 1e-8,
         precond_grad_accum: bool = False,
         precond_init_scale=None,
         precond_init_scale_scale: float = 1,
-        precond_init_scale_power: Optional[float] = None,
+        precond_init_scale_power: float | None = None,
         precond_lr: float = 0.1,
         finite_differences: bool = C.use_default,
         fallback_to_finite_differences: bool = C.use_default,
@@ -1745,7 +1751,7 @@ class PSGDLRA(PSGDBase):
 
         self._build_psgd_defaults(
             locals(),
-            fns=(C.scale_by_delayed_psgd_lra if delayed else C.scale_by_psgd_lra,),
+            fns=self._psgd_core_fns_from_group(locals()),
         )
 
 
@@ -1760,22 +1766,24 @@ class SplitOpt(utils.StatefulOptimizer):
     """
 
     def __init__(self, specs):
-        self.optimizers, all_params = [], []
+        normalized, all_params = [], []
         for spec in specs:
             spec = dict(spec)
             params = list(spec.pop("params"))
             if params:
-                optimizer = spec.pop("optimizer")(params, **spec)
-                if not isinstance(optimizer, utils.StatefulOptimizer):
-                    raise ValueError("SplitOpt only supports HeavyBall optimizers")
-                self.optimizers.append(optimizer)
+                optimizer = spec.pop("optimizer")
+                if not isinstance(optimizer, type) or not issubclass(optimizer, utils.StatefulOptimizer):
+                    raise TypeError("SplitOpt only supports HeavyBall optimizer classes")
+                hessian_approx = spec.get("hessian_approx", C.use_default)
+                if C.default(hessian_approx, optimizer.hessian_approx):
+                    raise ValueError("SplitOpt does not support Hessian-approximation optimizers")
+                normalized.append((optimizer, params, spec))
                 all_params.extend(params)
-        if not self.optimizers:
+        if not normalized:
             raise ValueError("No optimizers created")
         if len({id(p) for p in all_params}) != len(all_params):
             raise ValueError("A parameter cannot belong to multiple SplitOpt optimizers")
-        if any(opt.hessian_approx for opt in self.optimizers):
-            raise ValueError("SplitOpt does not support Hessian-approximation optimizers")
+        self.optimizers = [optimizer(params, **options) for optimizer, params, options in normalized]
         self._split_ready = False
         super().__init__(all_params, {"multi_tensor": True})
         self._split_ready = True
@@ -1828,12 +1836,18 @@ class SplitOpt(utils.StatefulOptimizer):
         return self.train(False)
 
     def state_dict(self):
-        return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
+        return {
+            "classes": [_class_path(opt) for opt in self.optimizers],
+            "optimizers": [opt.state_dict() for opt in self.optimizers],
+        }
 
     def load_state_dict(self, state_dict):
         states = state_dict["optimizers"]
         if len(states) != len(self.optimizers):
             raise ValueError(f"Expected {len(self.optimizers)} optimizer states, got {len(states)}")
+        classes = [_class_path(opt) for opt in self.optimizers]
+        if state_dict["classes"] != classes:
+            raise ValueError(f"Expected optimizer classes {classes}, got {state_dict['classes']}")
         for opt, s in zip(self.optimizers, states):
             opt.load_state_dict(s)
 
@@ -1856,20 +1870,30 @@ class SAMWrapper(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        wrapped_optimizer: Union[utils.StatefulOptimizer, Type[utils.StatefulOptimizer]] = AdamW,
+        wrapped_optimizer: utils.StatefulOptimizer | type[utils.StatefulOptimizer] = AdamW,
         ball: float = 0.1,
     ):
         _items = list(params)
         if _items and isinstance(_items[0], dict):
             _groups = [{**item, "params": list(item["params"])} for item in _items]
+            if any("ball" in group for group in _groups):
+                raise TypeError("ball is optimizer-wide")
             _wrapper_params = [{"params": list(group["params"])} for group in _groups]
-            _inner_params = [{k: v for k, v in group.items() if k != "ball"} for group in _groups]
+            _inner_params = _groups
         else:
             _wrapper_params = _inner_params = _items
         super().__init__(_wrapper_params, {})
 
         if isinstance(wrapped_optimizer, type):
+            if not issubclass(wrapped_optimizer, utils.StatefulOptimizer):
+                raise TypeError("SAMWrapper requires a HeavyBall StatefulOptimizer")
             wrapped_optimizer = wrapped_optimizer(_inner_params)
+        elif _items and isinstance(_items[0], dict):
+            unknown = set().union(*(group.keys() for group in _groups)) - {"params"}
+            if unknown:
+                raise TypeError(f"Configure instance-form optimizer options before wrapping: {sorted(unknown)}")
+        if not isinstance(wrapped_optimizer, utils.StatefulOptimizer):
+            raise TypeError("SAMWrapper requires a HeavyBall StatefulOptimizer")
 
         _wrapper_ids = sorted(id(p) for group in self.param_groups for p in group["params"])
         _inner_ids = sorted(id(p) for group in wrapped_optimizer.param_groups for p in group["params"])
@@ -1930,11 +1954,19 @@ class SAMWrapper(torch.optim.Optimizer):
         return self.wrapped_optimizer.state_size()
 
     def state_dict(self):
-        return {"wrapped": self.wrapped_optimizer.state_dict(), "ball": self.ball}
+        return {
+            "class": _class_path(self.wrapped_optimizer),
+            "wrapped": self.wrapped_optimizer.state_dict(),
+            "ball": self.ball,
+        }
 
     def load_state_dict(self, state_dict):
+        expected = _class_path(self.wrapped_optimizer)
+        if state_dict["class"] != expected:
+            raise ValueError(f"Expected wrapped optimizer {expected}, got {state_dict['class']}")
+        ball = state_dict["ball"]
         self.wrapped_optimizer.load_state_dict(state_dict["wrapped"])
-        self.ball = state_dict["ball"]
+        self.ball = ball
 
     def train(self, mode: bool = True):
         train = getattr(self.wrapped_optimizer, "train", None)

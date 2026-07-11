@@ -44,23 +44,17 @@ def parse_shape(text: str) -> tuple[int, ...]:
     return shape
 
 
-def compile_inductor(fn, **kwargs):
-    return torch.compile(fn, backend="inductor", **kwargs)
-
-
 def compiler_module(compiler: Compiler, fusions_path: Path | None):
     if fusions_path:
         if compiler is not Compiler.heavyball:
             raise ValueError("--fusions-path requires --compiler heavyball")
         spec = importlib.util.spec_from_file_location("heavyball._bench_fusions", fusions_path)
-        if spec is None or spec.loader is None:
-            raise ValueError(f"could not load {fusions_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
     if compiler is Compiler.inductor:
-        return types.SimpleNamespace(compile=compile_inductor)
+        return types.SimpleNamespace(compile=torch.compile)
     return DEFAULT_FUSIONS
 
 
@@ -74,7 +68,9 @@ def compiler_context(compiler: Compiler, fusions_path: Path | None):
         heavyball.utils.fusions = prior
 
 
-def optimizer_kwargs(optimizer_cls, library: Library, compile_step: bool, fused: bool | None, update_precond: bool | None) -> dict:
+def optimizer_kwargs(
+    optimizer_cls, library: Library, compile_step: bool, fused: bool | None, update_precond: bool | None
+) -> dict:
     kwargs = {"compile_step": compile_step, "consume_grad": False} if library is Library.heavyball else {}
     if fused is not None and library is Library.torch:
         kwargs["fused"] = fused
@@ -211,7 +207,9 @@ def main() -> None:
         parser.error("--fusions-path requires --library heavyball")
     if args.update_precond is not None and library is Library.heavyball:
         try:
-            optimizer_kwargs(getattr(heavyball, args.optimizer), library, args.compile_step, args.fused, args.update_precond)
+            optimizer_kwargs(
+                getattr(heavyball, args.optimizer), library, args.compile_step, args.fused, args.update_precond
+            )
         except ValueError as error:
             parser.error(str(error))
     if args.compare:

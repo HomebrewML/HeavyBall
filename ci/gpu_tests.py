@@ -29,9 +29,9 @@ def _detect_repo_and_branch():
                 branch = head.get("ref")
         except (json.JSONDecodeError, KeyError):
             pass
-    return (
-        repo or "https://github.com/HomebrewML/HeavyBall",
-        branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "main"),
+    fallback_repo = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', 'HomebrewML/HeavyBall')}"
+    return repo or fallback_repo, branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get(
+        "GITHUB_REF_NAME", "main"
     )
 
 
@@ -85,16 +85,14 @@ timeout {SELF_DESTRUCT_TIMEOUT} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
 if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends g++; fi &&
 cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w &&
-cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
+cd /w &&
 pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
 python -m pytest "$HB_TEST" --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
-sleep 3
-curl -s -X PUT "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
+sleep 120
+curl -s -X DELETE "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
   -H "Authorization: Bearer $CONTAINER_API_KEY" \\
-  -H "Content-Type: application/json" -d '{{"state": "stopped"}}' || true
-sleep 2
-kill 1 2>/dev/null || true
+  -H "Content-Type: application/json" || true
 """
 
 
@@ -155,13 +153,11 @@ def destroy(instance_id):
 
 def destroy_all(extra_ids=()):
     to_destroy = set(extra_ids)
-    to_destroy.update(get_instances())
-
     while to_destroy:
         for iid in to_destroy:
             destroy(iid)
         time.sleep(3)
-        to_destroy = set(get_instances())
+        to_destroy &= get_instances().keys()
 
 
 def _instance_elapsed(inst):
@@ -334,8 +330,9 @@ def main():
     all_offers = find_offers(len(test_files))
     offers = all_offers[: len(test_files)]
     spare_offers = list(all_offers[len(test_files) :])
+    results = [_error_result(test_file, "No matching GPU offer") for test_file in test_files[len(offers) :]]
     if len(offers) < len(test_files):
-        print(f"Warning: only {len(offers)} offers for {len(test_files)} tests, some skipped")
+        print(f"Error: only {len(offers)} offers for {len(test_files)} tests", file=sys.stderr)
         test_files = test_files[: len(offers)]
     print(f"{len(offers)} primary, {len(spare_offers)} spare offers")
 
@@ -346,18 +343,17 @@ def main():
                 iid = create_instance(offer["id"], test_file)
             except Exception as e:
                 print(f"  Failed to create for {test_file}: {e}")
+                results.append(_error_result(test_file, str(e)))
                 continue
             if iid:
                 instance_map[iid] = test_file
             else:
                 print(f"  Failed to create for {test_file}")
+                results.append(_error_result(test_file, "Instance creation failed"))
 
-        if not instance_map:
-            print("No instances created", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"\nWaiting for {len(instance_map)} instances (timeout={TIMEOUT}s)...")
-        results = wait_and_collect(instance_map, spare_offers)
+        if instance_map:
+            print(f"\nWaiting for {len(instance_map)} instances (timeout={TIMEOUT}s)...")
+            results.extend(wait_and_collect(instance_map, spare_offers))
     finally:
         print("\nCleaning up...")
         destroy_all(instance_map)

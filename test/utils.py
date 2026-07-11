@@ -1,7 +1,6 @@
 import functools
 import inspect
-import warnings
-from typing import Callable, List
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
@@ -44,9 +43,10 @@ _OPTIM_DEFAULTS = {
 
 
 def get_optim(optim, params, **kwargs):
-    args = {**_OPTIM_DEFAULTS, **kwargs}
     sig = inspect.signature(optim)
-    return optim(params, **{key: value for key, value in args.items() if key in sig.parameters})
+    defaults = {key: value for key, value in _OPTIM_DEFAULTS.items() if key in sig.parameters}
+    defaults.update(kwargs)
+    return optim(params, **defaults)
 
 
 def _fn_key(f):
@@ -67,12 +67,8 @@ def _deduplicate_by_chain(names):
     for name in names:
         dummy = [torch.nn.Parameter(torch.randn(4, 4))]
         cls = getattr(heavyball, name)
-        try:
-            opt = cls(dummy, lr=1e-3)
-            key = tuple(_fn_key(f) for f in opt._fns)
-        except Exception as e:
-            warnings.warn(f"Failed to instantiate {name} for dedup: {e}")
-            continue
+        opt = cls(dummy, lr=1e-3)
+        key = tuple(_fn_key(f) for f in opt._fns), opt.param_groups[0].get("sqrt", False)
         if any(ft._under_bucket for ft in _walk_fns(opt._fns)):
             bucket_aware.add(name)
         if key not in seen:
@@ -130,12 +126,12 @@ def _local_rms_norm(x):
 
 
 @_upcast
-def _global_l2_norm(xs: List[Tensor]) -> Tensor:
+def _global_l2_norm(xs: list[Tensor]) -> Tensor:
     return sum((x.square().sum() for x in xs), start=scalar_like(xs[0])) ** 0.5
 
 
 @_upcast
-def _global_rms_norm(xs: List[Tensor]) -> Tensor:
+def _global_rms_norm(xs: list[Tensor]) -> Tensor:
     norm = sum((x.square().sum() for x in xs), start=scalar_like(xs[0]))
     numel = sum(x.numel() for x in xs)
     return (norm / numel) ** 0.5

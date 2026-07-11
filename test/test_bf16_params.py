@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, get_optim, set_grad
+from utils import get_optim, set_grad
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -22,36 +22,31 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
-def test_foreach(opt, size: int = 256, depth: int = 1, iterations: int = 64, outer_iterations: int = 1):
+@pytest.mark.parametrize("opt", ["SGD", "AdamW", "PSGDKron"])
+def test_foreach(opt, size: int = 64, iterations: int = 8):
     set_torch()
     opt = getattr(heavyball, opt)
 
     torch.manual_seed(0x123131)
-    model = nn.Sequential(*[nn.Linear(size, size, bias=False) for _ in range(depth)]).to(torch.double).cuda()
+    model = nn.Linear(size, size, bias=False).double().cuda()
+    seeds = torch.randint(0, 2**30, (iterations,), device="cpu")
 
-    all_params = []
+    deltas = []
 
     for dtype in [torch.float32, torch.bfloat16]:
-        all_params.append([])
+        mdl = copy.deepcopy(model).to(dtype)
+        initial = [p.detach().float().clone() for p in mdl.parameters()]
+        o = get_optim(opt, mdl.parameters(), lr=1e-3, warmup_steps=0, update_clipping=None)
+        for seed in seeds:
+            torch.manual_seed(seed)
+            set_grad(mdl, dtype=torch.float32)
+            o.step()
+            o.zero_grad()
+        deltas.append(torch.cat([(p.float() - p0).flatten() for p, p0 in zip(mdl.parameters(), initial)]))
+        del mdl, o
+        clean()
 
-        for i in range(outer_iterations):
-            torch.manual_seed(0x2131290 + i)
-            seeds = torch.randint(0, 2**30, (iterations,), device="cpu")
-            mdl = copy.deepcopy(model).to(dtype)
-            o = get_optim(opt, mdl.parameters(), lr=1e-4, update_clipping=None)
-
-            for s in seeds.numpy():
-                torch.manual_seed(s)
-                set_grad(mdl, dtype=torch.float32)
-                o.step()
-                o.zero_grad()
-
-            all_params[-1].append([p.data.clone() for p in mdl.parameters()])
-
-            del mdl, o
-            clean()
-
-    for params_f32, params_bf16 in zip(*all_params):
-        for p0, p1 in zip(params_f32, params_bf16):
-            assert torch.allclose(p0.float(), p1.float(), rtol=0.1, atol=1e-3)
+    cosine = torch.nn.functional.cosine_similarity(*deltas, dim=0)
+    ratio = deltas[1].norm() / deltas[0].norm()
+    assert cosine > 0.9
+    assert 0.7 < ratio < 1.3

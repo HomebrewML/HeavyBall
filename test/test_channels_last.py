@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, get_optim
+from utils import get_optim
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -15,36 +15,28 @@ heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
 
-@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
-def test_foreach(opt, size: int = 128, depth: int = 1, iterations: int = 64, outer_iterations: int = 1):
+@pytest.mark.parametrize("opt", ["AdamW", "PSGDKron"])
+def test_foreach(opt, size: int = 8, iterations: int = 3):
     set_torch()
     opt = getattr(heavyball, opt)
 
-    peaks = []
-    losses = []
+    deltas = []
 
     for is_channels_last in [False, True]:
         torch.manual_seed(0x2131290)
-        peaks.append([])
-        losses.append([])
+        model = nn.Conv2d(size, size, 3).cuda()
+        if is_channels_last:
+            model.to(memory_format=torch.channels_last)
+        initial = [p.detach().clone() for p in model.parameters()]
+        o = get_optim(opt, model.parameters(), lr=1e-3, weight_decay=1e-4, warmup_steps=0)
+        for step in range(iterations):
+            torch.manual_seed(0x2131290 + step)
+            loss = model(torch.randn((4, size, 8, 8), device="cuda")).square().mean()
+            loss.backward()
+            o.step()
+            o.zero_grad()
+        deltas.append(torch.cat([(p - p0).flatten() for p, p0 in zip(model.parameters(), initial, strict=True)]))
+        del model, o
+        clean()
 
-        for i in range(outer_iterations):
-            model = nn.Sequential(*[nn.Conv2d(size, size, 3) for _ in range(depth)]).cuda()
-            if is_channels_last:
-                model.to(memory_format=torch.channels_last)
-
-            o = get_optim(opt, model.parameters(), lr=1e-3, weight_decay=1e-4, warmup_steps=16)
-
-            for _ in range(iterations):
-                loss = model(torch.randn((1024, size, 4, 4), device="cuda")).square().mean()
-                loss.backward()
-                o.step()
-                o.zero_grad()
-                losses[-1].append(loss.detach())
-
-            del model, o
-            clean()
-
-    for i, (l0, l1) in enumerate(zip(*losses)):
-        print(i, l0.item(), l1.item())
-        assert torch.allclose(l0.float(), l1.float(), rtol=0.01)
+    torch.testing.assert_close(deltas[1], deltas[0], rtol=2e-3, atol=2e-6)

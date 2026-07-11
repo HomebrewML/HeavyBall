@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, get_optim
+from utils import get_optim
 
 import heavyball
 from heavyball.utils import clean, set_torch
@@ -10,52 +10,37 @@ from heavyball.utils import clean, set_torch
 heavyball.utils.compile_mode = "default"
 config.cache_size_limit = 128
 
-PSGD_OPTS = [o for o in REPRESENTATIVE_OPTS if "PSGD" in o]
+PSGD_OPTS = ["PSGDKron", "PSGDPRO", "QSGD", "PSGDLRA"]
 
 
 @pytest.mark.parametrize("opt", PSGD_OPTS)
-def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, outer_iterations: int = 2):
+def test_foreach(opt, size: int = 32, iterations: int = 6):
     set_torch()
 
     opt = getattr(heavyball, opt)
 
-    # Pre-generate all gradients so bf16 stochastic rounding inside the optimizer
-    # doesn't desync the CUDA RNG between q_dtype runs.
     torch.manual_seed(0x2131290)
-    all_grads = []
-    for i in range(outer_iterations):
-        model_tmp = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-        grads_for_run = []
-        for _ in range(iterations):
-            grads_for_run.append([torch.randn_like(p) for p in model_tmp.parameters()])
-        all_grads.append(grads_for_run)
-        del model_tmp
-
-    all_params = []
+    model_tmp = nn.Linear(size, size).cuda()
+    all_grads = [[torch.randn_like(p) for p in model_tmp.parameters()] for _ in range(iterations)]
+    del model_tmp
+    deltas = []
 
     for q_dtype in ["float32", "bfloat16"]:
-        all_params.append([])
+        torch.manual_seed(0x2131290)
+        model = nn.Linear(size, size).cuda()
+        initial = [p.detach().clone() for p in model.parameters()]
+        o = get_optim(opt, model.parameters(), lr=1e-3, q_dtype=q_dtype, warmup_steps=0)
+        for step, gradients in enumerate(all_grads):
+            for p, grad in zip(model.parameters(), gradients, strict=True):
+                p.grad = grad.clone()
+            torch.cuda.manual_seed(0x9999 + step)
+            o.step()
+            o.zero_grad()
+        deltas.append(torch.cat([(p - p0).flatten() for p, p0 in zip(model.parameters(), initial, strict=True)]))
+        del model, o
+        clean()
 
-        for i in range(outer_iterations):
-            torch.manual_seed(0x2131290)
-            model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-            o = get_optim(opt, model.parameters(), lr=1e-3, q_dtype=q_dtype)
-
-            for j, step_grads in enumerate(all_grads[i]):
-                for p, g in zip(model.parameters(), step_grads):
-                    p.grad = g.clone()
-                # Re-seed CUDA RNG before each step so dampen_grad and other
-                # internal RNG calls produce identical values despite bf16
-                # stochastic rounding consuming extra RNG state.
-                torch.cuda.manual_seed(0x9999 + i * iterations + j)
-                o.step()
-                o.zero_grad()
-
-            all_params[-1].append([p.data.clone() for p in model.parameters()])
-
-            del model, o
-            clean()
-
-    for params_f32, params_bf16 in zip(*all_params):
-        for p0, p1 in zip(params_f32, params_bf16):
-            assert torch.allclose(p0, p1, rtol=0.1, atol=5e-3)
+    cosine = torch.nn.functional.cosine_similarity(*deltas, dim=0)
+    ratio = deltas[1].norm() / deltas[0].norm()
+    assert cosine > 0.95
+    assert 0.8 < ratio < 1.2

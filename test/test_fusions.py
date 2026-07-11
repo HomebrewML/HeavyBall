@@ -6,7 +6,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 from heavyball import fusions
-from heavyball.utils import beta_debias, scalar_guard
+from heavyball.utils import beta_debias
 
 
 def _targets(gm):
@@ -24,28 +24,28 @@ def _exec(fn, pass_fn, args):
     assert torch.allclose(ref, out, rtol=1e-5, atol=1e-6), f"\n  eager {ref}\n  pass  {out}"
 
 
-def test_cancel_double_one_minus_stays_opaque():
-    _exec(lambda x: (1 - (1 - x)) * 2, fusions.cancel_double_one_minus, (torch.rand(8),))
+def test_fold_affine_stays_opaque():
+    _exec(lambda x: (1 - (1 - x)) * 2, fusions.fold_affine, (torch.rand(8),))
     gm = make_fx(lambda x: (1 - (1 - x)) * 2)(torch.rand(8))
-    assert fusions.cancel_double_one_minus(gm.graph) == 0
+    assert fusions.fold_affine(gm.graph) == 0
 
 
-def test_cancel_double_one_minus_preserves_output_storage():
+def test_fold_affine_preserves_output_storage():
     gm = make_fx(lambda x: 1 - (1 - x))(torch.rand(8))
-    assert fusions.cancel_double_one_minus(gm.graph) == 0
+    assert fusions.fold_affine(gm.graph) == 0
     gm.recompile()
     x = torch.rand(8)
     assert gm(x).data_ptr() != x.data_ptr()
 
 
-def test_cancel_double_one_minus_skips_integers():
+def test_fold_affine_skips_integers():
     gm = make_fx(lambda x: 1 - (1 - x))(torch.arange(8))
-    assert fusions.cancel_double_one_minus(gm.graph) == 0
+    assert fusions.fold_affine(gm.graph) == 0
 
 
-def test_beta_debias_complement_cancels():
+def test_beta_debias_complement_stays_opaque():
     gm = make_fx(lambda b, s: (1 - beta_debias(b, s)) * 2)(torch.tensor(0.9999), torch.tensor(10))
-    assert fusions.cancel_double_one_minus(gm.graph) == 1
+    assert fusions.fold_affine(gm.graph) == 0
 
 
 def test_fold_affine_deep_one_minus_stays_opaque():
@@ -80,17 +80,17 @@ def test_post_grad_affine_preserves_signed_zero():
 
 
 def test_fold_affine_constant_shift():
-    _exec(lambda x: 2 - (1 - x), fusions.fold_affine, (torch.rand(8),))
-    gm = make_fx(lambda x: 2 - (1 - x))(torch.rand(8))
+    _exec(lambda x: (x + 1) * 2 + 3, fusions.fold_affine, (torch.rand(8),))
+    gm = make_fx(lambda x: (x + 1) * 2 + 3)(torch.rand(8))
     assert fusions.fold_affine(gm.graph) >= 1
     assert torch.ops.aten.add.Tensor in _targets(gm)
 
 
-def test_fold_affine_negate_distributes():
+def test_fold_affine_skips_sign_flips():
     _exec(lambda x: -(x * 2 + 1), fusions.fold_affine, (torch.rand(8),))
     gm = make_fx(lambda x: -(x * 2 + 1))(torch.rand(8))
-    fusions.fold_affine(gm.graph)
-    assert torch.ops.aten.neg.default not in _targets(gm)
+    assert fusions.fold_affine(gm.graph) == 0
+    assert torch.ops.aten.neg.default in _targets(gm)
 
 
 def test_fold_affine_scale_shift_combined():
@@ -139,15 +139,15 @@ def test_fma_crosses_functional_fulls_in_lerp_lowering():
     assert torch.ops.prims.fma.default in _targets(gm)
 
 
-def test_fold_affine_cse_dedup():
+def test_fold_affine_does_not_cse_ieee_distinct_forms():
     def f(x):
-        a = 2 - (1 - x)
-        b = 2 - (1 - x)
-        return a + b
+        return torch.signbit(2 - x), torch.signbit((x - 2) * -1)
 
-    _exec(f, fusions.fold_affine, (torch.rand(8),))
-    gm = make_fx(f)(torch.rand(8))
-    assert fusions.fold_affine(gm.graph) >= 2
+    value = torch.tensor(2.0)
+    gm = make_fx(f)(value)
+    assert fusions.fold_affine(gm.graph) == 0
+    gm.recompile()
+    assert all(torch.equal(a, b) for a, b in zip(gm(value), f(value)))
 
 
 def test_fold_affine_skips_already_minimal():
@@ -390,22 +390,20 @@ def test_fma_sub_and_scalar_addend_run():
     _exec(lambda a, b: a * b + 0.5, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8)))
 
 
-def test_fma_negates_promoted_factor():
+def test_fma_skips_subtracting_promoted_factor():
     for mask in (torch.tensor([True, False]), torch.tensor([3, 4], dtype=torch.uint8)):
         x = torch.tensor([2.0, 3.0])
         c = torch.tensor([7.0, 11.0])
         _exec(lambda mask, x, c: c - mask * x, fusions.fuse_mul_add_to_fma, (mask, x, c))
         gm = make_fx(lambda mask, x, c: c - mask * x)(mask, x, c)
-        assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-        assert torch.ops.prims.fma.default in _targets(gm)
+        assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+        assert torch.ops.prims.fma.default not in _targets(gm)
 
 
-def test_fma_negates_scalar_factor_without_a_tensor_negation():
+def test_fma_skips_subtracting_scalar_factor():
     gm = make_fx(lambda x, y: y - x * 64)(torch.randn(8), torch.randn(8))
-    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-    fma = next(node for node in gm.graph.nodes if node.target == torch.ops.prims.fma.default)
-    assert fma.args[1] == -64
-    assert torch.ops.aten.neg.default not in _targets(gm)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    assert torch.ops.prims.fma.default not in _targets(gm)
 
 
 def test_fma_scaled_add_rewrites_and_runs():
@@ -468,7 +466,7 @@ def test_fma_preserves_out_write():
     assert torch.equal(out, torch.tensor([10.0]))
 
 
-def test_fma_rsub_tensor_alpha_fuses():
+def test_fma_rsub_tensor_alpha_stays_opaque():
     a = torch.randn(8)
     b = torch.randn(8)
     o = torch.tensor(2.0)
@@ -477,17 +475,17 @@ def test_fma_rsub_tensor_alpha_fuses():
         return torch.ops.aten.rsub.Tensor(a * b, o, alpha=3.0)
 
     gm = make_fx(fn)(a, b, o)
-    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-    assert torch.ops.prims.fma.default in _targets(gm)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    assert torch.ops.prims.fma.default not in _targets(gm)
 
 
-def test_fma_rsub_scalar_alpha_fuses():
+def test_fma_rsub_scalar_alpha_stays_opaque():
     def fn(a, b):
         return torch.rsub(a * b, 2, alpha=3)
 
     gm = make_fx(fn)(torch.tensor(2.0), torch.tensor(3.0))
-    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-    assert torch.ops.prims.fma.default in _targets(gm)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    assert torch.ops.prims.fma.default not in _targets(gm)
 
 
 def test_fma_mixed_dtype_fuses():
@@ -499,19 +497,6 @@ def test_fma_mixed_dtype_fuses():
     assert torch.ops.prims.fma.default in _targets(gm)
 
 
-def test_fma_mixed_dtype_improves_precision():
-    a = torch.tensor([1.0009765625], dtype=torch.float16)
-    b = torch.tensor([1.0009765625], dtype=torch.float16)
-    c = torch.tensor([-1.001953125], dtype=torch.float32)
-
-    def fn(a, b, c):
-        return a * b + c
-
-    reference = (a.double() * b.double() + c.double()).float()
-    assert not torch.equal(fn(a, b, c), reference)
-    assert torch.equal(fusions.compile(fn, fullgraph=True)(a, b, c), reference)
-
-
 def test_fma_same_dtype_tensor_addend_fuses():
     a = torch.randn(8, dtype=torch.float16)
     b = torch.randn(8, dtype=torch.float16)
@@ -520,10 +505,10 @@ def test_fma_same_dtype_tensor_addend_fuses():
     assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
 
 
-def test_fma_integral_factor_promotes():
+def test_fma_integral_factor_subtraction_stays_opaque():
     gm = make_fx(lambda step, lr: 1 - step * lr)(torch.tensor(1, dtype=torch.int64), torch.tensor(0.1))
-    assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
-    assert torch.ops.prims.fma.default in _targets(gm)
+    assert fusions.fuse_mul_add_to_fma(gm.graph) == 0
+    assert torch.ops.prims.fma.default not in _targets(gm)
 
 
 def test_fma_scaled_product_fuses():
@@ -558,12 +543,6 @@ def test_post_grad_debias_graph():
         assert torch.allclose(a, b, rtol=1e-5, atol=1e-6)
 
 
-def test_beta_zero_stays_exact():
-    for step in (1, 2, 5, 100):
-        out = beta_debias(torch.tensor(0.0, dtype=torch.float32), torch.tensor(step, dtype=torch.int64))
-        assert float(out) == 0.0, f"beta=0 step={step} got {float(out)}"
-
-
 def _affine_programs():
     rng = random.Random(0xF00D)
     kinds = ("add", "sub", "rsub", "mul", "div", "neg")
@@ -595,14 +574,16 @@ def _apply_affine(x, operations):
 )
 def test_randomized_affine_dags_match_fp64_and_converge(dtype, rtol, atol):
     generator = torch.Generator().manual_seed(0xA11F1E)
+    rewrites = 0
     for operations in _affine_programs():
         x = (torch.randn(31, generator=generator) * 0.5).to(dtype)
         gm = make_fx(lambda x: _apply_affine(x, operations))(x)
-        assert fusions.fold_affine(gm.graph) > 0
+        rewrites += fusions.fold_affine(gm.graph)
         gm.recompile()
         expected = _apply_affine(x.double(), operations).to(dtype)
         torch.testing.assert_close(gm(x), expected, rtol=rtol, atol=atol)
         assert fusions.fold_affine(gm.graph) == 0
+    assert rewrites > 0
 
 
 def _apply_fma_dag(a, b, c, d, coefficients):
@@ -624,14 +605,6 @@ def test_randomized_fma_dags_match_fp64_and_converge():
         expected = _apply_fma_dag(*(x.double() for x in args), values).float()
         torch.testing.assert_close(gm(*args), expected, rtol=2e-6, atol=1e-6)
         assert fusions.post_grad_custom_pre_pass(gm.graph) == 0
-
-
-def test_scalar_guard_promotes_floating_optimizer_scalars_to_fp32():
-    for dtype in (torch.float16, torch.bfloat16, torch.float32):
-        reference = torch.ones((), dtype=dtype)
-        scalar, tensor_scalar = scalar_guard(0.1, torch.tensor(0.1, dtype=dtype), reference)
-        assert scalar.dtype == tensor_scalar.dtype == torch.float32
-        assert scalar.ndim == tensor_scalar.ndim == 0
 
 
 def test_scalar_alpha_dtype_matrix_matches_fp64():

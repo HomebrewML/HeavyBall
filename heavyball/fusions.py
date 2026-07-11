@@ -75,17 +75,16 @@ class Affine:
     a: float
     b: float
     depth: int = 0
+    added: bool = False
 
 
 def _affine_add(lhs: Affine, rhs: Affine, scale: int | float = 1) -> Affine | None:
     ra, rb = rhs.a * scale, rhs.b * scale
     depth = max(lhs.depth, rhs.depth) + 1
     if lhs.base is None:
-        return Affine(rhs.base, ra, rb + lhs.b, depth)
+        return Affine(rhs.base, ra, rb + lhs.b, depth, True) if rhs.base is None or ra > 0 else None
     if rhs.base is None:
-        return Affine(lhs.base, lhs.a, lhs.b + rb, depth)
-    if lhs.base is rhs.base:
-        return Affine(lhs.base, lhs.a + ra, lhs.b + rb, depth)
+        return Affine(lhs.base, lhs.a, lhs.b + rb, depth, True)
     return None
 
 
@@ -94,7 +93,7 @@ def _affine_leaf(node: torch.fx.Node) -> Affine | None:
 
 
 def _scale_affine(affine: Affine, scale: int | float) -> Affine:
-    return Affine(affine.base, affine.a * scale, affine.b * scale, affine.depth + 1)
+    return Affine(affine.base, affine.a * scale, affine.b * scale, affine.depth + 1, affine.added)
 
 
 def _fresh(node: torch.fx.Node) -> bool:
@@ -118,10 +117,6 @@ def _epochs(graph: torch.fx.Graph) -> dict[torch.fx.Node, int]:
         result[node] = epoch
         epoch += _barrier(node)
     return result
-
-
-def _can_elide(node: torch.fx.Node, epochs: dict[torch.fx.Node, int], epoch: int) -> bool:
-    return all(epochs.get(user, epoch) == epoch and _fresh(user) for user in node.users)
 
 
 def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
@@ -157,20 +152,16 @@ def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
         scale, inner_node = _scalar(left), right
         if scale is None:
             scale, inner_node = _scalar(right), left
-        if scale is not None:
+        if scale is not None and scale > 0:
             inner = _affine_of(inner_node, cache, epochs, epoch)
             if inner:
                 aff = _scale_affine(inner, scale)
     elif target in _DIV:
         scale = _scalar(_arg(node, 1, "other"))
-        if scale is not None and scale != 0:
+        if scale is not None and scale > 0:
             inner = _affine_of(_arg(node, 0, "input"), cache, epochs, epoch)
             if inner:
                 aff = _scale_affine(inner, 1.0 / scale)
-    elif target == aten.neg.default:
-        inner = _affine_of(_arg(node, 0, "input"), cache, epochs, epoch)
-        if inner:
-            aff = _scale_affine(inner, -1.0)
     if aff is None:
         aff = _affine_leaf(node)
     elif aff.base is not node and (aff.a == 0.0 or aff.a == 1.0 and aff.b == 0.0):
@@ -240,51 +231,30 @@ def _finalize(graph: torch.fx.Graph, count: int) -> int:
 def fold_affine(graph: torch.fx.Graph) -> int:
     epochs = _epochs(graph)
     fma = _fma() is not None
-    seen: dict[tuple[torch.fx.Node, str, str], torch.fx.Node] = {}
     cache: dict[tuple[torch.fx.Node, int], Affine | None] = {}
     count = 0
-    epoch = -1
     for node, node_epoch in tuple(epochs.items()):
-        if node_epoch != epoch:
-            seen.clear()
-            epoch = node_epoch
-        if node.op != "call_function" or not _is_float_tensor(node):
+        if node.op != "call_function" or not _is_float_tensor(node) or node.meta["val"].dtype == torch.float64:
             continue
-        affine = _affine_of(node, cache, epochs, epoch)
+        affine = _affine_of(node, cache, epochs, node_epoch)
         if affine is None or affine.base is None or not _representable(affine, node):
             continue
 
-        key = affine.base, affine.a.hex(), affine.b.hex()
-        if affine.a == 0.0 or affine.a == 1.0 and affine.b == 0.0:
-            continue
-
-        rep = seen.get(key)
-        if rep is not None and _can_elide(node, epochs, epoch) and _can_elide(rep, epochs, epoch):
-            node.replace_all_uses_with(rep)
-            graph.erase_node(node)
-            count += 1
+        if affine.a <= 0.0 or affine.b == 0.0 and affine.added:
             continue
 
         if _is_affine_form(node, affine):
-            seen[key] = node
             continue
 
         cost = 1 if fma or affine.a == 1.0 or affine.b == 0.0 else 2
         if affine.depth > cost:
             with graph.inserting_before(node):
-                built = _emit_affine(graph, affine, node.meta, epochs, epoch)
+                built = _emit_affine(graph, affine, node.meta, epochs, node_epoch)
             node.replace_all_uses_with(built)
             graph.erase_node(node)
             count += 1
-            seen[key] = built
-            continue
-
-        seen[key] = node
 
     return _finalize(graph, count)
-
-
-cancel_double_one_minus = fold_affine
 
 
 def _is_mul_operand(x: Any) -> bool:
@@ -293,28 +263,20 @@ def _is_mul_operand(x: Any) -> bool:
     return _number(x) is not None
 
 
-def _single_user_mul(node: Any, epochs: dict[torch.fx.Node, int], epoch: int) -> tuple[Any, Any] | None:
-    if not (isinstance(node, torch.fx.Node) and node.op == "call_function" and node.target in _MUL and len(
-            node.users) == 1 and _is_float_tensor(node) and epochs.get(node, epoch) == epoch):
+def _single_user_mul(
+    node: Any, epochs: dict[torch.fx.Node, int], epoch: int
+) -> tuple[Any, Any] | None:
+    if not (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target in _MUL
+        and len(node.users) == 1
+        and _is_float_tensor(node)
+        and epochs.get(node, epoch) == epoch
+    ):
         return None
     a, b = _arg(node, 0, "input"), _arg(node, 1, "other")
     return (a, b) if _is_mul_operand(a) and _is_mul_operand(b) else None
-
-
-def _neg(graph: torch.fx.Graph, x: Any) -> Any:
-    return _call(graph, aten.neg.default, (x,), x.meta) if isinstance(x, torch.fx.Node) else -x
-
-
-def _negated_product(graph: torch.fx.Graph, a: Any, b: Any) -> tuple[Any, Any] | None:
-    if _number(b) is not None:
-        return a, -b
-    if _number(a) is not None:
-        return -a, b
-    if isinstance(a, torch.fx.Node) and _is_float_tensor(a):
-        return _neg(graph, a), b
-    if isinstance(b, torch.fx.Node) and _is_float_tensor(b):
-        return a, _neg(graph, b)
-    return None
 
 
 def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
@@ -330,11 +292,11 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
         if args is None:
             continue
         lhs, rhs, scale = args
+        if node.target not in _ADD or scale <= 0:
+            continue
 
         if abs(scale) != 1:
             product_a, product_b, addend = rhs, scale, lhs
-            flip_product = False
-            flip_addend = False
             if not _is_float_tensor(product_a) or product_a.meta["val"].dtype != node.meta["val"].dtype:
                 continue
         else:
@@ -344,27 +306,14 @@ def fuse_mul_add_to_fma(graph: torch.fx.Graph) -> int:
                 continue
             if rhs_mul:
                 product_a, product_b, addend = rhs_mul[0], rhs_mul[1], lhs
-                flip_product = scale == -1
-                flip_addend = False
             elif lhs_mul:
                 product_a, product_b, addend = lhs_mul[0], lhs_mul[1], rhs
-                flip_product = False
-                flip_addend = scale == -1
             else:
                 continue
         if not _is_mul_operand(addend):
             continue
-        if flip_addend and isinstance(addend, torch.fx.Node) and not _is_float_tensor(addend):
-            continue
 
         with graph.inserting_before(node):
-            if flip_product:
-                product = _negated_product(graph, product_a, product_b)
-                if product is None:
-                    continue
-                product_a, product_b = product
-            if flip_addend:
-                addend = _neg(graph, addend)
             result = _call(graph, fma, (product_a, product_b, addend), node.meta)
         node.replace_all_uses_with(result)
         graph.erase_node(node)
@@ -406,4 +355,4 @@ def inductor_backend(graph_module: torch.fx.GraphModule, example_inputs: list[An
 
 
 def compile(fn: Any, **kwargs: Any) -> Any:
-    return torch.compile(fn, backend=inductor_backend, **kwargs)
+    return fn if torch._dynamo.config.disable else torch.compile(fn, backend=inductor_backend, **kwargs)

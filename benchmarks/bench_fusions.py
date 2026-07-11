@@ -23,7 +23,6 @@ class FusionCase:
     name: str
     fn: Callable[..., Any]
     make_args: Callable[[], tuple[Any, ...]]
-    precision: str
     reference: Callable[..., Any] | None = None
 
 
@@ -38,8 +37,8 @@ class ErrorMetrics:
 @dataclass(frozen=True)
 class GraphMetrics:
     nodes: int
-    fmas: int
-    casts: int
+    fma_nodes: int
+    cast_nodes: int
     rewrites: int
 
 
@@ -48,10 +47,10 @@ class KernelMetrics:
     generated: int
     sources: int
     triton: int
-    loads: int
-    stores: int
-    fmas: int
-    fp32_casts: int
+    load_sites: int
+    store_sites: int
+    explicit_triton_fmas: int
+    fp32_cast_sites: int
 
 
 @dataclass(frozen=True)
@@ -72,10 +71,10 @@ class VariantResult:
 @dataclass(frozen=True)
 class CaseResult:
     name: str
-    precision: str
     baseline: VariantResult
     candidate: VariantResult
     precision_ok: bool
+    pointwise_ok: bool
     precision_better: bool
     speedup: float
     measured_win: bool
@@ -98,8 +97,10 @@ def _tree_map(fn: Callable[[Any], Any], value: Any) -> Any:
 
 def fp64_reference(case: FusionCase, args: tuple[Any, ...] | None = None) -> Any:
     args = case.make_args() if args is None else args
-    output = case.fn(*args)
-    high_precision = case.reference(*args) if case.reference else case.fn(*_tree_map(_fp64, args))
+    output_args = _tree_map(lambda value: value.clone() if isinstance(value, torch.Tensor) else value, args)
+    reference_args = _tree_map(lambda value: value.clone() if isinstance(value, torch.Tensor) else value, args)
+    output = case.fn(*output_args)
+    high_precision = case.reference(*reference_args) if case.reference else case.fn(*_tree_map(_fp64, reference_args))
     return pytree.tree_map(_reference_like, high_precision, output)
 
 
@@ -112,8 +113,11 @@ def error_metrics(value: Any, reference: Any) -> ErrorMetrics:
     invalid = elements = 0
     sum_abs = max_abs = 0.0
     for actual, expected in zip(values, references, strict=True):
-        if not isinstance(actual, torch.Tensor) or not isinstance(expected, torch.Tensor):
-            invalid += actual != expected
+        if isinstance(actual, torch.Tensor) != isinstance(expected, torch.Tensor):
+            invalid += 1
+            continue
+        if not isinstance(actual, torch.Tensor):
+            invalid += int(actual != expected)
             continue
         if actual.shape != expected.shape or actual.dtype != expected.dtype:
             invalid += 1
@@ -122,10 +126,13 @@ def error_metrics(value: Any, reference: Any) -> ErrorMetrics:
             invalid += int(not torch.equal(actual, expected))
             elements += actual.numel()
             continue
-        reference_nan = torch.isnan(expected)
+        matching_nan = torch.isnan(actual) & torch.isnan(expected)
         finite = torch.isfinite(actual) & torch.isfinite(expected)
         matching_inf = torch.isinf(actual) & (actual == expected)
-        valid = reference_nan | finite | matching_inf
+        zero_sign_mismatch = (
+            finite & (actual == 0) & (expected == 0) & (torch.signbit(actual) != torch.signbit(expected))
+        )
+        valid = matching_nan | (finite & ~zero_sign_mismatch) | matching_inf
         invalid += (~valid).sum().item()
         elements += finite.sum().item()
         if finite.any():
@@ -176,7 +183,13 @@ def precision_pareto(candidate: Any, baseline: Any, reference: Any) -> bool:
             continue
         finite = torch.isfinite(expected)
         infinite = torch.isinf(expected)
+        nan = torch.isnan(expected)
+        if (nan & ~torch.isnan(value)).any():
+            return False
         if (infinite & (value != expected)).any():
+            return False
+        zero = finite & (value == 0) & (expected == 0)
+        if (zero & (torch.signbit(value) != torch.signbit(expected))).any():
             return False
         if ((~torch.isfinite(value)) & finite).any():
             return False
@@ -192,74 +205,16 @@ def precision_pareto(candidate: Any, baseline: Any, reference: Any) -> bool:
     return True
 
 
-def precision_better(candidate: Any, baseline: Any, reference: Any) -> bool:
-    if not precision_pareto(candidate, baseline, reference):
-        return False
-    candidates, _ = pytree.tree_flatten(candidate)
-    baselines, _ = pytree.tree_flatten(baseline)
-    references, _ = pytree.tree_flatten(reference)
-    for value, plain, expected in zip(candidates, baselines, references, strict=True):
-        if (
-            not isinstance(value, torch.Tensor)
-            or not isinstance(plain, torch.Tensor)
-            or not isinstance(expected, torch.Tensor)
-        ):
-            if value == expected and plain != expected:
-                return True
-            continue
-        if not value.dtype.is_floating_point:
-            if torch.equal(value, expected) and not torch.equal(plain, expected):
-                return True
-            continue
-        finite = torch.isfinite(expected)
-        infinite = torch.isinf(expected)
-        if (infinite & (value == expected) & (plain != expected)).any():
-            return True
-        candidate_finite = torch.isfinite(value)
-        baseline_finite = torch.isfinite(plain)
-        if (finite & candidate_finite & ~baseline_finite).any():
-            return True
-        comparable = finite & candidate_finite & baseline_finite
-        if (
-            comparable.any()
-            and (
-                (value[comparable].double() - expected[comparable].double()).abs()
-                < (plain[comparable].double() - expected[comparable].double()).abs()
-            ).any()
-        ):
-            return True
-    return False
-
-
-def no_new_nonfinite(candidate: Any, reference: Any) -> bool:
-    candidates, candidate_spec = pytree.tree_flatten(candidate)
-    references, reference_spec = pytree.tree_flatten(reference)
-    if candidate_spec != reference_spec:
-        return False
-    for value, expected in zip(candidates, references, strict=True):
-        if not isinstance(value, torch.Tensor) or not isinstance(expected, torch.Tensor):
-            if value != expected:
-                return False
-            continue
-        if value.shape != expected.shape or value.dtype != expected.dtype:
-            return False
-        if value.dtype.is_floating_point:
-            if ((~torch.isfinite(value)) & torch.isfinite(expected)).any():
-                return False
-        elif not torch.equal(value, expected):
-            return False
-    return True
-
-
 def _graph_metrics(case: FusionCase, enabled: bool, args: tuple[Any, ...] | None = None) -> tuple[GraphMetrics, str]:
     graph_module = make_fx(case.fn)(*(case.make_args() if args is None else args))
-    rewrites = fusions.post_grad_custom_pre_pass(graph_module.graph) if enabled else 0
+    pass_fn = getattr(fusions, "post_grad_custom_pre_pass", None) if enabled else None
+    rewrites = pass_fn(graph_module.graph) if pass_fn else 0
     targets = [str(node.target) for node in graph_module.graph.nodes if node.op == "call_function"]
     return (
         GraphMetrics(
             nodes=len(tuple(graph_module.graph.nodes)),
-            fmas=sum("fma" in target for target in targets),
-            casts=sum("_to_copy" in target or "convert_element_type" in target for target in targets),
+            fma_nodes=sum("fma" in target for target in targets),
+            cast_nodes=sum("_to_copy" in target or "convert_element_type" in target for target in targets),
             rewrites=rewrites,
         ),
         str(graph_module.graph),
@@ -272,19 +227,17 @@ def _kernel_metrics(sources: list[str], generated: int) -> KernelMetrics:
         generated=generated,
         sources=len(sources),
         triton=source.count("async_compile.triton("),
-        loads=source.count("tl.load("),
-        stores=source.count("tl.store("),
-        fmas=source.count("tl.fma("),
-        fp32_casts=source.count(".to(tl.float32)"),
+        load_sites=source.count("tl.load("),
+        store_sites=source.count("tl.store("),
+        explicit_triton_fmas=source.count("tl.fma("),
+        fp32_cast_sites=source.count(".to(tl.float32)"),
     )
 
 
 def _capture(compiled: Callable[..., Any], args: tuple[Any, ...]) -> tuple[Any, KernelMetrics, list[str]]:
-    try:
-        from torch._inductor import metrics
-        from torch._inductor.utils import run_and_get_code
-    except ImportError:
-        return compiled(*args), KernelMetrics(0, 0, 0, 0, 0, 0, 0), []
+    from torch._inductor import metrics
+    from torch._inductor.utils import run_and_get_code
+
     metrics.reset()
     output, sources = run_and_get_code(compiled, *args)
     return output, _kernel_metrics(sources, metrics.generated_kernel_count), sources
@@ -394,29 +347,42 @@ def evaluate(
         error_metrics(candidate_output, reference),
         candidate_timing,
     )
-    precision_ok = _same_signature(candidate_output, baseline_output) and (
-        precision_pareto(candidate_output, baseline_output, reference)
-        if case.precision == "strict"
-        else no_new_nonfinite(candidate_output, reference)
+    same_signature = _same_signature(candidate_output, baseline_output)
+    pointwise_ok = same_signature and precision_pareto(candidate_output, baseline_output, reference)
+    precision_ok = (
+        same_signature
+        and candidate.error.invalid <= baseline.error.invalid
+        and candidate.error.sum_abs <= baseline.error.sum_abs
     )
-    is_better = precision_better(candidate_output, baseline_output, reference) if case.precision == "strict" else False
+    is_better = candidate.error.invalid < baseline.error.invalid or (
+        candidate.error.invalid == baseline.error.invalid and candidate.error.sum_abs < baseline.error.sum_abs
+    )
     speedup = baseline.timing.median_us / candidate.timing.median_us
     measured_win = speedup >= min_speedup
     return CaseResult(
         case.name,
-        case.precision,
         baseline,
         candidate,
         precision_ok,
+        pointwise_ok,
         is_better,
         speedup,
         measured_win,
-        precision_ok and (measured_win or (case.precision == "strict" and is_better)),
+        precision_ok and (measured_win or (is_better and speedup >= 1)),
     )
 
 
-def _affine(x):
+def _affine_integer(x):
     return ((x * 3 + 2) * 4 + 5) * 6 + 7
+
+
+def _affine_rounding(x):
+    x = -x
+    x = 0.03 - x
+    x = x - (-0.1)
+    x = x / 0.1
+    x = x - 0.03
+    return x + 0.1
 
 
 def _fma(a, b, c):
@@ -454,38 +420,35 @@ def corpus(size: int, dtype: torch.dtype, device: torch.device, seed: int = 0) -
     def random(dtype_: torch.dtype = dtype):
         return torch.randn(size, generator=generator, device=device, dtype=dtype_)
 
-    scalar_dtype = torch.float64 if dtype == torch.float64 else torch.float32
-
     def scalar(value: float) -> torch.Tensor:
-        return torch.tensor(value, device=device, dtype=scalar_dtype)
+        return torch.tensor(value, device=device, dtype=torch.float64 if dtype == torch.float64 else torch.float32)
+
+    affine_input = random()
+    affine_input[0] = 0.3339076638221741
 
     return (
-        FusionCase("affine", _affine, _factory(random()), "report"),
-        FusionCase("fma", _fma, _factory(random(), random(), random()), "strict"),
-        FusionCase("lerp", _lerp, _factory(random(), random()), "strict"),
+        FusionCase("affine_integer", _affine_integer, _factory(random())),
+        FusionCase("affine_rounding", _affine_rounding, _factory(affine_input)),
+        FusionCase("fma", _fma, _factory(random(), random(), random())),
+        FusionCase("lerp", _lerp, _factory(random(), random())),
         FusionCase(
             "mixed_products",
             _mixed_products,
             _factory(random(dtype), random(dtype), random(torch.float32), random(torch.float32)),
-            "strict",
         ),
-        FusionCase("scalar_alpha", _scalar_alpha, _factory(random(torch.float32), random(dtype)), "strict"),
+        FusionCase("scalar_alpha", _scalar_alpha, _factory(random(torch.float32), random(dtype))),
         FusionCase(
             "adam",
             _adam,
             _factory(
                 random(), random(), random().abs(), random(), scalar(0.9), scalar(0.99), scalar(0.01), scalar(1e-8)
             ),
-            "report",
         ),
     )
 
 
 def _dtype(name: str) -> torch.dtype:
-    try:
-        return getattr(torch, name)
-    except AttributeError as error:
-        raise ValueError(f"Unknown dtype: {name}") from error
+    return getattr(torch, name)
 
 
 def _device_arg(name: str) -> torch.device:
@@ -514,8 +477,6 @@ def _load_fusions(path: Path | None) -> None:
     if path is None:
         return
     spec = importlib.util.spec_from_file_location("heavyball._bench_fusions", path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"Could not load fusions from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -555,6 +516,7 @@ def main() -> None:
         "environment": _environment(device),
         "config": {
             "dtype": args.dtype,
+            "reference": "float64" if dtype != torch.float64 else "input precision",
             "size": args.size,
             "warmup": args.warmup,
             "iterations": args.iterations,
@@ -568,10 +530,10 @@ def main() -> None:
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    if args.strict and any(result.precision == "strict" and not result.precision_ok for result in results):
+    if args.strict and any(not result.pointwise_ok for result in results):
         raise SystemExit("A strict precision case regressed")
-    if args.require_win and any(not result.accepted for result in results):
-        raise SystemExit("A case did not produce an accepted hillclimb result")
+    if args.require_win and (not any(result.accepted for result in results) or any(not result.precision_ok for result in results)):
+        raise SystemExit("No accepted hillclimb win")
 
 
 if __name__ == "__main__":

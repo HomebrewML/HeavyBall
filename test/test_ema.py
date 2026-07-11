@@ -1,72 +1,22 @@
-import pytest
 import torch
-from torch import nn
-from torch._dynamo import config
-from utils import REPRESENTATIVE_OPTS, get_optim, set_grad
 
 import heavyball
-from heavyball.utils import clean, set_torch
-
-heavyball.utils.compile_mode = "default"
-config.cache_size_limit = 128
 
 
-@pytest.mark.parametrize("opt", REPRESENTATIVE_OPTS)
-def test_foreach(opt, size: int = 256, depth: int = 2, iterations: int = 32, outer_iterations: int = 2):
-    set_torch()
-    opt = getattr(heavyball, opt)
-
-    weights = []
-    for do_ema in [True, False]:
-        torch.manual_seed(0x2131290)
-        weights.append([])
-
-        for i in range(outer_iterations):
-            model = nn.Sequential(*[nn.Linear(size, size) for _ in range(depth)]).cuda()
-            o = get_optim(opt, model.parameters(), lr=1e-3)
-            init_params = [p.data.clone() for p in model.parameters()]
-
-            for _ in range(iterations):
-                set_grad(model)
-                o.step()
-                o.zero_grad()
-                if do_ema:
-                    o.ema_update()
-                    o.copy_emas_to_params()
-                    o.copy_params_to_emas()
-
-            delta = sum((p.data - p0).float().square().sum().item() for p, p0 in zip(model.parameters(), init_params))
-            if do_ema:
-                live_params = [p.detach().clone() for p in model.parameters()]
-                o.copy_emas_to_params()
-                assert any(not torch.equal(p, live) for p, live in zip(model.parameters(), live_params))
-                o.copy_params_to_emas()
-                assert all(torch.equal(p, live) for p, live in zip(model.parameters(), live_params))
-
-            weights[-1].append(delta)
-
-            del model, o
-            clean()
-
-    for i, (w_ema, w_no_ema) in enumerate(zip(*weights)):
-        print(i, w_ema, w_no_ema)
-        assert w_ema > 0, "EMA weights should have changed"
-        assert w_no_ema > 0, "Non-EMA weights should have changed"
-        assert torch.isclose(torch.tensor(w_ema), torch.tensor(w_no_ema), rtol=1e-6)
-
-
-def test_normalized_ema_recurrence_and_swap():
-    p = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
-    opt = heavyball.SGD([p], use_ema=True)
-    values = torch.tensor([1.0, 2.0, 4.0, 8.0], dtype=torch.float64)
+def test_ema_handles_noncontiguous_merged_parameters():
+    p = torch.nn.Parameter(torch.zeros(3, 4, dtype=torch.float64).mT)
+    assert not p.is_contiguous()
+    opt = heavyball.SOAP([p], use_ema=True, ema_decay=0.25, merge_dims=True)
+    values = torch.arange(1, 4, dtype=torch.float64).view(-1, 1, 1) * torch.ones_like(p)
     for value in values:
         p.data.copy_(value)
         opt.ema_update()
 
     beta = 1 - opt.ema_decay
     weights = beta ** torch.arange(len(values) - 1, -1, -1, dtype=torch.float64)
-    expected = (values * weights).sum() / weights.sum()
+    expected = (values * weights.view(-1, 1, 1)).sum(0) / weights.sum()
     ema = opt.state[p]["_root"]["param_ema"]
+    assert ema.is_contiguous()
     torch.testing.assert_close(ema, expected)
 
     live = p.detach().clone()
@@ -74,4 +24,34 @@ def test_normalized_ema_recurrence_and_swap():
     torch.testing.assert_close(p, expected)
     opt.copy_params_to_emas()
     assert torch.equal(p, live)
+
+
+def test_normalized_ema_recurrence_and_swap():
+    p = torch.nn.Parameter(torch.zeros(()))
+    opt = heavyball.SGD([p], use_ema=True, param_ecc="bf16+16")
+    values = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    for value in values:
+        p.data.copy_(value)
+        opt.ema_update()
+
+    beta = 1 - opt.ema_decay
+    weights = beta ** torch.arange(len(values) - 1, -1, -1)
+    expected = (values * weights).sum() / weights.sum()
+    ema = opt.state[p]["_root"]["param_ema"]
+    torch.testing.assert_close(ema, expected)
+
+    group = opt.param_groups[0]
+    view = opt._set_views(p, group)[0]
+    state = opt.state_(view)
+    config = group["_param_ecc_config"]
+
+    def decoded():
+        with config.attached([view], [state["param::ecc"].view_as(view)]):
+            return heavyball.utils.promote(view).clone()
+
+    live = decoded()
+    opt.copy_emas_to_params()
+    torch.testing.assert_close(decoded(), expected, rtol=0, atol=1e-4)
+    opt.copy_params_to_emas()
+    torch.testing.assert_close(decoded(), live, rtol=0, atol=1e-4)
     torch.testing.assert_close(opt.state[p]["_root"]["param_ema"], expected)

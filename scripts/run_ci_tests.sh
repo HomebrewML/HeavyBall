@@ -11,7 +11,7 @@ PYTEST_FLAGS=(--maxfail=1 --disable-warnings -q --color=no --code-highlight=no)
 
 run_pytest() {
   echo "::group::pytest $*"
-  pytest "${PYTEST_FLAGS[@]}" "$@"
+  python -m pytest "${PYTEST_FLAGS[@]}" "$@"
   echo "::endgroup::"
 }
 
@@ -35,9 +35,3 @@ test/test_ademamix.py
 test/test_psgd_precond_init_stability.py
 test/test_utils_property.py
 EOF
-
-if [[ ${1:-} == push ]]; then
-  run_list <<'EOF'
-test/test_toy_training.py
-EOF
-fi

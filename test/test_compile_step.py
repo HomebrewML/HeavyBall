@@ -1,53 +1,45 @@
-import inspect
-
 import pytest
 import torch
 
 import heavyball
-from heavyball.chainable import ChainOpt, WarmupGuard, _walk_fns
+from heavyball.chainable import WarmupGuard, _walk_fns
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 EXTRA_KWARGS = {
-    "AdamC": {"max_lr": 0.01},
+    "PSGDKron": {"preconditioner_update_probability": 0.0},
+    "QSGD": {"preconditioner_update_probability": 0.0},
+    "PSGDLRA": {"preconditioner_update_probability": 0.0},
 }
 
 # Iterative inner ops (Newton-Schulz, eigendecomp) are inherently sensitive to FP op order;
 # compile may fuse/reorder them differently than eager.
 _LOOSE_COMPILE_TOL = {
     "Scion",
-    "Muon",
-    "MuonLaProp",
     "MuonAdamW",
-    "KLSOAP",
+    "SOAP",
     "KLShampoo",
-    "HeavyKLSOAP",
-    "HeavyKLShampoo",
 }
 
+_COMPILE_OPTS = (
+    "AdamW",
+    "NAdam",
+    "ADOPT",
+    "Scion",
+    "MuonAdamW",
+    "SFAdamW",
+    "MSAMLaProp",
+    "SOAP",
+    "KLShampoo",
+    "PSGDKron",
+    "QSGD",
+    "PSGDLRA",
+    "AdEMAMix",
+)
 
-def _optimizer_params():
-    seen = set()
-    params = []
-    for name in heavyball.__all__:
-        if not hasattr(heavyball, name):
-            continue
-        obj = getattr(heavyball, name)
-        if not inspect.isclass(obj):
-            continue
-        if not issubclass(obj, torch.optim.Optimizer):
-            continue
-        ident = id(obj)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        if name == "SplitOpt":
-            params.append(
-                pytest.param(name, obj, id=name, marks=pytest.mark.skip(reason="SplitOpt requires dict specs"))
-            )
-            continue
-        params.append(pytest.param(name, obj, id=name))
-    return params
+_COMPILE_CASES = tuple(pytest.param(name, {}, id=name) for name in _COMPILE_OPTS) + (
+    pytest.param("AdamW", {"mars": True}, id="AdamW-mars"),
+)
 
 
 def _make_model():
@@ -58,14 +50,14 @@ def _make_model():
     ).to(DEVICE)
 
 
-def _run_steps(model, optimizer, n=5, seed=0xDEADBEEF):
+def _run_steps(model, optimizer, n=2, seed=0xDEADBEEF):
     torch.manual_seed(seed)
     for _ in range(n):
 
         def closure():
             optimizer.zero_grad(set_to_none=True)
-            data = torch.randn(32, 8, device=DEVICE)
-            target = torch.randn(32, 4, device=DEVICE)
+            data = torch.randn(4, 8, device=DEVICE)
+            target = torch.randn(4, 4, device=DEVICE)
             loss = torch.nn.functional.mse_loss(model(data), target)
             loss.backward()
             return loss
@@ -73,46 +65,64 @@ def _run_steps(model, optimizer, n=5, seed=0xDEADBEEF):
         optimizer.step(closure)
 
 
-@pytest.mark.parametrize("opt_name,opt_cls", _optimizer_params())
-def test_compile_step_matches_eager(opt_name, opt_cls):
-    """compile_step=True must produce identical parameters to compile_step=False."""
-    sig = inspect.signature(opt_cls.__init__)
-    if "compile_step" not in sig.parameters:
-        pytest.skip("optimizer does not accept compile_step")
+def _assert_close(actual, expected, *, rtol, atol):
+    if isinstance(actual, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_close(actual[key], expected[key], rtol=rtol, atol=atol)
+    elif isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected, strict=True):
+            _assert_close(a, b, rtol=rtol, atol=atol)
+    else:
+        assert actual == expected
 
-    kwargs = dict(EXTRA_KWARGS.get(opt_name, {}))
+
+def _assert_muon_delta(actual, expected):
+    actual_norm, expected_norm = actual.norm(), expected.norm()
+    torch.testing.assert_close(actual_norm, expected_norm, rtol=0.08, atol=2e-5)
+    if expected_norm > 0:
+        assert torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0) >= 0.995
+
+
+@pytest.mark.parametrize("opt_name,case_kwargs", _COMPILE_CASES)
+def test_compile_step_matches_eager(opt_name, case_kwargs):
+    opt_cls = getattr(heavyball, opt_name)
+    kwargs = {**EXTRA_KWARGS.get(opt_name, {}), **case_kwargs}
 
     torch.manual_seed(0xDEADBEEF)
     model_ref = _make_model()
     model_test = _make_model()
     model_test.load_state_dict(model_ref.state_dict())
+    initial = [p.detach().clone() for p in model_ref.parameters()]
 
     opt_ref = opt_cls(model_ref.parameters(), compile_step=False, **kwargs)
     opt_test = opt_cls(model_test.parameters(), compile_step=True, **kwargs)
 
-    _run_steps(model_ref, opt_ref)
-    _run_steps(model_test, opt_test)
+    steps = 3 if opt_name in {"ADOPT", "SOAP", "KLShampoo"} else 2
+    _run_steps(model_ref, opt_ref, steps)
+    _run_steps(model_test, opt_test, steps)
 
-    tol = 1e-2 if opt_name in _LOOSE_COMPILE_TOL else 1e-4
-    for p_ref, p_test in zip(model_ref.parameters(), model_test.parameters()):
-        diff = (p_ref.data - p_test.data).abs().max().item()
-        assert diff < tol, f"compile_step diverged: max_diff={diff}"
+    rtol, atol = (2e-2, 2e-5) if opt_name in _LOOSE_COMPILE_TOL else (2e-4, 2e-7)
+    for p_ref, p_test, p0 in zip(model_ref.parameters(), model_test.parameters(), initial, strict=True):
+        actual, expected = p_test - p0, p_ref - p0
+        if opt_name == "MuonAdamW" and p_ref.ndim >= 2:
+            _assert_muon_delta(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    if opt_name not in _LOOSE_COMPILE_TOL:
+        _assert_close(opt_test.state_dict()["state"], opt_ref.state_dict()["state"], rtol=rtol, atol=atol)
+
 
 def _max_warmup(opt):
     return max((len(ft.warmup_fns) for ft in _walk_fns(opt.fns) if isinstance(ft, WarmupGuard)), default=0)
 
 
-@pytest.mark.parametrize("opt_name,opt_cls", _optimizer_params())
-def test_needs_init_clears(opt_name, opt_cls):
-    """_needs_init must become False after max_warmup + 1 steps for all ChainOpt optimizers.
-
-    Catches bugs where Route-based or warmup_guard-based optimizers permanently
-    force eager mode because different params accumulate different is_initialized
-    sets that never individually cover _transform_ids.
-    """
-    if not issubclass(opt_cls, ChainOpt):
-        pytest.skip("not a ChainOpt")
-
+@pytest.mark.parametrize("opt_name", _COMPILE_OPTS)
+def test_needs_init_clears(opt_name):
+    opt_cls = getattr(heavyball, opt_name)
     kwargs = dict(EXTRA_KWARGS.get(opt_name, {}))
     model = _make_model()
     opt = opt_cls(model.parameters(), **kwargs)

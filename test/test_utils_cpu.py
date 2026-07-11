@@ -18,6 +18,7 @@ from heavyball.utils import (
     _compilable_global_rmsnorm_clip_,
     _compilable_l2_clip_,
     _compilable_rmsnorm_clip_,
+    beta_debias,
     caution,
     disable_caution_scaling,
     fused_hook,
@@ -28,6 +29,7 @@ from heavyball.utils import (
     orthogonalize_grad_to_param,
     precond_update_prob_schedule,
     sam_step,
+    scalar_guard,
     stochastic_add_,
     stochastic_add_divide_,
     stochastic_divide_with_eps_,
@@ -298,6 +300,17 @@ def test_precond_update_prob_schedule_basic_decay():
     assert values[:2] == [1.0, 1.0]
     assert values[2] == pytest.approx(0.5)
     assert values[3:] == [0.25, 0.25]
+
+
+def test_optimizer_scalars_stay_fp32():
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        scalar, tensor = scalar_guard(0.1, torch.tensor(0.1, dtype=dtype), torch.ones((), dtype=dtype))
+        assert scalar.dtype == tensor.dtype == torch.float32
+
+
+def test_beta_debias_zero_is_exact():
+    for step in (1, 2, 100):
+        assert beta_debias(torch.tensor(0.0), torch.tensor(step)).item() == 0.0
 
 
 def test_merge_group_merges_only_when_enabled():

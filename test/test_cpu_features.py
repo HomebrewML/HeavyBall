@@ -61,31 +61,25 @@ def test_selected_optimizers_run_on_cpu(opt_name: str) -> None:
     assert _parameter_drift(model, init) > 0.0
 
 
-def test_caution_reduces_update_magnitude() -> None:
-    baseline_model, data, target = _make_batch()
-    cautious_model = deepcopy(baseline_model)
+def test_unknown_optimizer_option_is_rejected() -> None:
+    with pytest.raises(TypeError):
+        heavyball.AdamW([nn.Parameter(torch.zeros(()))], unknown_option=True)
 
-    baseline_init = [param.detach().clone() for param in baseline_model.parameters()]
-    cautious_init = [param.detach().clone() for param in cautious_model.parameters()]
 
-    baseline_opt = heavyball.SGD(
-        baseline_model.parameters(),
-        lr=1e-3,
-        caution=False,
-    )
-    cautious_opt = heavyball.SGD(
-        cautious_model.parameters(),
-        lr=1e-3,
-        caution=True,
-    )
+def test_caution_masks_an_adam_update_opposing_the_gradient() -> None:
+    baseline = nn.Parameter(torch.tensor(1.0))
+    cautious = nn.Parameter(torch.tensor(1.0))
+    baseline_opt = heavyball.AdamW([baseline], lr=0.1, caution=False, warmup_steps=0)
+    cautious_opt = heavyball.AdamW([cautious], lr=0.1, caution=True, warmup_steps=0)
 
-    _train_once(baseline_opt, baseline_model, data, target)
-    _train_once(cautious_opt, cautious_model, data, target)
+    for grad in (1.0, -0.1):
+        baseline.grad = torch.tensor(grad)
+        cautious.grad = torch.tensor(grad)
+        baseline_opt.step()
+        cautious_opt.step()
 
-    baseline_drift = _parameter_drift(baseline_model, baseline_init)
-    cautious_drift = _parameter_drift(cautious_model, cautious_init)
-
-    assert cautious_drift <= baseline_drift * 1.05  # caution should not overshoot compared to baseline
+    assert baseline.item() == pytest.approx(0.840603, abs=1e-6)
+    assert cautious.item() == pytest.approx(0.9, abs=1e-6)
 
 
 def test_mars_flag_changes_behavior() -> None:

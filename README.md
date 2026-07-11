@@ -52,6 +52,9 @@ opt = SplitOpt([
 ])
 ```
 
+`SplitOpt` specs take HeavyBall optimizer classes, not instances; constructor options belong in each spec. It does not
+support Hessian-approximation optimizers or adding parameter groups after construction.
+
 The API matches `torch.optim`, with the same parameter groups, same `step()`/`zero_grad()` interface. See [
 `examples/`](examples/) for training scripts.
 By default, HeavyBall consumes gradients during `step()` and clears `p.grad` once it has used it. Pass
@@ -90,7 +93,8 @@ PSGDLRA
 **SAM:**
 SAMWrapper, MSAMLaProp
 
-SAMWrapper requires a closure passed to `step()`.
+SAMWrapper requires a closure passed to `step()`. Class form accepts per-group hyperparameters in the group dictionaries;
+use a preconfigured instance for optimizer-wide flags.
 
 MSAMLaProp overrides `.eval()` and `.train()` to swap between training and evaluation parameter states.
 Call `opt.eval()` before validation and `opt.train()` before resuming training.
@@ -103,7 +107,9 @@ SplitOpt
 ## Composable Features
 
 These flags compose freely. For example, `LaProp(..., ecc="bf16+8", mars=True, caution=True, palm=True)` is valid.
-They are available on all optimizers except SAMWrapper and SplitOpt, which delegate to inner optimizers.
+They are available on all optimizers except SAMWrapper and SplitOpt, which delegate to inner optimizers. AdamC,
+HyperBallAdamW, and MSAMLaProp do not support `update_clipping` because their terminal kernels form and apply the update
+atomically.
 
 | Flag                    | Effect                                                                                                                                                                           |
 |-------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -112,8 +118,8 @@ They are available on all optimizers except SAMWrapper and SplitOpt, which deleg
 | `ecc="bf16+8"`          | [Compresses optimizer state](https://arxiv.org/pdf/2602.23349) to bf16 + int8 correction (3 bytes vs fp32's 4). See [ECC](#ecc).                                                 |
 | `param_ecc="bf16+8"`    | Applies the same compression to parameters.                                                                                                                                      |
 | `palm=True`             | Enables [PaLM-style beta2 scheduling](https://arxiv.org/abs/2204.02311). Only available on optimizers with beta2                                                                 |
-| `gradient_clipping=...` | Clips incoming gradients. Accepts `"l2_clip_"`, `"rmsnorm_clip_"`, `"trust_region_clip_"`, `"a_law_compress"`, `"mu_law_compress"`, `"softsign_compress"`, or a custom callable. |
-| `update_clipping=...`   | Clips outgoing updates after all transforms. Same options as `gradient_clipping`.                                                                                                |
+| `gradient_clipping=...` | Clips incoming gradients. Accepts `"l2_clip_"`, `"rmsnorm_clip_"`, `"global_l2norm_clip"`, `"global_rmsnorm_clip"`, `"trust_region_clip_"`, `"a_law_compress"`, `"mu_law_compress"`, `"softsign_compress"`, or a custom callable. Global clipping requires `multi_tensor=True`. |
+| `update_clipping=...`   | Clips the completed optimizer update before parameter application. Same options as `gradient_clipping`.                                                                          |
 | `promote=True`          | Promotes gradients to fp32 before the update.                                                                                                                                    |
 | `warmup_steps=N`        | Linear learning rate warmup over N steps.                                                                                                                                        |
 
@@ -219,16 +225,15 @@ HeavyBall includes a benchmark suite via [LightBench](https://github.com/Homebre
 for silent optimizer failures across difficulty levels. Results and methodology are documented
 in [docs/benchmark.md](docs/benchmark.md).
 
-The fusion hillclimb runner compares stock Inductor with HeavyBall's post-grad compiler pass, including FP64 references,
-generated-code diagnostics, and steady-state timings. See [docs/fusions.md](docs/fusions.md).
+The fusion hillclimb runner compares HeavyBall's post-grad passes with stock Inductor using FP64 references,
+generated Triton source diagnostics, and steady-state timings. See [docs/fusions.md](docs/fusions.md).
 
-[`benchmarks/bench_release_optimizers.py`](benchmarks/bench_optimizer_step.py) measures optimizer latency, with
+[`benchmarks/bench_optimizer_step.py`](benchmarks/bench_optimizer_step.py) measures optimizer latency, with
 AdamW step times dropping from 10.63 ms in HeavyBall 2 to 4.15 ms in HeavyBall 3.
 
 ## Migrating
 
-**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes, removed kwargs, and checkpoint
-conversion.
+**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes and removed kwargs.
 
 **From 1.x** See the [2.0.0 migration notes](docs/heavyball2.md), then follow the 3.0.0 guide.
 

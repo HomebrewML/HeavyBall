@@ -1,49 +1,42 @@
-from typing import List
-
 import pytest
 import torch
-from torch import nn
-from utils import get_optim
 
 import heavyball
 from heavyball.utils import clean, set_torch
 
-
-class Param(nn.Module):
-    def __init__(self, size):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(size))
-
-    def forward(self, inp):
-        return self.weight.mean() * inp
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-@pytest.mark.parametrize("opt", ["PSGDKron"])
-@pytest.mark.parametrize("size", [(16, 16, 16, 16), (4, 4, 4, 4), (512, 1, 128), (32128, 768)])
-@pytest.mark.parametrize("merge,split", [(False, False), (True, False), (True, True)])
-def test_merge(opt, size: List[int], merge, split, depth: int = 2, iterations: int = 5):
+@pytest.mark.parametrize(
+    "size,merge,split,expected",
+    [
+        ((4, 4, 4, 4), False, False, [(4, 4, 4, 4)]),
+        ((4, 4, 4, 4), True, False, [(4, 4, 16)]),
+        ((33, 17), True, True, [(16, 16), (16, 16), (1, 16), (16,), (16,), (1,)]),
+    ],
+)
+def test_psgd_merge_layout_and_step(size, merge, split, expected):
     clean()
     set_torch()
-    opt = getattr(heavyball, opt)
-    model = nn.Sequential(*[Param(size) for _ in range(depth)]).cuda()
-    initial = [p.detach().clone() for p in model.parameters()]
-    o = get_optim(
-        opt,
-        model.parameters(),
+    param = torch.nn.Parameter(torch.randn(size, device=DEVICE))
+    initial = param.detach().clone()
+    opt = heavyball.PSGDKron(
+        [param],
         lr=1e-3,
         merge_dims=merge,
         split=split,
-        max_precond_dim=256,
-        max_size_triangular=256,
+        max_size_triangular=16,
+        preconditioner_update_probability=1.0,
+        precond_init_scale=1.0,
+        delayed=False,
+        update_clipping=None,
     )
+    assert [tuple(view.shape) for view in opt._set_views(param, opt.param_groups[0])] == expected
 
-    for _ in range(iterations):
-        for p in model.parameters():
-            p.grad = torch.randn_like(p, requires_grad=False)
-        o.step()
-        o.zero_grad()
+    for _ in range(2):
+        param.grad = torch.randn_like(param)
+        opt.step()
+        opt.zero_grad()
 
-    moved = [(p.detach() - q).abs().max().item() for p, q in zip(model.parameters(), initial)]
-    assert max(moved) > 0, f"no parameter changed (merge={merge}, split={split})"
-    for p in model.parameters():
-        assert torch.isfinite(p).all(), f"non-finite parameter (merge={merge}, split={split})"
+    assert not torch.equal(param, initial)
+    assert param.isfinite().all()
