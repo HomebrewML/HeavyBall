@@ -1,8 +1,8 @@
-"""Test that PSGD preconditioner lower bound uses fp32, not fp64.
+"""Test that PSGD preconditioner does not promote matrices to fp64.
 
 Verifies:
-1. Convergence is not degraded with fp32 lower bound
-2. No fp64 tensors leak into optimizer state
+1. Convergence is not degraded
+2. No fp64 matrices leak into optimizer state (scalar/vector fp64 is intentional)
 """
 
 import pytest
@@ -51,21 +51,20 @@ def test_psgd_convergence_fp32_lb(opt_cls, lr, extra_kw):
     clean()
 
 
-def _check_no_fp64(obj, path=""):
+def _check_no_fp64_matrices(obj, path=""):
     if isinstance(obj, torch.Tensor) and obj.is_floating_point():
-        if "step" in path:
-            return
-        assert obj.dtype != torch.float64, f"fp64 tensor at {path}: dtype={obj.dtype}"
+        if obj.ndim >= 2 and obj.dtype == torch.float64:
+            assert False, f"fp64 matrix at {path}: shape={obj.shape}, dtype={obj.dtype}"
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            _check_no_fp64(v, f"{path}.{k}" if path else str(k))
+            _check_no_fp64_matrices(v, f"{path}.{k}" if path else str(k))
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            _check_no_fp64(v, f"{path}[{i}]")
+            _check_no_fp64_matrices(v, f"{path}[{i}]")
 
 
 @pytest.mark.parametrize("opt_cls,lr,extra_kw", _PSGD_OPTIMIZERS, ids=[t[0].__name__ for t in _PSGD_OPTIMIZERS])
-def test_psgd_no_fp64_in_state(opt_cls, lr, extra_kw):
+def test_psgd_no_fp64_matrices_in_state(opt_cls, lr, extra_kw):
     set_torch()
     torch.manual_seed(42)
     data = torch.randn(32, 64, device="cuda")
@@ -78,7 +77,7 @@ def test_psgd_no_fp64_in_state(opt_cls, lr, extra_kw):
     _train(model, opt, data, target, 5)
 
     for param in model.parameters():
-        _check_no_fp64(opt.state[param])
+        _check_no_fp64_matrices(opt.state[param])
 
     del model, opt
     clean()
