@@ -176,7 +176,7 @@ def test_fold_affine_keeps_beta_debias_complement_boundary():
     s = torch.tensor(10)
 
     def f(b, s):
-        denom = 1 - b ** s
+        denom = 1 - b**s
         ratio = (1 - b) / denom
         a = 1 - ratio
         return (1 - a) * 2
@@ -315,6 +315,7 @@ def test_fold_affine_preserves_untracked_aliases():
         torch.ops.aten.lift.default,
     )
     for alias in aliases:
+
         def fn(x):
             value = 1 - (1 - x)
             value = alias(value)
@@ -356,8 +357,7 @@ def test_fma_handles_keyword_only_aten_arguments():
 
 
 def test_fma_value_runs():
-    _exec(lambda a, b, c: a * b + c, fusions.fuse_mul_add_to_fma,
-          (torch.randn(8), torch.randn(8), torch.randn(8)))
+    _exec(lambda a, b, c: a * b + c, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8), torch.randn(8)))
     _exec(lambda a, b: 1 - a * b, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8)))
 
 
@@ -383,10 +383,8 @@ def test_fma_keeps_integral_subtraction_unfused():
 
 
 def test_fma_sub_and_scalar_addend_run():
-    _exec(lambda a, b, c: a * b - c, fusions.fuse_mul_add_to_fma,
-          (torch.randn(8), torch.randn(8), torch.randn(8)))
-    _exec(lambda a, b, c: c - a * b, fusions.fuse_mul_add_to_fma,
-          (torch.randn(8), torch.randn(8), torch.randn(8)))
+    _exec(lambda a, b, c: a * b - c, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8), torch.randn(8)))
+    _exec(lambda a, b, c: c - a * b, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8), torch.randn(8)))
     _exec(lambda a, b: a * b + 0.5, fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8)))
 
 
@@ -407,8 +405,7 @@ def test_fma_skips_subtracting_scalar_factor():
 
 
 def test_fma_scaled_add_rewrites_and_runs():
-    _exec(lambda x, y: torch.add(x, y, alpha=0.5), fusions.fuse_mul_add_to_fma,
-          (torch.randn(8), torch.randn(8)))
+    _exec(lambda x, y: torch.add(x, y, alpha=0.5), fusions.fuse_mul_add_to_fma, (torch.randn(8), torch.randn(8)))
     gm = make_fx(lambda x, y: torch.add(x, y, alpha=0.5))(torch.randn(8), torch.randn(8))
     assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
     assert torch.ops.prims.fma.default in _targets(gm)
@@ -512,8 +509,7 @@ def test_fma_integral_factor_subtraction_stays_opaque():
 
 
 def test_fma_scaled_product_fuses():
-    gm = make_fx(lambda a, b, c: torch.add(a * b, c, alpha=0.5))(
-        torch.randn(8), torch.randn(8), torch.randn(8))
+    gm = make_fx(lambda a, b, c: torch.add(a * b, c, alpha=0.5))(torch.randn(8), torch.randn(8), torch.randn(8))
     assert fusions.fuse_mul_add_to_fma(gm.graph) == 1
     assert torch.ops.prims.fma.default in _targets(gm)
 

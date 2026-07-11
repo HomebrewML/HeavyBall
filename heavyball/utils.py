@@ -1145,8 +1145,10 @@ def _compilable_stochastic_lerp_(x: list[Tensor], y: list[Tensor], a: float | in
 
 
 def get_beta1(group):
-    if "beta" in group and group["beta"] is not None: return group["beta"]
-    if "betas" in group: return group["betas"][0]
+    if "beta" in group and group["beta"] is not None:
+        return group["beta"]
+    if "betas" in group:
+        return group["betas"][0]
     raise ValueError("Beta not found in group.")
 
 

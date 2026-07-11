@@ -532,7 +532,9 @@ def main() -> None:
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     if args.strict and any(not result.pointwise_ok for result in results):
         raise SystemExit("A strict precision case regressed")
-    if args.require_win and (not any(result.accepted for result in results) or any(not result.precision_ok for result in results)):
+    if args.require_win and (
+        not any(result.accepted for result in results) or any(not result.precision_ok for result in results)
+    ):
         raise SystemExit("No accepted hillclimb win")
 
 

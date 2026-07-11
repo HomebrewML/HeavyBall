@@ -66,6 +66,7 @@ def _scaled_add_args(node: torch.fx.Node) -> tuple[Any, Any, int | float] | None
 
 def _fma() -> Any:
     from torch._inductor import inductor_prims
+
     return getattr(inductor_prims, "fma", None)
 
 
@@ -99,10 +100,13 @@ def _scale_affine(affine: Affine, scale: int | float) -> Affine:
 def _fresh(node: torch.fx.Node) -> bool:
     schema = _schema(node)
     tags = getattr(node.target, "tags", ())
-    return schema is not None and schema.returns and not node.is_impure() and _SEEDED_TAG not in tags and all(
-        ret.alias_info is None for ret in schema.returns
-    ) and (
-        node.target in _FRESH or _POINTWISE_TAG in tags or node.target == _fma()
+    return (
+        schema is not None
+        and schema.returns
+        and not node.is_impure()
+        and _SEEDED_TAG not in tags
+        and all(ret.alias_info is None for ret in schema.returns)
+        and (node.target in _FRESH or _POINTWISE_TAG in tags or node.target == _fma())
     )
 
 
@@ -119,8 +123,9 @@ def _epochs(graph: torch.fx.Graph) -> dict[torch.fx.Node, int]:
     return result
 
 
-def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
-               epochs: dict[torch.fx.Node, int], epoch: int) -> Affine | None:
+def _affine_of(
+    node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None], epochs: dict[torch.fx.Node, int], epoch: int
+) -> Affine | None:
     if not isinstance(node, torch.fx.Node):
         value = _scalar(node)
         return Affine(None, 0.0, value) if value is not None else None
@@ -170,8 +175,9 @@ def _affine_of(node: Any, cache: dict[tuple[torch.fx.Node, int], Affine | None],
     return aff
 
 
-def _emit_affine(graph: torch.fx.Graph, affine: Affine, meta: dict,
-                 epochs: dict[torch.fx.Node, int], epoch: int) -> Any:
+def _emit_affine(
+    graph: torch.fx.Graph, affine: Affine, meta: dict, epochs: dict[torch.fx.Node, int], epoch: int
+) -> Any:
     def emit(target: Any, args: tuple) -> torch.fx.Node:
         node = _call(graph, target, args, meta)
         epochs[node] = epoch
@@ -263,9 +269,7 @@ def _is_mul_operand(x: Any) -> bool:
     return _number(x) is not None
 
 
-def _single_user_mul(
-    node: Any, epochs: dict[torch.fx.Node, int], epoch: int
-) -> tuple[Any, Any] | None:
+def _single_user_mul(node: Any, epochs: dict[torch.fx.Node, int], epoch: int) -> tuple[Any, Any] | None:
     if not (
         isinstance(node, torch.fx.Node)
         and node.op == "call_function"

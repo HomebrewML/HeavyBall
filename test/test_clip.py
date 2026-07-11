@@ -74,9 +74,7 @@ def test_clip(kind, clip_fn):
                 functools.partial(global_fn, clip_at=2.0) if global_fn else lambda values: clip_fn(values, 2.0)
             ),
             update_clipping=(
-                functools.partial(global_fn, clip_at=0.05)
-                if global_fn
-                else lambda values: clip_fn(values, 0.05)
+                functools.partial(global_fn, clip_at=0.05) if global_fn else lambda values: clip_fn(values, 0.05)
             ),
         )
 
