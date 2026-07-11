@@ -3095,10 +3095,11 @@ def calcG_expr(q_dim, g_dim):
 
 
 def _update_lb(ell: Tensor, lb_state: Tensor, beta: Tensor) -> Tensor:
+    orig_dtype = ell.dtype
     ell = promote(ell)
     ell = ell.maximum(promote(lb_state) + (ell - promote(lb_state)) * (1 - beta))
     copy_stochastic_(lb_state, ell)
-    return ell
+    return ell.to(orig_dtype)
 
 
 @decorator_no_fullgraph
