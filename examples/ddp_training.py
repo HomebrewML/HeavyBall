@@ -9,6 +9,7 @@ All HeavyBall optimizers work transparently with DDP
 """
 
 import argparse
+import os
 
 import torch
 import torch.distributed as dist
@@ -16,7 +17,6 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets, transforms
 
 import heavyball
 
@@ -36,7 +36,13 @@ def make_model():
     )
 
 
+def build_optimizer(params, name="AdamW", lr=1e-3):
+    return getattr(heavyball, name)(params, lr=lr)
+
+
 def main():
+    from torchvision import datasets, transforms
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--opt", default="AdamW")
     parser.add_argument("--epochs", type=int, default=5)
@@ -44,12 +50,20 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
-    dist.init_process_group("nccl")
+    use_cuda = torch.cuda.is_available()
+    dist.init_process_group("nccl" if use_cuda else "gloo")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    if use_cuda:
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
 
-    model = DDP(make_model().cuda())
-    opt = getattr(heavyball, args.opt)(model.parameters(), lr=args.lr)
+    model = make_model().to(device)
+    # HeavyBall 4.0 slab-backs parameters and records their shapes when the facade is constructed.
+    opt = build_optimizer(model.parameters(), args.opt, args.lr)
+    model = DDP(model, device_ids=[device.index] if use_cuda else None)
     criterion = nn.CrossEntropyLoss()
 
     tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
@@ -65,7 +79,7 @@ def main():
         running_loss = correct = total = 0
 
         for images, labels in loader:
-            images, labels = images.cuda(), labels.cuda()
+            images, labels = images.to(device), labels.to(device)
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()

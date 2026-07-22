@@ -2,236 +2,196 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/heavyball?color=blue)][pypi] [![Downloads](https://img.shields.io/pypi/dm/heavyball)][pypi] [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)][license]
 
-HeavyBall is an optimizer library for PyTorch where every optimizer is assembled from composable, compiled building
-blocks. It includes API-compatible replacements for `torch.optim.AdamW`, `SGD`, and `RMSprop`, alongside Muon, SOAP (
-Shampoo), PSGD (Kronecker), LATHER, ADOPT, Schedule-Free, LaProp, and others.
+HeavyBall is a compile-first optimizer library for PyTorch. Every optimizer's entire step
+compiles into a single `torch.compile(fullgraph=True)` graph, and each optimizer is assembled from
+small, composable transforms. It ships drop-in `torch.optim` replacements (AdamW, SGD, RMSprop)
+alongside Muon, SOAP, Shampoo, PSGD (Kronecker, PRO, QSGD), LATHER, Scion, Schedule-Free, MSAM, and
+more.
 
-The building blocks, over 100 functions in [`utils.py`](heavyball/utils.py), are each compiled with
-`torch.compile(fullgraph=True)` and fuse into Triton kernels. Features like MARS gradient correction,
-cautious updates, and [ECC state compression](#ecc) are implemented as chainable transforms that work as flags on any
-optimizer. DDP and FSDP are [supported](#distributed-training), with automatic repartitioning for second-order methods.
-
-## Quick Start
+## Install
 
 ```bash
 pip install heavyball
 ```
 
-Requires PyTorch >= 2.2.
+Requires PyTorch >= 2.13.
+
+## Quick start
+
+Every optimizer is a `torch.optim.Optimizer` subclass and drives the usual
+`loss.backward()` / `opt.step()` / `opt.zero_grad()` loop.
 
 ```python
-from heavyball import AdamW
+from heavyball import AdamW, SOAP, Muon
 
-opt = AdamW(model.parameters(), lr=1e-3)
+opt = AdamW(model.parameters(), lr=1e-3)   # drop-in torch.optim.AdamW replacement
+opt = SOAP(model.parameters(), lr=3e-3)    # Shampoo-style eigenbasis preconditioning
+opt = Muon(model.parameters(), lr=0.02)    # Newton-Schulz orthogonalized updates
 ```
 
-```python
-from heavyball import SOAP  # Shampoo-based preconditioning
+The preconditioning optimizers route by shape: a weight that merges to a matrix (including a
+convolution kernel whose trailing dims collapse to 2-D) is preconditioned, a 1-D bias or norm weight
+falls back to AdamW, and an oversized axis is handled with a reduced factor (diagonal in PSGD/LATHER,
+dropped in SOAP/Shampoo) rather than a full one. So you pass `model.parameters()` directly, biases and
+all.
 
-opt = SOAP(model.parameters(), lr=3e-3)
+For the compiled path's full speed, call `heavyball.set_torch()` once at startup:
+
+```python
+import heavyball
+
+heavyball.set_torch()   # TF32 matmuls + opt_einsum optimal contraction paths
 ```
 
+It sets `torch.set_float32_matmul_precision("high")` (TF32 on tensor-core GPUs, ~2x faster fp32
+matmuls) and opt_einsum's path strategy. For the optimizers' preconditioner contractions the TF32
+step is marginal for training (below seed-to-seed noise); pass `set_torch(matmul_precision="highest")`
+for numerically sensitive work. It mutates process-wide torch state (your model's matmuls too), so it
+is opt-in, not applied on import.
+
+## Parameter groups
+
+Pass `torch.optim`-style parameter groups for per-group hyperparameters, for example a lower learning
+rate on the embedding and no weight decay on the norms. A learning-rate scheduler that mutates
+`opt.param_groups[i]["lr"]` works as usual.
+
 ```python
-from heavyball import LATHER  # Lie-group Adam Through Harmonic Eigenbasis Rotations
-
-opt = LATHER(model.parameters(), lr=1e-3)
-```
-
-```python
-from heavyball import Muon
-
-opt = Muon(model.parameters(), lr=0.02, ecc="bf16+8", mars=True, caution=True)
-```
-
-```python
-from heavyball import SplitOpt, Muon, AdamW
-
-opt = SplitOpt([
-    {'params': matrices, 'optimizer': Muon, 'lr': 0.02},
-    {'params': vectors, 'optimizer': AdamW, 'lr': 1e-3},
+opt = AdamW([
+    {"params": body.parameters(), "lr": 1e-3, "weight_decay": 0.1},
+    {"params": norms.parameters(), "lr": 1e-3, "weight_decay": 0.0},
 ])
 ```
 
-The API matches `torch.optim`, with the same parameter groups, same `step()`/`zero_grad()` interface. See [
-`examples/`](examples/) for training scripts.
-By default, HeavyBall consumes gradients during `step()` and clears `p.grad` once it has used it. Pass
-`consume_grad=False` if your training loop needs gradients to remain attached after the optimizer step.
-
 ## Optimizers
 
-The library covers first-order methods (AdamW, NAdam, RMSprop, ADOPT, LaProp, SGD), orthogonal methods (Muon),
-Shampoo-based preconditioning (SOAP and variants), PSGD with Kronecker and low-rank factorization, Schedule-Free
-training, and SAM.
+Every optimizer below is an importable class (`from heavyball import <Name>`).
 
-<details>
-<summary>Full list</summary>
+- **First-order:** `AdamW`, `AdamC`, `NAdam`, `RMSprop`, `Lion`, `SGD`, `SignSGD`, `LaProp`,
+  `SignLaProp`, `ADOPT`, `AdEMAMix`, `MARSAdamW`, `CautiousAdamW`, `OrthoGradAdamW`, `UnscaledAdamW`,
+  `SUDSAdamW`
+- **Orthogonal / norm-constrained:** `Muon`, `MuonLaProp`, `AdaMuon`, `NorMuon`, `HyperBallAdamW`,
+  `OrthoLaProp`, `LaPropOrtho`, `Scion`, `PolarGrad`, `Aurora`, `Oblique`, `SpEL`
+- **Shampoo / SOAP:** `SOAP`, `Shampoo`, `KLSOAP`, `KLShampoo`, `SOAPNAdam`, `SOAPAdEMAMix`, `SOLP`
+- **PSGD:** `PSGDKron`, `PSGDPro`, `QSGD`, `LATHER`
+- **Whitening:** `Whitening`, `WhitenAdamW`
+- **Schedule-Free / SAM:** `ScheduleFree`, `MSAM`
 
-**First-order:**
-AdamW, NAdam, RMSprop, ADOPT, AdEMAMix, LaProp, SignLaProp, SGD, Scion, UnscaledAdamW, AdamC, SUDSAdamW
+`ScheduleFree` and `MSAM` keep separate training and evaluation parameter states. Call `opt.eval()`
+before validation and `opt.train()` before resuming; the swap is reversible and training continues
+seamlessly.
 
-**Schedule-Free:**
-SFAdamW
+## Composition
 
-Schedule-Free optimizers override `.eval()` and `.train()` to swap between training and evaluation parameter states.
-Call `opt.eval()` before validation and `opt.train()` before resuming training.
-
-**Orthogonal:**
-Muon, MuonAdamW, MuonLaProp, HyperBallAdamW, OrthoLaProp, LaPropOrtho
-
-**Shampoo-based (SOAP):**
-SOAP, SOAPNAdam, SOAPAdEMAMix, SOLP
-
-**PSGD (Kronecker):**
-PSGDKron, LATHER, PSGDPRO, QSGD
-
-**PSGD (Low-Rank):**
-PSGDLRA
-
-**SAM:**
-SAMWrapper, MSAMLaProp
-
-SAMWrapper requires a closure passed to `step()`.
-
-MSAMLaProp overrides `.eval()` and `.train()` to swap between training and evaluation parameter states.
-Call `opt.eval()` before validation and `opt.train()` before resuming training.
-
-**Meta:**
-SplitOpt
-
-</details>
-
-## Composable Features
-
-These flags compose freely. For example, `LaProp(..., ecc="bf16+8", mars=True, caution=True, palm=True)` is valid.
-They are available on all optimizers except SAMWrapper and SplitOpt, which delegate to inner optimizers.
-
-| Flag                    | Effect                                                                                                                                                                           |
-|-------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `mars=True`             | Applies [MARS variance reduction](https://arxiv.org/pdf/2411.10438) via previous gradients.                                                                                      |
-| `caution=True`          | [Masks update elements](https://arxiv.org/abs/2411.16085) that disagree with the gradient direction.                                                                             |
-| `ecc="bf16+8"`          | [Compresses optimizer state](https://arxiv.org/pdf/2602.23349) to bf16 + int8 correction (3 bytes vs fp32's 4). See [ECC](#ecc).                                                 |
-| `param_ecc="bf16+8"`    | Applies the same compression to parameters.                                                                                                                                      |
-| `palm=True`             | Enables [PaLM-style beta2 scheduling](https://arxiv.org/abs/2204.02311). Only available on optimizers with beta2                                                                 |
-| `gradient_clipping=...` | Clips incoming gradients. Accepts `"l2_clip_"`, `"rmsnorm_clip_"`, `"trust_region_clip_"`, `"a_law_compress"`, `"mu_law_compress"`, `"softsign_compress"`, or a custom callable. |
-| `update_clipping=...`   | Clips outgoing updates after all transforms. Same options as `gradient_clipping`.                                                                                                |
-| `promote=True`          | Promotes gradients to fp32 before the update.                                                                                                                                    |
-| `warmup_steps=N`        | Linear learning rate warmup over N steps.                                                                                                                                        |
-
-### ECC
-
-ECC stores each optimizer state tensor as a bf16 value plus an int8 correction term (3 bytes total vs fp32's 4 bytes),
-based on the approach from [FlashOptim](https://arxiv.org/abs/2602.23349). HeavyBall integrates ECC as a composable
-flag: correction tensors are attached as attributes at call time, so any built-in optimizer handles ECC without
-per-optimizer changes.
+Each optimizer is a `Recipe`: a `chain` of pure transforms plus a terminal `commit` that writes the
+update. A transform maps `(update, observations, param, state, tempo)` to a new update and its next
+state; the engine is the only writer. `Route` dispatches by a shape predicate, which is how the
+shape-aware optimizers fall back to AdamW on parameters they cannot precondition.
 
 ```python
-opt = AdamW(model.parameters(), lr=1e-3, ecc="bf16+8")
-opt = Muon(model.parameters(), lr=0.02, ecc="bf16+8", param_ecc="bf16+8")  # state + params
+from heavyball import build, adamw, soap, Route
+from heavyball.matrix import matrix_route
+
+# Preconditioning 2-D leaves with soap and everything else with adamw is exactly what the
+# heavyball.SOAP facade builds:
+recipe = Route(matrix_route, soap, adamw)
+opt = build(model.parameters(), recipe, lr=3e-3)
 ```
 
-For first-order optimizers (where all state is momentum and variance), `bf16+8` gives roughly 25% state memory savings
-compared to fp32.
-For second-order methods, preconditioner matrices are not compressed, so total savings are lower. The encode and decode
-operations are fully elementwise and fuse into the compiled kernel.
+Hyperparameters are a strict contract: `tempo.hyper` carries only the declared hyperparameters, so a
+transform that reads one the recipe never declared raises rather than silently substituting a default.
 
-Available modes: `bf16+8`, `bf16+16`, `fp16+8`, `fp16+16`.
+See [`examples/`](examples/) for full training scripts, including DDP, which works transparently.
 
-## Distributed Training
+For FSDP2 (`torch.distributed.fsdp.fully_shard`), wrap the model with `fully_shard(model)`, then build
+the optimizer with the `.fsdp2` classmethod -- `heavyball.AdamW.fsdp2(model, lr=1e-3)` rather than
+`heavyball.AdamW(model.parameters())` -- which binds each slab into FSDP2's sharded storage instead of a
+plain one. Passing a `fully_shard`'d model's parameters to the plain constructor raises with a message
+pointing to `.fsdp2()` (HeavyBall binds each parameter into a contiguous slab at construction, which
+FSDP2's sharded DTensor storage does not permit). Shard-separable and owner-whole optimizers are covered;
+the whole-model scoped ones (`clip_global_norm`, SAM) are rejected under FSDP2. DDP works transparently.
 
-HeavyBall works with both DDP and FSDP. First-order optimizers are elementwise and operate directly on FSDP shards with
-no repartitioning. Second-order methods (Muon, SOAP, PSGD) need the full parameter to compute their update, so HeavyBall
-auto-detects FSDP-sharded parameters on the first step and repartitions them with a metadata-first `all_to_all_single`
-exchange: each weight matrix is deterministically assigned to one rank, shard metadata is exchanged up front, the owner
-reconstructs the full parameter, computes the update once, and returns the updated shards. This saves both compute and
-memory compared to DDP-style redundant updates, at the cost of communication.
+## Checkpointing
 
-```python
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from heavyball import Muon
+`state_dict()` / `load_state_dict()` round-trip the full optimizer state, including the
+preconditioner refresh cadence and the per-optimizer random seed. Restore it alongside
+`model.load_state_dict()` (the optimizer state does not carry the parameters), and resume matches an
+uninterrupted run bit-for-bit -- including the optimizers that draw randomness in the step (Muon's
+stochastic rounding, the PSGD family, Scion, LATHER, and any `storage_dtype`/`ecc` low-precision state
+write). Their per-step randomness is a stateless counter-based stream keyed by the stored seed, leaf
+index, and step count, so it resumes bit-identically from `state_dict()` alone, without restoring the
+process-wide `torch.get_rng_state()`.
 
-model = FSDP(model, use_orig_params=True)  # use_orig_params required for shape detection
-opt = Muon(model.parameters(), lr=0.02)
+## Performance
+
+Compiling the whole step is the point. Measured on an RTX 5060 Ti (PyTorch 2.12) for AdamW, the
+compiled step is about **6x faster than the same optimizer run eagerly**, **2-3x faster than
+`torch.optim.AdamW(foreach=True)`**, and within a few percent of `torch.optim.AdamW(fused=True)` at
+scale (a compiled Python optimizer matching a hand-written fused CUDA kernel). For most optimizers the
+compiled step matches the eager result to floating-point precision. The orthogonalizing and spectral
+families are the exception (the Muon variants, Scion, PolarGrad, SpEL, KLSOAP, Aurora): their
+Newton-Schulz and eigendecomposition iterations amplify the small difference between the compiled and
+eager matmul kernels, so over a run compiled and eager drift apart like two seeds. That drift is
+matmul reduction order, not a correctness bug. The preconditioning families trade a higher
+per-step cost for sample efficiency; `benchmarks/conditioning.py` measures this across a controlled
+input-conditioning sweep, where whitening with momentum (`LATHER`) increasingly outperforms `AdamW`
+as conditioning worsens.
+
+The step compiles with `fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs"`. One graph
+is compiled per step type (a normal step and a preconditioner-refresh step), and no per-step
+recompilation occurs.
+
+## Low-precision state
+
+Optimizer state defaults to fp32. Two opt-ins shrink it, with compute still promoted to fp32 so only
+storage changes: `storage_dtype=torch.bfloat16` stores state in bfloat16 (half the state memory, and
+faster than `torch.optim.AdamW(fused=True)` on the tested models from the lower bandwidth), and `ecc=8`
+adds a per-value int8 residual for near-fp16 precision at 0.75x fp32 (`ecc=16` uses int16 but costs as
+much memory as fp32, so prefer plain fp32 there). See `examples/ecc_bf16.py` and
+`benchmarks/precision_speed.py`.
+
+## Compatibility matrix
+
+`test/test_feature_matrix.py` is the compile-first compatibility matrix: for every optimizer, over each
+distinct state-precision setting (`fp32`, `bf16`, `ecc=8`, `ecc=16`), it compiles the live max-autotune
+step — the exact path production runs, not eager and not a cheaper mode — on real transformer-shaped
+weights, and asserts the cell compiles, stays finite, updates every parameter, and actually allocates the
+requested state precision. Each cell also records its compile time, steady step time, peak GPU memory, and
+optimizer-state bytes (set `FEATURE_MATRIX_MEASURE=<path.jsonl>`), so a run characterizes the whole surface
+rather than only passing or failing. Companion guards in `test/test_storage_dtype.py` assert that `bf16`
+halves the state for every optimizer and that every optimizer updates `bf16` *parameters* without underflow.
+
+The full grid -- **43 optimizers × 4 state precisions = 172 cells -- compiles and passes with no holes**
+(each cell runs the live max-autotune step, stays finite, updates every parameter, and allocates the
+requested precision; `bf16` halves the float state for every stateful optimizer):
+
+| state precision | optimizer state stored as |
+| --- | --- |
+| `fp32` (default) | fp32 |
+| `bf16` | bf16 -- half the float-state memory |
+| `ecc=8` | bf16 + int8 (top 8 low-mantissa bits, rest stochastically rounded) -- near-fp16 at 0.75x fp32 |
+| `ecc=16` | bf16 + int16 (all 16 low-mantissa bits) -- **bit-exact fp32** at the same 4 bytes |
+
+It is a heavy GPU test — max-autotune compiles the whole grid — so CI runs it on the on-demand `gpu-test`
+lane across 8 GPUs with `pytest-xdist` (`test/conftest.py` pins one worker per GPU). On a CUDA box:
+
+```bash
+pytest test/test_feature_matrix.py -n 8   # -n <#gpus>; drop -n to run serially
 ```
 
-For non-FSDP sharding backends, capture the original parameter shapes before wrapping:
+## Migrating from 3.x
 
-```python
-from heavyball import SOAP, capture_param_shapes
-
-shapes = capture_param_shapes(model)
-model = your_sharding_wrapper(model)
-opt = SOAP(model.parameters(), lr=3e-3, orig_shapes=shapes)
-```
-
-## Building Custom Optimizers
-
-Every built-in optimizer is a chain of `FunctionTransform`s, an API also available for building custom optimizers.
-`Parallel` runs parallel transform paths with a merge function, which is useful for grafted optimizers or ensemble
-updates.
-
-```python
-import heavyball.chainable as C
-
-
-def graft(outputs, eps=1e-8):
-    adam_update, sgd_update = outputs
-    return [s * (a.norm() / s.norm().add(eps)) for a, s in zip(adam_update, sgd_update)]
-
-
-class GraftedAdam(C.BaseOpt):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, warmup_steps=0, multi_tensor=True):
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                        warmup_steps=warmup_steps, multi_tensor=multi_tensor)
-        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=graft)
-        super().__init__(params, defaults, fns=(branch,))
-```
-
-Custom optimizers that inherit from `BaseOpt` get ECC, MARS, caution, clipping, warmup, and stochastic rounding
-automatically.
-
-Key transforms: `scale_by_adam`, `scale_by_laprop`, `scale_by_soap`, `scale_by_psgd`, `scale_by_adopt`,
-`scale_by_ademamix`, `orthogonalize_update`, `exp_avg`, `nesterov_ema`, `heavyball_momentum`, `mars`, `palm_beta2`,
-`sign`, `identity`.
-
-<details>
-<summary>How it compiles</summary>
-
-Every building block in `utils.py` is wrapped with `torch.compile(fullgraph=True)`. When one
-compiled function calls another, the inner function inlines and nested calls fuse into the same compiled graph.
-
-For fused first-order optimizers (AdamW, LaProp, ADOPT, NAdam, AdEMAMix), the entire update runs in a single compiled
-function and fuses into minimal kernels. Stochastic rounding, ECC encode/decode, weight decay, and cautious
-masking all fold into the same graph, reducing the memory traffic to a minimum. Adam without add-ons gets reduced from
-14 reads + 9 writes in O(N) kernels to 4 reads + 3 writes in one kernel, a 3x speedup.
-
-Second-order methods compile their preconditioning steps separately: Newton-Schulz iterations (Muon) and Kronecker
-factor updates (PSGD, SOAP) each compile as individual regions, while their elementwise portions still fuse. This avoids
-suboptimal code paths, at the cost of one graph break.
-
-Custom optimizers built via the chainable API inherit this behavior.
-
-</details>
-
-## Benchmarks
-
-HeavyBall includes a benchmark suite via [LightBench](https://github.com/HomebrewML/LightBench) that tests
-for silent optimizer failures across difficulty levels. Results and methodology are documented
-in [docs/benchmark.md](docs/benchmark.md).
-
-[`benchmarks/bench_release_optimizers.py`](benchmarks/bench_optimizer_step.py) measures optimizer latency, with
-AdamW step times dropping from 10.63 ms in HeavyBall 2 to 4.15 ms in HeavyBall 3.
-
-## Migrating
-
-**From 2.x** See the [3.0.0 migration guide](docs/heavyball3.md) for renamed classes, removed kwargs, and checkpoint
-conversion.
-
-**From 1.x** See the [2.0.0 migration notes](docs/heavyball2.md), then follow the 3.0.0 guide.
+HeavyBall 4 is a rewrite. The 3.x composable-flag surface is gone: `heavyball.chainable`,
+`SplitOpt`, the `mars=` / `caution=` keyword flags, and `capture_param_shapes` no longer exist. The
+`ecc=` low-precision-state option and `heavyball.set_torch` (also exposed at `heavyball.utils.set_torch`)
+returned in 4.0; see Low-precision state above and Quick start. Use the optimizer classes above for the
+common case, per-group
+dictionaries instead of `SplitOpt`, and the `Recipe` / `Route` / transform API to compose custom
+optimizers. `cautious`/`mars` variants that used to be flags are their own recipes (for example
+`CautiousAdamW`, `MARSAdamW`).
 
 ## Contributing
 
-To contribute, fork the repository, install with `pip install -e .[dev]`, and run `pytest`.
+Fork the repository, install with `pip install -e .[dev]`, and run `pytest`.
 
 ## License
 

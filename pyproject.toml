@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heavyball"
 description = "Compile-first PyTorch optimizer library - AdamW, Muon, SOAP/Shampoo, PSGD, Schedule-Free, and 30+ more with torch.compile fusion and composable features"
-version = "3.2.0"
+version = "4.0.0"
 authors = [{ name = "HeavyBall Authors", email = "github.heavyball@nestler.sh" }]
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
@@ -17,7 +17,7 @@ classifiers = ["Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = ["opt-einsum>=3.4.0",
-    "torch>=2.2,<3.0",
+    "torch>=2.13.0,<3.0.0",
     "numpy>=2.3.4",
 ]
 keywords = [
@@ -54,10 +54,10 @@ keywords = [
     "ddp",
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "pytest", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "tqdm"]
+dev = ["pre-commit", "pytest", "pytest-xdist", "hypothesis", "ruff", "matplotlib", "seaborn", "pandas", "typer", "optuna", "optunahub", "gpytorch", "scikit-learn", "tqdm"]
 tuning = ["optuna", "optunahub", "gpytorch", "scikit-learn", "pandas"]
 
 [project.urls]
@@ -67,17 +67,20 @@ tracker = "https://github.com/HomebrewML/HeavyBall/issues"
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["heavyball_legacy"]
 
 [tool.ruff.lint]
-extend-select = ["I", "W"]
-ignore = ["E741"]
+extend-select = ["I", "W", "UP", "B", "SIM"]
+ignore = ["E741", "UP035"]
 preview = false
 
 [tool.ruff.lint.isort]
 relative-imports-order = "closest-to-furthest"
+combine-as-imports = true
 
 [tool.ruff.format]
 preview = false
 
 [tool.setuptools.packages.find]
-include = ["heavyball*"]
+include = ["heavyball", "heavyball.*"]
+exclude = ["heavyball_legacy*"]

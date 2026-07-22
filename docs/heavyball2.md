@@ -32,12 +32,10 @@
 
 ### Breaking changes
 
-* Default orthogonalization switches to Newton-Schulz, impacting Muon; SOAP relies on `precise_zeroth_power_mode="qr"`
-  and remains unchanged
+* Default orthogonalization switches to Newton-Schulz, impacting Muon
 * Optimizer state keys include the per‑transform index (e.g., `exp_avg_3`), breaking old checkpoints
 
 ## Upgrade checklist
 
-1. Re‑test optimizers sensitive to orthogonalization; set `utils.zeroth_power_mode="qr"` to restore 1.x behavior
-2. Migrate checkpoints using `python scripts/migrate_optimizer_state.py <checkpoint_path> heavyball.<OptimizerClass>`
-3. Update any custom state‑dict tooling to handle transform‑indexed keys
+1. Re‑test optimizers sensitive to orthogonalization
+2. Update any custom state-dict tooling to handle transform-indexed keys

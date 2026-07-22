@@ -5,7 +5,8 @@
 * Simplified public API: `Foreach*` prefixes removed, short names are now the canonical classes
 * New optimizers: `HyperBallAdamW`, `MuonAdamW`, `LATHER`, `PSGDPRO`
 * `LATHER`, "Lie-group Adam Through Harmonic Eigenbasis Rotations", performs AdamW in the PSGD eigenbasis
-* `Route`-based param dispatch replaces manual `SplitOpt` for mixed-architecture optimizers
+* `Route`-based parameter dispatch handles mixed paths within one optimizer; `SplitOpt` remains available when the paths
+  need different optimizer classes
 * `ScheduleFree` and `MSAM` mode switches are now idempotent (`eval()` twice is safe)
 * Higher-precision PSGD preconditioner updates
 * New `consume_grad` option: `step()` clears `p.grad` after consuming it by default; set `consume_grad=False` to keep gradients attached after the step
@@ -17,7 +18,7 @@
 ## Release benchmarks
 
 HeavyBall 3.0.0 was benchmarked against HeavyBall 2.0.0 and `torch.optim` with
-[`benchmarks/bench_release_optimizers.py`](../benchmarks/bench_release_optimizers.py), with compiled AdamW step latency
+[`benchmarks/bench_optimizer_step.py`](../benchmarks/bench_optimizer_step.py), with compiled AdamW step latency
 dropping from 10.63 ms in HeavyBall 2.0.0 to 4.15 ms in HeavyBall 3.0.0, a 2.56x speedup.
 
 ## Breaking changes
@@ -58,11 +59,11 @@ corresponding constructor argument instead.
 | `PrecondScheduleForeachSOAP` / `PrecondScheduleSOAP` | `SOAP(..., use_precond_schedule=True)` |
 | `PrecondSchedulePaLMForeachSOAP` / `PrecondSchedulePaLMSOAP` | `SOAP(..., palm=True, use_precond_schedule=True)` |
 | `ForeachPurePSGD` / `PurePSGD` | `PSGDKron(..., exp_avg_input=False)` |
-| `ForeachCachedPSGDKron` / `CachedPSGDKron` | `PSGDKron(...)` (caching is now the default) |
+| `ForeachCachedPSGDKron` / `CachedPSGDKron` | `PSGDKron(..., cached=True)` |
 | `ForeachDelayedPSGD` / `DelayedPSGD` | `PSGDKron(..., delayed=True)` |
-| `ForeachCachedDelayedPSGDKron` / `CachedDelayedPSGDKron` | `PSGDKron(..., delayed=True)` |
-| `ForeachCachedNewtonPSGD` / `NewtonPSGDKron` | `PSGDKron(..., hessian_approx=True)` |
-| `NewtonHybrid2PSGDKron` | `PSGDKron(..., hessian_approx=True, hvp_interval=2)` |
+| `ForeachCachedDelayedPSGDKron` / `CachedDelayedPSGDKron` | `PSGDKron(..., delayed=True, cached=True)` |
+| `ForeachCachedNewtonPSGD` / `NewtonPSGDKron` | `PSGDKron(..., hessian_approx=True, cached=True)` |
+| `NewtonHybrid2PSGDKron` | `PSGDKron(..., hessian_approx=True, hvp_interval=2, cached=True)` |
 | `ForeachDelayedPSGDLRA` / `DelayedPSGDLRA` | `PSGDLRA(..., delayed=True)` |
 | `ForeachNewtonPSGDLRA` / `NewtonPSGDLRA` | `PSGDLRA(..., hessian_approx=True)` |
 | `NewtonHybrid2PSGDLRA` | `PSGDLRA(..., hessian_approx=True, hvp_interval=2)` |
@@ -71,7 +72,7 @@ corresponding constructor argument instead.
 
 | 2.x parameter | 3.x parameter | Notes |
 |---|---|---|
-| `foreach` | `multi_tensor` | Passing `foreach` emits a `FutureWarning` and remaps automatically |
+| `foreach` | `multi_tensor` | The old name is removed |
 
 ### Removed parameters
 
@@ -84,6 +85,7 @@ These raise `TypeError` if passed. They were either unused or replaced by better
 | `correct_bias` | SOAP variants | Was unused in the transform pipeline                     |
 | `inverse_free` | PSGDKron | Use `quad_torch` or PSGDPRO for inverse-free PSGD        |
 | `adaptive` | PSGDKron | Removed                                                  |
+| `palm`, `beta2_scale` | Muon, KLShampoo | These optimizers have no second-moment coefficient |
 
 ### Helper sampler kwargs
 
@@ -114,22 +116,15 @@ These compatibility kwargs were removed from `heavyball.helpers` samplers and no
 * **Sharded parameter shapes**: Built-in optimizers now expose `orig_shapes` explicitly. Use
   `capture_param_shapes()` before wrapping parameters if your sharding backend hides original
   shapes.
-* **PSGD dampening**: `dampen_grad` default changed from `2**-13` to `1e-9`, and dampening
-  epsilon uses `torch.finfo(float32).eps` regardless of input dtype. This improves
+* **HyperBallAdamW routing**: Matrix parameters use HyperBall; 1D parameters now use full AdamW rather than only its
+  second-moment scaling.
+* **SplitOpt construction**: Each spec now requires a HeavyBall optimizer class rather than an instance, with constructor
+  options in the spec. Hessian-approximation children and `add_param_group()` are unsupported.
+* **SAMWrapper construction**: Class form accepts per-group hyperparameters from parameter-group dictionaries. Use a
+  preconfigured instance for optimizer-wide flags.
+* **PSGD dampening**: `dampening` default changed from `2**-13` to `1e-9`, and the dampening
+  epsilon follows the promoted working dtype. This improves
   preconditioner accuracy but may change convergence behavior.
-
----
-
-## Checkpoint migration
-
-Use the migration CLI to convert 1.x or 2.x checkpoints:
-
-```bash
-python scripts/migrate_optimizer_state.py <checkpoint.pt> <OptimizerClass>
-```
-
-Old class names (including all aliases listed above) are resolved automatically.
-The `foreach` → `multi_tensor` key rename in param groups is handled automatically.
 
 ---
 
@@ -140,7 +135,6 @@ The `foreach` → `multi_tensor` key rename in param groups is handled automatic
 3. Replace removed subclass instantiations with parent + kwargs (see table above)
 4. Remove any `stochastic_schedule`, `normalize_grads`, `correct_bias`, `inverse_free`, or `adaptive` kwargs
 5. Replace `Branch(...)` with `Parallel(...)` in custom chainable code
-6. Migrate checkpoints: `python scripts/migrate_optimizer_state.py <ckpt> heavyball.<Optimizer>`
-7. If you relied on `eval(); eval()` toggling back to train mode, update your code
-8. If your training loop reads `p.grad` after `step()`, pass `consume_grad=False`
-9. Remove obsolete compatibility kwargs from `heavyball.helpers` samplers
+6. If you relied on `eval(); eval()` toggling back to train mode, update your code
+7. If your training loop reads `p.grad` after `step()`, pass `consume_grad=False`
+8. Remove obsolete compatibility kwargs from `heavyball.helpers` samplers

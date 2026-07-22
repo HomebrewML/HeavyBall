@@ -3,19 +3,13 @@ import argparse
 import torch
 from torch._dynamo import config as dynamo_config
 
-from heavyball.utils import max_singular_value, min_singular_value
+from heavyball.utils import max_singular_value_power_iter
 
 dynamo_config.cache_size_limit = 2**20
 dynamo_config.accumulated_cache_size_limit = 2**20
 
 
-def hilbert_matrix(n):
-    i = torch.arange(1, n + 1, dtype=torch.float64).unsqueeze(1)
-    j = torch.arange(1, n + 1, dtype=torch.float64).unsqueeze(0)
-    return 1.0 / (i + j - 1).cuda()
-
-
-def make_matrix(shape, cond=10, dtype=torch.float32, symmetric=False, seed=0):
+def make_matrix(shape, cond=10, dtype=torch.float32, seed=0):
     torch.manual_seed(seed)
     m, n = shape
     r = min(m, n)
@@ -24,13 +18,10 @@ def make_matrix(shape, cond=10, dtype=torch.float32, symmetric=False, seed=0):
     exponents = torch.linspace(0, -1, r, dtype=torch.float32)
     spectrum = cond**exponents
     diag = torch.diag(spectrum)
-    if symmetric:
-        return (q_left @ diag @ q_left.T).contiguous().to(dtype).cuda()
     return (q_left @ diag @ q_right.T).contiguous().to(dtype).cuda()
 
 
 SHAPES_2D = [(4, 4), (32, 32), (128, 128), (10, 5), (5, 10)]
-SHAPES_SYM = [(4, 4), (32, 32), (128, 128)]
 CONDS = [1, 10, 1e4, 1e10, 1e18, 1e30, 1e300]
 DTYPES = [torch.bfloat16, torch.float32, torch.float64]
 POWER_ITERS = [0, 5, 20]
@@ -48,33 +39,13 @@ def bench_max_sv(rows):
                     A = make_matrix(shape, cond=cond, dtype=dtype)
                     exact = torch.linalg.svdvals(A.double()).max()
                     try:
-                        approx = max_singular_value(A, power_iter=pi)
+                        approx = max_singular_value_power_iter(A, iterations=pi)
                         rerr = abs((approx.double() - exact) / exact).item()
                         status = "ok"
                     except Exception as e:
                         rerr = float("nan")
                         status = type(e).__name__
                     rows.append(("max_sv", _dtype_name(dtype), pi, shape, cond, rerr, status))
-
-
-def bench_min_sv(rows):
-    for dtype in DTYPES:
-        for pi in POWER_ITERS:
-            for shape in SHAPES_SYM:
-                for cond in CONDS:
-                    A = make_matrix(shape, cond=cond, dtype=dtype, symmetric=True)
-                    exact = torch.linalg.svdvals(A.double()).min()
-                    try:
-                        approx = min_singular_value(A, power_iter=pi)
-                        if exact.abs() < 1e-8:
-                            rerr = abs(approx.double() - exact).item()
-                        else:
-                            rerr = abs((approx.double() - exact) / exact).item()
-                        status = "ok"
-                    except Exception as e:
-                        rerr = float("nan")
-                        status = type(e).__name__
-                    rows.append(("min_sv", _dtype_name(dtype), pi, shape, cond, rerr, status))
 
 
 def print_pareto(rows):
@@ -106,7 +77,6 @@ def main():
 
     rows = []
     bench_max_sv(rows)
-    bench_min_sv(rows)
 
     print_pareto(rows)
 

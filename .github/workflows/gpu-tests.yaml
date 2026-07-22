@@ -28,9 +28,12 @@ jobs:
         continue-on-error: true
         env:
           VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
-        run: python ci/gpu_tests.py
+        run: exec python ci/gpu_tests.py
+      - name: Tear down Vast instances
+        if: always()
+        env:
+          VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+        run: python -m ci.gpu_tests teardown
       - name: Post results to PR
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
@@ -90,24 +93,6 @@ jobs:
                 });
               }
             }
-      - name: Destroy leaked instances
-        if: always()
-        env:
-          VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
-        run: |
-          python -c "
-          import requests, os, time
-          key = os.environ.get('VASTAI_API_KEY', '')
-          if not key: exit()
-          r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'}).json().get('instances', [])
-          while r:
-            for inst in r:
-                requests.delete(f'https://console.vast.ai/api/v0/instances/{inst[\"id\"]}/', params={'api_key': key})
-                print(f'Destroyed leaked instance {inst[\"id\"]}')
-            time.sleep(3)
-            r = requests.get('https://console.vast.ai/api/v0/instances', params={'api_key': key, 'owner': 'me'}).json().get('instances', [])
-
-          "
       - name: Set exit code
         if: steps.tests.outcome == 'failure'
         run: exit 1

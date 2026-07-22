@@ -1,0 +1,85 @@
+"""Stateful HyperBall terminal commit for HeavyBall 4.0."""
+
+import torch
+from torch import Tensor
+
+from .numerics import _caution, _wide, broadcast_leaf, stable_l2_normalize
+
+
+# Kept local: this caller needs the stable scale and normalized norm separately.
+def _stable_l2_components(value: Tensor) -> tuple[Tensor, Tensor]:
+    """Return legacy stable-L2 scale and normalized norm for every slab row."""
+
+    value = _wide(value)
+    if value.numel() == 0:
+        scale = torch.zeros(value.shape[0], dtype=value.dtype, device=value.device)
+        return scale, torch.ones_like(scale)
+    flat = value.reshape(value.shape[0], -1)
+    scale = flat.abs().amax(dim=1)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    norm = torch.linalg.vector_norm(flat / safe_scale.unsqueeze(1), dim=1)
+    return scale, norm
+
+
+def _stable_l2_normalize(value: Tensor, *, eps: float) -> Tensor:
+    """Normalize each slab leaf through the shared stable-L2 primitive."""
+
+    value = _wide(value)
+    flat = value.reshape(value.shape[0], -1)
+    return stable_l2_normalize(flat, dim=1, eps=eps).reshape_as(value)
+
+
+def _initial_norm(value: Tensor) -> Tensor:
+    scale, norm = _stable_l2_components(value)
+    return torch.cat((scale.unsqueeze(1), norm.unsqueeze(1)), dim=1)
+
+
+def _unpack_init_norm(init_norm: Tensor) -> tuple[Tensor, Tensor]:
+    """Accept legacy's one- or two-scalar init-norm representations."""
+
+    if init_norm.shape[1] == 2:
+        return init_norm[:, 0], init_norm[:, 1]
+    norm_scale = init_norm.reshape(init_norm.shape[0])
+    return norm_scale, torch.ones_like(norm_scale)
+
+
+def hyperball_commit_init(reference: Tensor) -> dict[str, Tensor]:
+    """Allocate the legacy two-scalar norm template and first-step latch."""
+
+    reference = _wide(reference)
+    return {
+        "init_norm": torch.zeros(2, dtype=reference.dtype, device=reference.device),
+        "seen": torch.zeros((), dtype=torch.bool, device=reference.device),
+    }
+
+
+def hyperball_commit(param: Tensor, update: Tensor, state: dict[str, Tensor], tempo):
+    """Apply HyperBall's decay, caution, normalized step, and sphere projection."""
+
+    param = _wide(param)
+    update = _wide(update)
+    stored_init_norm = _wide(state["init_norm"])
+    seen = state["seen"]
+    first = seen.logical_not()
+    first_init_norm = _initial_norm(param)
+    init_norm = torch.where(broadcast_leaf(first, first_init_norm), first_init_norm, stored_init_norm)
+
+    lr = _wide(tempo.hyper.lr)
+    caution = _wide(tempo.hyper.caution)
+
+    # Hyperball (arXiv 2606.16899, Algorithm 1) replaces weight decay with the norm constraint, so no weight_decay term is folded here; hyperball_adamw's routed AdamW branch keeps decay for vectors.
+    raw_grad = torch.zeros_like(update) if tempo.raw_grad is None else _wide(tempo.raw_grad)
+    update = torch.where(caution != 0, _caution(raw_grad, update), update)
+
+    norm_scale, scaled_norm = _unpack_init_norm(init_norm)
+    step_scale = broadcast_leaf((lr * scaled_norm) * norm_scale, param)
+    radius = broadcast_leaf(scaled_norm * norm_scale, param)
+    candidate_param = param - _stable_l2_normalize(update, eps=torch.finfo(update.dtype).tiny) * step_scale
+    candidate_param = _stable_l2_normalize(
+        candidate_param, eps=torch.finfo(candidate_param.dtype).tiny
+    ) * radius
+    return candidate_param, {"init_norm": init_norm, "seen": torch.ones_like(seen)}
+
+
+hyperball_commit.init = hyperball_commit_init
+hyperball_commit.distributed_shard_separable = False

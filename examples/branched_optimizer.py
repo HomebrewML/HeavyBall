@@ -4,45 +4,34 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 
 import heavyball
-import heavyball.chainable as C
 
-heavyball.utils.set_torch()
-
-
-def _graft(outputs: Iterable[list[torch.Tensor]], eps: float = 1e-8) -> list[torch.Tensor]:
-    adam_update, sgd_update = outputs
-    merged = []
-    for adam, sgd in zip(adam_update, sgd_update):
-        merged.append(sgd * (adam.norm() / sgd.norm().add(eps)))
-    return merged
+# HeavyBall 4.0 has no chainable Parallel/merge grafting; Route branches by ParamInfo instead.
+BRANCHED_RECIPE = heavyball.Route(lambda info: info.ndim == 2, heavyball.adamw, heavyball.sgd)
 
 
-class GraftedAdam(C.BaseOpt):
-    def __init__(
-        self,
+def build_optimizer(
+    params: Iterable[torch.Tensor],
+    lr: float = 1e-3,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+    weight_decay: float = 1e-4,
+):
+    return heavyball.HeavyBallOptimizer(
         params,
-        lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 1e-4,
-        warmup_steps: int = 0,
-        multi_tensor: bool = True,
-    ):
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            warmup_steps=warmup_steps,
-        )
-        branch = C.Parallel(branches=[[C.scale_by_adam], [C.identity]], merge_fn=_graft)
-        super().__init__(params, defaults, multi_tensor, fns=(branch,))
+        BRANCHED_RECIPE,
+        lr=lr,
+        beta1=betas[0],
+        beta2=betas[1],
+        eps=eps,
+        weight_decay=weight_decay,
+    )
 
 
 def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
+    from torchvision import datasets, transforms
+
     torch.manual_seed(2024)
     random.seed(2024)
 
@@ -73,7 +62,7 @@ def main(epochs: int = 20, batch_size: int = 256, subset_size: int = 4096):
         nn.Linear(256, 10),
     ).to(device)
 
-    optimizer = GraftedAdam(model.parameters(), lr=3e-4, betas=(0.9, 0.995), weight_decay=1e-4)
+    optimizer = build_optimizer(model.parameters(), lr=3e-4, betas=(0.9, 0.995), weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(1, epochs + 1):

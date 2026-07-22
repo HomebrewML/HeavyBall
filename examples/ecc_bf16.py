@@ -1,14 +1,12 @@
 import math
 import warnings
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import heavyball
 
-heavyball.utils.set_torch()
 warnings.filterwarnings("ignore", message="Learning rate changed")
 
 DEPTH, WIDTH, IN_DIM = 6, 64, 8
@@ -17,13 +15,37 @@ N_TRAIN = 2048
 LOG_EVERY = 500
 
 CONFIGS = {
-    "naive_fp32": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
-    "naive_bf16": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
-    "heavyball_fp32": lambda p: heavyball.AdamW(p, lr=LR, betas=BETAS, eps=EPS, storage_dtype="float32"),
-    "heavyball_bf16": lambda p: heavyball.AdamW(
-        p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, storage_dtype="bfloat16"
-    ),
-    "ecc_bf16+8": lambda p: heavyball.AdamW(p, lr=LR, betas=BETAS, eps=EPS, weight_decay=0, ecc="bf16+8"),
+    "naive_fp32": {
+        "dtype": torch.float32,
+        "make_optimizer": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.float32),
+    },
+    "naive_bf16": {
+        "dtype": torch.bfloat16,
+        "make_optimizer": lambda p: NaiveAdamW(p, lr=LR, betas=BETAS, eps=EPS, state_dtype=torch.bfloat16),
+    },
+    # HeavyBall stores optimizer state in low precision on request: storage_dtype=torch.bfloat16 halves
+    # the state memory, and ecc=8 adds an int8 residual for near-fp16 precision at 0.75x fp32. bf16
+    # parameters additionally get built-in stochastic rounding.
+    "heavyball_fp32": {
+        "dtype": torch.float32,
+        "make_optimizer": lambda p: heavyball.AdamW(p, lr=LR, beta1=BETAS[0], beta2=BETAS[1], eps=EPS, weight_decay=0),
+    },
+    "heavyball_bf16": {
+        "dtype": torch.bfloat16,
+        "make_optimizer": lambda p: heavyball.AdamW(p, lr=LR, beta1=BETAS[0], beta2=BETAS[1], eps=EPS, weight_decay=0),
+    },
+    "heavyball_bf16_state": {
+        "dtype": torch.float32,  # fp32 model, bfloat16 optimizer STATE (half the state memory)
+        "make_optimizer": lambda p: heavyball.AdamW(
+            p, lr=LR, beta1=BETAS[0], beta2=BETAS[1], eps=EPS, weight_decay=0, storage_dtype=torch.bfloat16
+        ),
+    },
+    "heavyball_ecc8_state": {
+        "dtype": torch.float32,  # fp32 model, bf16+int8 ECC state (near-fp16 precision at 0.75x fp32)
+        "make_optimizer": lambda p: heavyball.AdamW(
+            p, lr=LR, beta1=BETAS[0], beta2=BETAS[1], eps=EPS, weight_decay=0, ecc=8
+        ),
+    },
 }
 
 COLORS = {
@@ -31,21 +53,24 @@ COLORS = {
     "naive_bf16": "#d62728",
     "heavyball_fp32": "#2d2d2d",
     "heavyball_bf16": "#1f77b4",
-    "ecc_bf16+8": "#2ca02c",
+    "heavyball_bf16_state": "#9467bd",
+    "heavyball_ecc8_state": "#2ca02c",
 }
 LABELS = {
     "naive_fp32": "naive fp32",
     "naive_bf16": "naive bf16",
     "heavyball_fp32": "heavyball fp32",
-    "heavyball_bf16": "heavyball bf16 (stochastic rounding)",
-    "ecc_bf16+8": "ECC bf16+8 (correction tensor)",
+    "heavyball_bf16": "heavyball bf16 params (stochastic rounding)",
+    "heavyball_bf16_state": "heavyball bf16 state (storage_dtype)",
+    "heavyball_ecc8_state": "heavyball ecc8 state",
 }
 STYLES = {
     "naive_fp32": dict(linewidth=2, linestyle="--", alpha=0.7),
     "naive_bf16": dict(linewidth=2.5, linestyle="-"),
     "heavyball_fp32": dict(linewidth=2.5, linestyle="-"),
     "heavyball_bf16": dict(linewidth=1.8, linestyle="--"),
-    "ecc_bf16+8": dict(linewidth=1.8, linestyle="--"),
+    "heavyball_bf16_state": dict(linewidth=2, linestyle="-"),
+    "heavyball_ecc8_state": dict(linewidth=2, linestyle="-"),
 }
 
 
@@ -107,16 +132,24 @@ class NaiveAdamW:
                 p.grad.zero_()
 
 
+def build_optimizer(name, params):
+    return CONFIGS[name]["make_optimizer"](params)
+
+
 @torch.no_grad()
-def make_data(teacher, n, seed):
-    x = torch.randn(n, IN_DIM, generator=torch.Generator().manual_seed(seed)).cuda()
+def make_data(teacher, n, seed, device):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn(n, IN_DIM, generator=generator, device=device)
     return x, teacher(x)
 
 
-def train(name, make_opt, init_state, train_x, train_y):
-    model = MLP().cuda()
+def train(name, init_state, train_x, train_y, device):
+    dtype = CONFIGS[name]["dtype"]
+    model = MLP().to(device=device, dtype=dtype)
     model.load_state_dict(init_state)
-    opt = make_opt(model.parameters())
+    opt = build_optimizer(name, model.parameters())
+    config_x = train_x.to(dtype=dtype)
+    config_y = train_y.to(dtype=dtype)
 
     log = []
     for step in range(1, STEPS + 1):
@@ -125,7 +158,7 @@ def train(name, make_opt, init_state, train_x, train_y):
             g["lr"] = lr
 
         def closure():
-            loss = F.mse_loss(model(train_x), train_y)
+            loss = F.mse_loss(model(config_x).float(), config_y.float())
             loss.backward()
             return loss
 
@@ -134,7 +167,7 @@ def train(name, make_opt, init_state, train_x, train_y):
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():
-                mse = F.mse_loss(model(train_x), train_y).item()
+                mse = F.mse_loss(model(config_x).float(), config_y.float()).item()
             log_mse = math.log10(mse) if mse > 0 else -float("inf")
             log.append((step, mse, log_mse))
             print(f"[{name:>20}] step {step:5d}  log10(mse) {log_mse:+.2f}  mse {mse:.2e}")
@@ -143,15 +176,18 @@ def train(name, make_opt, init_state, train_x, train_y):
 
 
 def main():
+    import matplotlib.pyplot as plt
+
     torch.manual_seed(0)
-    teacher = MLP().cuda().eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    teacher = MLP().to(device).eval()
     torch.manual_seed(42)
-    init = MLP().cuda().state_dict()
-    train_x, train_y = make_data(teacher, N_TRAIN, seed=0)
+    init = MLP().to(device).state_dict()
+    train_x, train_y = make_data(teacher, N_TRAIN, seed=0, device=device)
 
     results, opts = {}, {}
-    for name, make_opt in CONFIGS.items():
-        results[name], opts[name] = train(name, make_opt, init, train_x, train_y)
+    for name in CONFIGS:
+        results[name], opts[name] = train(name, init, train_x, train_y, device)
 
     fig, ax = plt.subplots(figsize=(8, 5))
 

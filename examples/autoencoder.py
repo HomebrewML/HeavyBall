@@ -5,16 +5,9 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-import tqdm
 from torch.nn import functional as F
-from torch.utils.tensorboard import SummaryWriter
-from torchvision.datasets import MNIST
-from torchvision.transforms import v2
-from torchvision.utils import make_grid
 
 import heavyball
-
-heavyball.utils.set_torch()
 
 
 class Autoencoder(nn.Module):
@@ -57,33 +50,45 @@ class RandomPad(nn.Module):
         return torch.stack(new)
 
 
+def build_optimizer(params):
+    # HeavyBall 4.0 dropped precond_update_power_iterations, store_triu_as_line, and cached.
+    return heavyball.PSGDPro(params, lr=1e-3)
+
+
 def main(epochs: int, batch: int, log_interval: int = 16):
+    import tqdm
+    from torch.utils.tensorboard import SummaryWriter
+    from torchvision.datasets import MNIST
+    from torchvision.transforms import v2
+    from torchvision.utils import make_grid
+
+    heavyball.set_torch()  # TF32 matmuls + opt_einsum paths for the compiled step
     torch.manual_seed(0x12783)
     np.random.seed(0x12783)
     random.seed(0x12783)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_dir = os.path.join("runs", f"psgdpro_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     writer = SummaryWriter(log_dir)
 
-    model = torch.compile(Autoencoder().cuda(), mode="default")
-    optimizer = heavyball.PSGDPRO(
-        model.parameters(), lr=1e-3, precond_update_power_iterations=6, store_triu_as_line=False, cached=True
-    )
+    model = Autoencoder().to(device)
+    optimizer = build_optimizer(model.parameters())
+    model = torch.compile(model, mode="default")
 
     transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32)])
     train = [img for img, _ in MNIST(root="./data", train=True, download=True, transform=transform)]
     test = [img for _, (img, _) in zip(range(8), MNIST(root="./data", train=False, download=True, transform=transform))]
 
-    train = torch.stack(train).cuda() / 255.0
+    train = torch.stack(train).to(device) / 255.0
     eval_batch = torch.stack(test) / 255.0
 
     pad = RandomPad(4)
     eval_batch_raw = eval_batch
-    eval_batch_cuda = F.pad(eval_batch, (2, 2, 2, 2)).cuda()
+    eval_batch_device = F.pad(eval_batch, (2, 2, 2, 2)).to(device)
     step = 0
     total_loss = 0
 
     for epoch in range(epochs):
-        train = train[torch.randperm(train.size(0))].contiguous()
+        train = train[torch.randperm(train.size(0), device=device)].contiguous()
         batches = pad(train)
         batches = batches[: batches.size(0) // batch * batch]
         batches = batches.view(-1, batch, *batches.shape[1:])
@@ -112,7 +117,7 @@ def main(epochs: int, batch: int, log_interval: int = 16):
 
         with torch.no_grad():
             model.eval()
-            samples = model(eval_batch_cuda)
+            samples = model(eval_batch_device)
             comparison = torch.cat([eval_batch_raw, samples.cpu()[:, :, 2:-2, 2:-2]], dim=0)
             grid = make_grid(comparison, nrow=8, normalize=True, padding=2)
             writer.add_image("reconstructions", grid, epoch)

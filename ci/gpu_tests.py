@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -16,31 +17,55 @@ def _detect_repo_and_branch():
     repo = os.environ.get("REPO_URL")
     branch = os.environ.get("BRANCH")
     if repo and branch:
-        return repo, branch
+        return repo, branch, None
+    merge_sha = None
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if event_path and os.path.isfile(event_path):
         try:
             with open(event_path) as f:
                 event = json.load(f)
-            head = event.get("pull_request", {}).get("head", {})
-            if not repo:
-                repo = head.get("repo", {}).get("clone_url")
-            if not branch:
-                branch = head.get("ref")
+            pr = event["pull_request"]
+            merge_sha = pr.get("merge_commit_sha")
+            if merge_sha:
+                base_repo = pr.get("base", {}).get("repo") or {}
+                repo = base_repo.get("clone_url") or event.get("repository", {}).get("clone_url") or repo
+                branch = merge_sha
+            else:
+                head = pr.get("head", {})
+                if not repo:
+                    repo = (head.get("repo") or {}).get("clone_url")
+                if not branch:
+                    branch = head.get("ref")
         except (json.JSONDecodeError, KeyError):
             pass
+    fallback_repo = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', 'HomebrewML/HeavyBall')}"
     return (
-        repo or "https://github.com/HomebrewML/HeavyBall",
+        repo or fallback_repo,
         branch or os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME", "main"),
+        merge_sha,
     )
 
 
-REPO_URL, BRANCH = _detect_repo_and_branch()
+REPO_URL, BRANCH, MERGE_SHA = _detect_repo_and_branch()
 TIMEOUT = 1800
+PER_FILE_TIMEOUT = {"test/test_feature_matrix.py": 14400}
+PER_FILE_DISK = {"test/test_feature_matrix.py": 48}
 POLL_INTERVAL = 5
 MAX_DPH = 0.20
 STUCK_TIMEOUT = 30
 MAX_RETRIES = 3
+# All FSDP2 torchrun tests run as one bundle on a single >=4-GPU instance: hsdp_parity needs
+# nproc=4 and uneven_worldsize nproc=3, so a 4-GPU box covers every fsdp2 topology, and one instance
+# (one clone+install) is far cheaper and more offer-available than ~23 separate multi-GPU rentals.
+# HB_TEST is a glob the onstart shell expands; multigpu_matrix (in the bundle) carries the
+# HB_REQUIRE_MULTIGPU fail-closed guard.
+FSDP2_BUNDLE = "test/test_fsdp2_*.py"
+MULTI_GPU_TESTS = {FSDP2_BUNDLE: 4}
+XDIST_GPU_TESTS = {"test/test_feature_matrix.py": 8, "test/test_compiled_matches_eager_gpu.py": 8}
+
+
+def _gpus_needed(test_file):
+    return max(MULTI_GPU_TESTS.get(test_file, 1), XDIST_GPU_TESTS.get(test_file, 1))
 
 
 def api(method, path, **kwargs):
@@ -55,13 +80,13 @@ def api(method, path, **kwargs):
     return r
 
 
-def find_offers(n):
+def find_offers(n, num_gpus=1, max_dph=MAX_DPH):
     query = {
         "gpu_ram": {"gte": 8},
-        "num_gpus": {"eq": 1},
+        "num_gpus": {"eq": 1} if num_gpus == 1 else {"gte": num_gpus},
         "inet_down": {"gte": 200},
         "disk_bw": {"gte": 500},
-        "dph_total": {"lte": MAX_DPH},
+        "dph_total": {"lte": max_dph},
         "cuda_vers": {"gte": 12.0},
         "rentable": {"eq": True},
         "rented": {"eq": False},
@@ -80,21 +105,28 @@ def find_offers(n):
 
 SELF_DESTRUCT_TIMEOUT = 1800
 
-ONSTART_SCRIPT = f"""#!/bin/bash
-timeout {SELF_DESTRUCT_TIMEOUT} bash -c '
+
+def _timeout_for_test(test_file):
+    return PER_FILE_TIMEOUT.get(test_file, SELF_DESTRUCT_TIMEOUT)
+
+
+ONSTART_SCRIPT = """#!/bin/bash
+timeout {self_destruct_timeout} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
 if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -qq --no-install-recommends g++; fi &&
-cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w &&
-cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
+if [ -n "$HB_MERGE_SHA" ]; then
+  cd / && git clone --depth 1 "$HB_REPO" /w &&
+  cd /w && git fetch --depth 1 origin "$HB_BRANCH" && git checkout "$HB_BRANCH"
+else
+  cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w && cd /w
+fi &&
 pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
-python -m pytest "$HB_TEST" --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
+python -m pytest $HB_TEST {pytest_args} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
 '
-sleep 3
-curl -s -X PUT "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
+sleep 120
+curl -s -X DELETE "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
   -H "Authorization: Bearer $CONTAINER_API_KEY" \\
-  -H "Content-Type: application/json" -d '{{"state": "stopped"}}' || true
-sleep 2
-kill 1 2>/dev/null || true
+  -H "Content-Type: application/json" || true
 """
 
 
@@ -102,12 +134,17 @@ def create_instance(offer_id, test_file):
     payload = {
         "client_id": "me",
         "image": IMAGE,
-        "disk": 16,
-        "onstart": ONSTART_SCRIPT,
+        "disk": PER_FILE_DISK.get(test_file, 16),
+        "onstart": ONSTART_SCRIPT.format(
+            self_destruct_timeout=_timeout_for_test(test_file),
+            pytest_args=f"-n {XDIST_GPU_TESTS[test_file]}" if test_file in XDIST_GPU_TESTS else "",
+        ),
         "env": {
             "HB_BRANCH": BRANCH,
+            "HB_MERGE_SHA": MERGE_SHA or "",
             "HB_REPO": REPO_URL,
             "HB_TEST": test_file,
+            **({"HB_REQUIRE_MULTIGPU": "1"} if test_file in MULTI_GPU_TESTS else {}),
         },
         "runtype": "ssh_direc ssh_proxy",
     }
@@ -155,13 +192,15 @@ def destroy(instance_id):
 
 def destroy_all(extra_ids=()):
     to_destroy = set(extra_ids)
-    to_destroy.update(get_instances())
-
     while to_destroy:
         for iid in to_destroy:
             destroy(iid)
         time.sleep(3)
-        to_destroy = set(get_instances())
+        to_destroy &= get_instances().keys()
+
+
+def teardown():
+    destroy_all(get_instances())
 
 
 def _instance_elapsed(inst):
@@ -171,12 +210,28 @@ def _instance_elapsed(inst):
     return 0
 
 
+def _real_pass(log):
+    # pytest -q prints "N passed" only when >=1 test actually ran and passed; an all-skipped or
+    # uncollected run ("N skipped", "no tests ran") also exits 0 but has no "passed", so exit code
+    # alone cannot certify a lane. A partial skip ("42 passed, 1 skipped") is still a real pass -- the
+    # fsdp2 bundle legitimately skips unexported-optimizer guard cases -- so gate on "passed" itself,
+    # not on the mere presence of a skip.
+    low = log.lower()
+    return "passed" in low and "no tests ran" not in low
+
+
 def _make_result(test_file, exit_code, inst, log):
     if exit_code is None:
         status, exit_code = "error", -1
     elif exit_code == 0:
         status = "pass"
     else:
+        status = "fail"
+    if (
+        status == "pass"
+        and (test_file in MULTI_GPU_TESTS or test_file in XDIST_GPU_TESTS)
+        and not _real_pass(log or "")
+    ):
         status = "fail"
     return {
         "file": test_file,
@@ -218,8 +273,9 @@ def _error_result(test_file, log=""):
 
 
 def _try_recycle(test_file, spare_offers, instance_map, created_at, pending):
-    while spare_offers:
-        offer = spare_offers.pop(0)
+    lane_spare_offers = spare_offers[_gpus_needed(test_file)]
+    while lane_spare_offers:
+        offer = lane_spare_offers.pop(0)
         try:
             new_iid = create_instance(offer["id"], test_file)
         except Exception:
@@ -245,10 +301,12 @@ def _recycle_or_fail(iid, test_file, reason, retries, spare_offers, instance_map
         _log("!", test_file, f"{reason}, {give_up}")
 
 
-def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
+def wait_and_collect(instance_map, spare_offers, timeout=None):
     results = {}
     pending = set(instance_map.keys())
     total = len(instance_map)
+    if timeout is None:
+        timeout = max((_timeout_for_test(test_file) for test_file in instance_map.values()), default=TIMEOUT)
     deadline = time.time() + timeout
     created_at = {iid: time.time() for iid in instance_map}
     retries = {}
@@ -325,39 +383,68 @@ def main():
     if not API_KEY:
         print("Set VASTAI_API_KEY or VAST_AI_API_KEY", file=sys.stderr)
         sys.exit(1)
-    test_files = sorted(glob.glob("test/test_*.py"))
+    instance_map = {}
+
+    def cleanup_on_signal(signum, _frame):
+        print("\nCleaning up after signal...")
+        destroy_all(instance_map)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, cleanup_on_signal)
+    signal.signal(signal.SIGINT, cleanup_on_signal)
+    test_files = [f for f in sorted(glob.glob("test/test_*.py")) if "test_fsdp2_" not in f]
+    test_files.append(FSDP2_BUNDLE)
     if not test_files:
         print("No test files found", file=sys.stderr)
         sys.exit(1)
     print(f"Found {len(test_files)} test files")
 
-    all_offers = find_offers(len(test_files))
-    offers = all_offers[: len(test_files)]
-    spare_offers = list(all_offers[len(test_files) :])
-    if len(offers) < len(test_files):
-        print(f"Warning: only {len(offers)} offers for {len(test_files)} tests, some skipped")
-        test_files = test_files[: len(offers)]
-    print(f"{len(offers)} primary, {len(spare_offers)} spare offers")
+    multi_gpu_test_files = [test_file for test_file in test_files if _gpus_needed(test_file) > 1]
+    single_gpu_test_files = [test_file for test_file in test_files if _gpus_needed(test_file) == 1]
+    lanes = {1: single_gpu_test_files}
+    for test_file in multi_gpu_test_files:
+        lanes.setdefault(_gpus_needed(test_file), []).append(test_file)
 
-    instance_map = {}
+    assignments = []
+    spare_offers = {}
+    results = []
+    for num_gpus, lane_test_files in lanes.items():
+        if not lane_test_files:
+            continue
+        if num_gpus == 1:
+            all_offers = find_offers(len(lane_test_files))
+        else:
+            all_offers = find_offers(
+                len(lane_test_files), num_gpus=num_gpus, max_dph=MAX_DPH * num_gpus * 2
+            )
+        offers = all_offers[: len(lane_test_files)]
+        spare_offers[num_gpus] = list(all_offers[len(lane_test_files) :])
+        results.extend(
+            _error_result(test_file, "No matching GPU offer") for test_file in lane_test_files[len(offers) :]
+        )
+        if len(offers) < len(lane_test_files):
+            print(f"Error: only {len(offers)} offers for {len(lane_test_files)} tests", file=sys.stderr)
+            lane_test_files = lane_test_files[: len(offers)]
+        print(f"{len(offers)} primary, {len(spare_offers[num_gpus])} spare offers")
+        assignments.extend(zip(lane_test_files, offers))
+
     try:
-        for test_file, offer in zip(test_files, offers):
+        for test_file, offer in assignments:
             try:
                 iid = create_instance(offer["id"], test_file)
             except Exception as e:
                 print(f"  Failed to create for {test_file}: {e}")
+                results.append(_error_result(test_file, str(e)))
                 continue
             if iid:
                 instance_map[iid] = test_file
             else:
                 print(f"  Failed to create for {test_file}")
+                results.append(_error_result(test_file, "Instance creation failed"))
 
-        if not instance_map:
-            print("No instances created", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"\nWaiting for {len(instance_map)} instances (timeout={TIMEOUT}s)...")
-        results = wait_and_collect(instance_map, spare_offers)
+        if instance_map:
+            print(f"\nWaiting for {len(instance_map)} instances (timeout={TIMEOUT}s)...")
+            results.extend(wait_and_collect(instance_map, spare_offers))
     finally:
         print("\nCleaning up...")
         destroy_all(instance_map)
@@ -376,4 +463,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["teardown"]:
+        teardown()
+    else:
+        main()
