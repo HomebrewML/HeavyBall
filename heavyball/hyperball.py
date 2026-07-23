@@ -21,14 +21,6 @@ def _stable_l2_components(value: Tensor) -> tuple[Tensor, Tensor]:
     return scale, norm
 
 
-def _stable_l2_normalize(value: Tensor, *, eps: float) -> Tensor:
-    """Normalize each slab leaf through the shared stable-L2 primitive."""
-
-    value = _wide(value)
-    flat = value.reshape(value.shape[0], -1)
-    return stable_l2_normalize(flat, dim=1, eps=eps).reshape_as(value)
-
-
 def _initial_norm(value: Tensor) -> Tensor:
     scale, norm = _stable_l2_components(value)
     return torch.cat((scale.unsqueeze(1), norm.unsqueeze(1)), dim=1)
@@ -74,10 +66,15 @@ def hyperball_commit(param: Tensor, update: Tensor, state: dict[str, Tensor], te
     norm_scale, scaled_norm = _unpack_init_norm(init_norm)
     step_scale = broadcast_leaf((lr * scaled_norm) * norm_scale, param)
     radius = broadcast_leaf(scaled_norm * norm_scale, param)
-    candidate_param = param - _stable_l2_normalize(update, eps=torch.finfo(update.dtype).tiny) * step_scale
-    candidate_param = _stable_l2_normalize(
-        candidate_param, eps=torch.finfo(candidate_param.dtype).tiny
-    ) * radius
+    normalized_update = stable_l2_normalize(
+        update.reshape(update.shape[0], -1), dim=1, eps=torch.finfo(update.dtype).tiny
+    ).reshape_as(update)
+    candidate_param = param - normalized_update * step_scale
+    candidate_param = stable_l2_normalize(
+        candidate_param.reshape(candidate_param.shape[0], -1),
+        dim=1,
+        eps=torch.finfo(candidate_param.dtype).tiny,
+    ).reshape_as(candidate_param) * radius
     return candidate_param, {"init_norm": init_norm, "seen": torch.ones_like(seen)}
 
 

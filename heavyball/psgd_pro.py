@@ -10,8 +10,6 @@ from torch import Tensor
 
 from .core import Recipe
 from .kron import (
-    _balance_mixed_q,
-    _balance_q,
     _max_singular_value_power_iter,
     _next_lower_bound,
     _precondition,
@@ -19,7 +17,7 @@ from .kron import (
     psgd_kron_init,
 )
 from .matrix import merge_matrix_transform
-from .numerics import _wide, broadcast_leaf
+from .numerics import _wide, balance_factors, broadcast_leaf
 from .transforms import WHOLE, Tempo, sgd_commit
 
 
@@ -115,7 +113,7 @@ def _refresh_q(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Run legacy's stochastic PRO Q update for a full two-factor slab."""
 
-    q0, q1 = _balance_q(q0, q1)
+    q0, q1 = balance_factors([q0, q1])
     damping = tempo.hyper.dampening + torch.finfo(update.dtype).eps * update.abs()
     probe = tempo.randn_like(update)
     preconditioned = _precondition(update + damping * probe, q0, q1)
@@ -153,7 +151,7 @@ def _refresh_mixed_q(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Run legacy's stochastic PRO Q update with at least one diagonal factor."""
 
-    q0, q1 = _balance_mixed_q(q0, q1)
+    q0, q1 = balance_factors([q0, q1])
     damping = tempo.hyper.dampening + torch.finfo(update.dtype).eps * update.abs()
     probe = tempo.randn_like(update)
     preconditioned = _precondition_mixed(update + damping * probe, q0, q1)
@@ -238,24 +236,7 @@ def _partial_contraction_nfactor(update: Tensor, index: int, triangular: bool) -
 
 
 def _balance_nfactor(factors: list[Tensor]) -> list[Tensor]:
-    logs = []
-    for factor in factors:
-        logs.append(factor.abs().amax(dim=tuple(range(1, factor.ndim))).log())
-    mean_log = logs[0]
-    for log in logs[1:]:
-        mean_log = mean_log + log
-    mean_log = mean_log / len(logs)
-
-    scales = []
-    valid = torch.ones_like(mean_log, dtype=torch.bool)
-    for log in logs:
-        scale = (mean_log - log).exp()
-        scales.append(scale)
-        valid = valid & torch.isfinite(scale) & (scale > 0)
-    return [
-        factor * broadcast_leaf(torch.where(valid, scale, torch.ones_like(scale)), factor)
-        for factor, scale in zip(factors, scales, strict=True)
-    ]
+    return balance_factors(factors)
 
 
 def _refresh_nfactor(

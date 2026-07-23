@@ -10,14 +10,8 @@ from torch import Tensor
 
 from .core import Recipe, RefreshCadence
 from .matrix import merge_matrix_transform, merged_matrix_shape
-from .numerics import _wide, broadcast_leaf, stable_l2_normalize
+from .numerics import _wide, balance_factors, broadcast_leaf, stable_l2_normalize
 from .transforms import WHOLE, Tempo, sgd_commit
-
-
-def _stable_l2_normalize(value: Tensor, *, dim: int) -> Tensor:
-    """Normalize through the shared no-epsilon stable-L2 primitive."""
-
-    return stable_l2_normalize(value, dim=dim, eps=None)
 
 
 def _max_singular_value_power_iter(value: Tensor, power_iterations: int) -> Tensor:
@@ -28,7 +22,7 @@ def _max_singular_value_power_iter(value: Tensor, power_iterations: int) -> Tens
     count = min(2, value.shape[-2])
     indices = scaled.norm(dim=-1).topk(count, dim=-1).indices
     vectors = scaled.gather(-2, indices.unsqueeze(-1).expand(-1, -1, value.shape[-1]))
-    vectors = _stable_l2_normalize(vectors, dim=-1)
+    vectors = stable_l2_normalize(vectors, dim=-1, eps=None)
     # The compiled loop requires its carried vector layout to remain stable.
     vectors = vectors.mT.contiguous().mT
     transpose = scaled.mH.contiguous()
@@ -37,7 +31,7 @@ def _max_singular_value_power_iter(value: Tensor, power_iterations: int) -> Tens
         return (transpose @ (scaled @ vector.mT)).mT
 
     for _ in range(power_iterations):
-        vectors = _stable_l2_normalize(multiply(vectors), dim=-1)
+        vectors = stable_l2_normalize(multiply(vectors), dim=-1, eps=None)
     return (vectors.conj() * multiply(vectors)).sum(dim=-1).real.clamp_min(0).sqrt().amax(dim=-1) * scale
 
 
@@ -61,31 +55,15 @@ def _next_lower_bound(ell: Tensor, lower_bound: Tensor, beta: Tensor) -> tuple[T
 def _balance_q(q0: Tensor, q1: Tensor) -> tuple[Tensor, Tensor]:
     """Balance the two factor maxima exactly as PSGD's full-Q path does."""
 
-    log0 = q0.abs().amax(dim=(-2, -1)).log()
-    log1 = q1.abs().amax(dim=(-2, -1)).log()
-    mean_log = (log0 + log1) * 0.5
-    scale0 = (mean_log - log0).exp()
-    scale1 = (mean_log - log1).exp()
-    valid = torch.isfinite(scale0) & torch.isfinite(scale1) & (scale0 > 0) & (scale1 > 0)
-    scale0 = torch.where(valid, scale0, torch.ones_like(scale0))
-    scale1 = torch.where(valid, scale1, torch.ones_like(scale1))
-    return q0 * broadcast_leaf(scale0, q0), q1 * broadcast_leaf(scale1, q1)
+    q0, q1 = balance_factors([q0, q1])
+    return q0, q1
 
 
 def _balance_mixed_q(q0: Tensor, q1: Tensor) -> tuple[Tensor, Tensor]:
     """Balance factors whose state shapes encode diagonal/triangular topology."""
 
-    dims0 = tuple(range(1, q0.ndim))
-    dims1 = tuple(range(1, q1.ndim))
-    log0 = q0.abs().amax(dim=dims0).log()
-    log1 = q1.abs().amax(dim=dims1).log()
-    mean_log = (log0 + log1) * 0.5
-    scale0 = (mean_log - log0).exp()
-    scale1 = (mean_log - log1).exp()
-    valid = torch.isfinite(scale0) & torch.isfinite(scale1) & (scale0 > 0) & (scale1 > 0)
-    scale0 = torch.where(valid, scale0, torch.ones_like(scale0))
-    scale1 = torch.where(valid, scale1, torch.ones_like(scale1))
-    return q0 * broadcast_leaf(scale0, q0), q1 * broadcast_leaf(scale1, q1)
+    q0, q1 = balance_factors([q0, q1])
+    return q0, q1
 
 
 def _calc_a_and_conjb(hessian_vector: Tensor, q0: Tensor, q1: Tensor, vector: Tensor) -> tuple[Tensor, Tensor]:

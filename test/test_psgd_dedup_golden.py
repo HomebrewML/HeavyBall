@@ -1,0 +1,96 @@
+"""Bit-exact fp32 trajectories for the shared PSGD numerics refactor."""
+
+import math
+from unittest.mock import patch
+
+import pytest
+import torch
+
+import heavyball
+
+
+_CASES = {
+    "PSGDKron": ((3, 4), {"max_size_triangular": 8}),
+    "PSGDPro": ((5, 3), {"max_size_triangular": 3}),
+    "QSGD": ((3, 4), {"max_size_triangular": 8}),
+    "PSGDNfactor": ((2, 3, 5), {"max_size_triangular": 3}),
+    "PSGDLRA": ((3, 4), {"rank": 2}),
+    "LATHER": ((5, 3), {"max_size_triangular": 3}),
+}
+
+_GOLDEN_BITS = {
+    "PSGDKron": [
+        -1092879416, -1094869292, -1096775179, -1098689804,
+        -1102317738, -1106053358, -1115819592, -1138208593,
+        1035858912, 1040344125, 1042625653, 1049047592,
+    ],
+    "PSGDPro": [
+        -1092874278, -1094942309, -1096811988, -1098586983,
+        -1102207825, -1105577288, -1116689958, -1135623591,
+        1037428563, 1040405063, 1042133266, 1049198129,
+        1049949101, 1052960492, 1054851688,
+    ],
+    "QSGD": [
+        -1092906687, -1094876858, -1096775196, -1098672988,
+        -1102380362, -1106018943, -1115554998, -1139132950,
+        1036037094, 1040356294, 1042680870, 1049043093,
+    ],
+    "PSGDNfactor": [
+        -1092913272, -1094968049, -1096779072, -1098561092,
+        -1102134043, -1105441153, -1116594520, -1131517662,
+        1037866754, 1040444653, 1041791807, 1049282674,
+        1049823570, 1052992626, 1054892029, 1056453414,
+        1058147836, 1059500231, 1060537382, 1060922130,
+        1061921241, 1062854476, 1065116910, 1065427332,
+        1065939892, 1066392333, 1066839103, 1067335081,
+        1067740486, 1068523906,
+    ],
+    "PSGDLRA": [
+        -1092953671, -1094792691, -1096774985, -1098716177,
+        -1102562129, -1106466749, -1115815983, -1147849760,
+        1034975707, 1040278623, 1043018454, 1048952586,
+    ],
+    "LATHER": [
+        -1094604640, -1095265291, -1096931482, -1098119582,
+        -1099778851, -1105631667, -1111463302, 1016266412,
+        1038482780, 1041339899, 1043303772, 1048758466,
+        1050117318, 1052070379, 1053785266,
+    ],
+}
+
+
+def _fixed_values(shape: tuple[int, ...]) -> torch.Tensor:
+    values = torch.arange(math.prod(shape), dtype=torch.float32)
+    return ((values - 7) / 16).reshape(shape)
+
+
+def _fixed_gradient(shape: tuple[int, ...], step: int) -> torch.Tensor:
+    indices = torch.arange(math.prod(shape), dtype=torch.int64)
+    values = (((indices + 1) * (step + 3) + step * step) % 23) - 11
+    return (values.to(torch.float32) / 16).reshape(shape)
+
+
+@pytest.mark.parametrize("optimizer_name", _CASES)
+def test_psgd_fp32_golden_trajectory(optimizer_name: str):
+    shape, options = _CASES[optimizer_name]
+    torch.manual_seed(20260722)
+    param = torch.nn.Parameter(_fixed_values(shape))
+    hyper = {
+        "lr": 0.0125,
+        "preconditioner_update_probability": 1.0,
+        "precond_lr": 0.05,
+        "dampening": 1e-6,
+        "weight_decay": 0.0,
+        "storage_dtype": None,
+        "ecc": None,
+        **options,
+    }
+    with patch("heavyball.core.torch.compile", lambda function, **_kwargs: function):
+        optimizer = getattr(heavyball, optimizer_name)([param], **hyper)
+
+    for step in range(8):
+        param.grad.copy_(_fixed_gradient(shape, step))
+        optimizer.step()
+
+    expected = torch.tensor(_GOLDEN_BITS[optimizer_name], dtype=torch.int32).reshape(shape).view(torch.float32)
+    assert torch.equal(param.detach(), expected)

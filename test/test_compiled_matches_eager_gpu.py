@@ -31,7 +31,7 @@ assert len(OPTIMIZERS) >= 43, f"optimizer feature matrix unexpectedly shrank: {l
 # converge -- not a bug). Measured rel at 12 steps on RTX 5060 Ti: SpEL 3.4e-2, PolarGrad 9.2e-3, AdaMuon 4.8e-3,
 # Aurora 3.7e-3, NorMuon 3.4e-3, Muon 2.8e-3, KLSOAP 2.6e-3, MuonLaProp 1.1e-3, Scion 1.6e-4. The other 34 facades
 # are ~1e-7.
-_DIVERGENT = {"AdaMuon", "Aurora", "KLSOAP", "Muon", "MuonLaProp", "NorMuon", "PolarGrad", "Scion", "SpEL"}
+_DIVERGENT = {"AdaMuon", "Aurora", "HeavyKLSOAP", "KLSOAP", "Muon", "MuonLaProp", "NorMuon", "PolarGrad", "Scion", "SpEL"}
 
 
 def run(name, eager):

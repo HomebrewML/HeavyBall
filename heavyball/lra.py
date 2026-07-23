@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 from .core import Recipe, RefreshCadence
-from .numerics import _wide, broadcast_leaf
+from .numerics import _wide, balance_factors, broadcast_leaf
 from .transforms import Tempo, sgd_commit
 
 
@@ -28,15 +28,8 @@ def _lra_precond(update_flat: Tensor, U: Tensor, V: Tensor, d: Tensor) -> Tensor
 def _balance_lra(U: Tensor, V: Tensor) -> tuple[Tensor, Tensor]:
     """Balance the low-rank factor maxima without changing their product."""
 
-    log_u = U.abs().amax(dim=(-2, -1)).log()
-    log_v = V.abs().amax(dim=(-2, -1)).log()
-    mean_log = (log_u + log_v) * 0.5
-    scale_u = (mean_log - log_u).exp()
-    scale_v = (mean_log - log_v).exp()
-    valid = torch.isfinite(scale_u) & torch.isfinite(scale_v) & (scale_u > 0) & (scale_v > 0)
-    scale_u = torch.where(valid, scale_u, torch.ones_like(scale_u))
-    scale_v = torch.where(valid, scale_v, torch.ones_like(scale_v))
-    return U * broadcast_leaf(scale_u, U), V * broadcast_leaf(scale_v, V)
+    U, V = balance_factors([U, V])
+    return U, V
 
 
 def _mv(matrix: Tensor, vector: Tensor) -> Tensor:

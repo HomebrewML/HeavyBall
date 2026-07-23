@@ -48,8 +48,20 @@ def _detect_repo_and_branch():
 
 REPO_URL, BRANCH, MERGE_SHA = _detect_repo_and_branch()
 TIMEOUT = 1800
-PER_FILE_TIMEOUT = {"test/test_feature_matrix.py": 14400}
-PER_FILE_DISK = {"test/test_feature_matrix.py": 48}
+FEATURE_MATRIX_BENCHMARK = "benchmarks/feature_matrix.py"
+FEATURE_MATRIX_GPUS = 8
+FEATURE_MATRIX_REMOTE_ARTIFACT = "/w/feature-matrix.jsonl"
+FEATURE_MATRIX_ARTIFACT = "feature-matrix.jsonl"
+FEATURE_MATRIX_ARTIFACT_BEGIN = "HEAVYBALL_FEATURE_MATRIX_JSONL_BEGIN"
+FEATURE_MATRIX_ARTIFACT_END = "HEAVYBALL_FEATURE_MATRIX_JSONL_END"
+PER_FILE_TIMEOUT = {
+    "test/test_feature_matrix.py": 14400,
+    FEATURE_MATRIX_BENCHMARK: 14400,
+}
+PER_FILE_DISK = {
+    "test/test_feature_matrix.py": 48,
+    FEATURE_MATRIX_BENCHMARK: 48,
+}
 POLL_INTERVAL = 5
 MAX_DPH = 0.20
 STUCK_TIMEOUT = 30
@@ -60,7 +72,10 @@ MAX_RETRIES = 3
 # HB_TEST is a glob the onstart shell expands; multigpu_matrix (in the bundle) carries the
 # HB_REQUIRE_MULTIGPU fail-closed guard.
 FSDP2_BUNDLE = "test/test_fsdp2_*.py"
-MULTI_GPU_TESTS = {FSDP2_BUNDLE: 4}
+MULTI_GPU_TESTS = {
+    FSDP2_BUNDLE: 4,
+    FEATURE_MATRIX_BENCHMARK: FEATURE_MATRIX_GPUS,
+}
 XDIST_GPU_TESTS = {"test/test_feature_matrix.py": 8, "test/test_compiled_matches_eager_gpu.py": 8}
 
 
@@ -110,6 +125,29 @@ def _timeout_for_test(test_file):
     return PER_FILE_TIMEOUT.get(test_file, SELF_DESTRUCT_TIMEOUT)
 
 
+def _command_for_test(test_file):
+    if test_file == FEATURE_MATRIX_BENCHMARK:
+        return (
+            f"python {FEATURE_MATRIX_BENCHMARK} "
+            f"--gpus {_gpus_needed(test_file)} "
+            f"--measure {FEATURE_MATRIX_REMOTE_ARTIFACT} && "
+            f"python {FEATURE_MATRIX_BENCHMARK} "
+            f"--render {FEATURE_MATRIX_REMOTE_ARTIFACT} --update-readme README.md"
+        )
+    pytest_args = f"-n {XDIST_GPU_TESTS[test_file]}" if test_file in XDIST_GPU_TESTS else ""
+    return f"python -m pytest $HB_TEST {pytest_args} --tb=short -q"
+
+
+def _artifact_capture_for_test(test_file):
+    if test_file != FEATURE_MATRIX_BENCHMARK:
+        return ""
+    return f"""if [ -f {FEATURE_MATRIX_REMOTE_ARTIFACT} ]; then
+  echo {FEATURE_MATRIX_ARTIFACT_BEGIN}
+  cat {FEATURE_MATRIX_REMOTE_ARTIFACT}
+  echo {FEATURE_MATRIX_ARTIFACT_END}
+fi"""
+
+
 ONSTART_SCRIPT = """#!/bin/bash
 timeout {self_destruct_timeout} bash -c '
 export PIP_BREAK_SYSTEM_PACKAGES=1 &&
@@ -121,7 +159,10 @@ else
   cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w && cd /w
 fi &&
 pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
-python -m pytest $HB_TEST {pytest_args} --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
+{test_command} 2>&1
+HB_EXIT=$?
+{artifact_capture}
+echo HEAVYBALL_EXIT=$HB_EXIT
 '
 sleep 120
 curl -s -X DELETE "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
@@ -137,14 +178,15 @@ def create_instance(offer_id, test_file):
         "disk": PER_FILE_DISK.get(test_file, 16),
         "onstart": ONSTART_SCRIPT.format(
             self_destruct_timeout=_timeout_for_test(test_file),
-            pytest_args=f"-n {XDIST_GPU_TESTS[test_file]}" if test_file in XDIST_GPU_TESTS else "",
+            test_command=_command_for_test(test_file),
+            artifact_capture=_artifact_capture_for_test(test_file),
         ),
         "env": {
             "HB_BRANCH": BRANCH,
             "HB_MERGE_SHA": MERGE_SHA or "",
             "HB_REPO": REPO_URL,
             "HB_TEST": test_file,
-            **({"HB_REQUIRE_MULTIGPU": "1"} if test_file in MULTI_GPU_TESTS else {}),
+            **({"HB_REQUIRE_MULTIGPU": "1"} if test_file == FSDP2_BUNDLE else {}),
         },
         "runtype": "ssh_direc ssh_proxy",
     }
@@ -229,6 +271,7 @@ def _make_result(test_file, exit_code, inst, log):
         status = "fail"
     if (
         status == "pass"
+        and test_file != FEATURE_MATRIX_BENCHMARK
         and (test_file in MULTI_GPU_TESTS or test_file in XDIST_GPU_TESTS)
         and not _real_pass(log or "")
     ):
@@ -247,6 +290,36 @@ def parse_exit_code(log):
         if line.startswith("HEAVYBALL_EXIT="):
             return int(line.split("=")[1])
     return None
+
+
+def _feature_matrix_artifact(log):
+    lines = log.splitlines()
+    try:
+        start = lines.index(FEATURE_MATRIX_ARTIFACT_BEGIN)
+        end = lines.index(FEATURE_MATRIX_ARTIFACT_END, start + 1)
+    except ValueError:
+        return None, "feature-matrix JSONL artifact markers were not found"
+
+    payload_lines = [line for line in lines[start + 1 : end] if line.strip()]
+    if not payload_lines:
+        return None, "feature-matrix JSONL artifact was empty"
+    try:
+        for line in payload_lines:
+            json.loads(line)
+    except json.JSONDecodeError as error:
+        return None, f"feature-matrix JSONL artifact was invalid: {error}"
+    return "\n".join(payload_lines) + "\n", None
+
+
+def _capture_artifact(test_file, log):
+    if test_file != FEATURE_MATRIX_BENCHMARK:
+        return None, None
+    payload, error = _feature_matrix_artifact(log)
+    if error is not None:
+        return None, error
+    with open(FEATURE_MATRIX_ARTIFACT, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    return FEATURE_MATRIX_ARTIFACT, None
 
 
 _ICONS = {"pass": "+", "fail": "-", "error": "!", "timeout": "?"}
@@ -354,6 +427,14 @@ def wait_and_collect(instance_map, spare_offers, timeout=None):
             ec = parse_exit_code(log)
             if done or ec is not None:
                 result = _make_result(instance_map[iid], ec, inst, log)
+                artifact, artifact_error = _capture_artifact(instance_map[iid], log)
+                if artifact is not None:
+                    result["artifact"] = artifact
+                elif artifact_error is not None:
+                    result["status"] = "fail"
+                    if result["exit_code"] == 0:
+                        result["exit_code"] = -1
+                    result["log"] = f"{result['log']}\n{artifact_error}".strip()
                 results[iid] = result
                 pending.discard(iid)
                 destroy(iid)
@@ -394,6 +475,7 @@ def main():
     signal.signal(signal.SIGINT, cleanup_on_signal)
     test_files = [f for f in sorted(glob.glob("test/test_*.py")) if "test_fsdp2_" not in f]
     test_files.append(FSDP2_BUNDLE)
+    test_files.append(FEATURE_MATRIX_BENCHMARK)
     if not test_files:
         print("No test files found", file=sys.stderr)
         sys.exit(1)

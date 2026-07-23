@@ -24,6 +24,29 @@ def broadcast_leaf(scalar: Tensor, target: Tensor) -> Tensor:
     return scalar.reshape((scalar.shape[0],) + (1,) * (target.ndim - 1))
 
 
+def balance_factors(factors: list[Tensor]) -> list[Tensor]:
+    """Equalize factor log-magnitudes without changing their joint scale."""
+
+    logs = []
+    for factor in factors:
+        logs.append(factor.abs().amax(dim=tuple(range(1, factor.ndim))).log())
+    mean_log = logs[0]
+    for log in logs[1:]:
+        mean_log = mean_log + log
+    mean_log = mean_log * 0.5 if len(logs) == 2 else mean_log / len(logs)
+
+    scales = []
+    valid = torch.ones_like(mean_log, dtype=torch.bool)
+    for log in logs:
+        scale = (mean_log - log).exp()
+        scales.append(scale)
+        valid = valid & torch.isfinite(scale) & (scale > 0)
+    return [
+        factor * broadcast_leaf(torch.where(valid, scale, torch.ones_like(scale)), factor)
+        for factor, scale in zip(factors, scales, strict=True)
+    ]
+
+
 def _strictly_aligned(left: Tensor, right: Tensor) -> Tensor:
     return ((left > 0) & (right > 0)) | ((left < 0) & (right < 0))
 
