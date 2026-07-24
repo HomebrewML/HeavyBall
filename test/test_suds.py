@@ -4,29 +4,14 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
 
-import heavyball
-import heavyball_legacy
 from heavyball import Engine, suds, suds_adamw
 from heavyball.suds import eigvecs_product_rank1, oja_update, stable_l2_normalize
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield
-    finally:
-        legacy.compile_mode = previous
 
 
 def _copy_grads(params, gradients) -> None:
@@ -34,77 +19,72 @@ def _copy_grads(params, gradients) -> None:
         parameter.grad.copy_(gradient)
 
 
-@pytest.mark.xfail(
-    reason="slab-native SUDS now transports Adam moments across Householder basis changes; "
-    "legacy omits this transport, so parity is intentionally broken (see test_suds_transport.py)",
-    strict=True,
-)
 @pytest.mark.parametrize(
-    ("dtype", "rtol", "atol", "storage_dtype"),
+    ("dtype", "rtol", "atol"),
     (
-        (torch.float64, 1e-10, 1e-10, "float64"),
-        (torch.float32, 2e-5, 2e-5, "float32"),
+        (torch.float64, 1e-11, 1e-11),
+        (torch.float32, 2e-5, 2e-5),
     ),
 )
-def test_suds_matches_legacy(dtype, rtol, atol, storage_dtype):
-    """Every parameter delta directly matches legacy ``SUDSAdamW`` step by step."""
+@pytest.mark.parametrize("shape", ((3, 4), (4,), ()))
+def test_suds_bootstrap_and_second_step_follow_householder_adam_math(dtype, rtol, atol, shape):
+    """Recompute the bootstrap, Householder direction, and Oja state without an optimizer oracle."""
 
-    torch._dynamo.reset()
-    torch.manual_seed(101)
-    values = dict(
-        lr=0.017,
-        beta1=0.87,
-        beta2=0.97,
-        eps=1e-8,
-        weight_decay=0.031,
-        precond_lr=0.13,
+    torch.manual_seed(101 + len(shape))
+    lr, eps, precond_lr = 0.017, 1e-8, 0.13
+    parameter = torch.nn.Parameter(torch.randn(shape, dtype=dtype))
+    initial = parameter.detach().clone()
+    first_gradient = torch.randn_like(parameter)
+    second_gradient = torch.randn_like(parameter)
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
+        optimizer = Engine(
+            [parameter],
+            suds_adamw,
+            lr=lr,
+            beta1=0.87,
+            beta2=0.97,
+            eps=eps,
+            weight_decay=0.0,
+            precond_lr=precond_lr,
+        )
+    state = optimizer.groups[0].states[0]
+
+    parameter.grad.copy_(first_gradient)
+    optimizer.step()
+    torch.testing.assert_close(parameter, initial, rtol=0, atol=0)
+    fisher = first_gradient.reshape(1, -1)
+    fisher = fisher / torch.linalg.vector_norm(fisher, dim=1, keepdim=True)
+    torch.testing.assert_close(state["fisher_approx"].reshape(1, -1), fisher, rtol=rtol, atol=atol)
+    assert state["seen"].all()
+    assert torch.count_nonzero(state["exp_avg"]) == 0
+    assert torch.count_nonzero(state["exp_avg_sq"]) == 0
+
+    e1 = torch.zeros_like(fisher)
+    e1[:, 0] = 1
+    w = e1 - fisher
+    w_norm = torch.linalg.vector_norm(w, dim=1, keepdim=True)
+    w = torch.where(w_norm >= 1e-12, w / w_norm.clamp_min(1e-12), torch.zeros_like(w))
+    identity = torch.eye(fisher.shape[1], dtype=dtype).unsqueeze(0)
+    reflector = identity - 2 * w.unsqueeze(-1) * w.unsqueeze(-2)
+    flat_gradient = second_gradient.reshape(1, -1)
+    rotated = torch.bmm(flat_gradient.unsqueeze(1), reflector).squeeze(1)
+    adam_direction = rotated / rotated.abs().clamp_min(eps**0.5)
+    expected_direction = torch.bmm(adam_direction.unsqueeze(1), reflector).squeeze(1).reshape(shape)
+    projection = (flat_gradient * fisher).sum(dim=1, keepdim=True)
+    next_fisher = fisher + precond_lr * projection * (flat_gradient - projection * fisher)
+    next_fisher = next_fisher / torch.linalg.vector_norm(next_fisher, dim=1, keepdim=True)
+
+    before = parameter.detach().clone()
+    parameter.grad.copy_(second_gradient)
+    optimizer.step()
+
+    torch.testing.assert_close((before - parameter) / lr, expected_direction, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        state["fisher_approx"].reshape(1, -1),
+        next_fisher,
+        rtol=rtol,
+        atol=atol,
     )
-    initial = [torch.randn(3, 4, dtype=dtype), torch.randn(3, 4, dtype=dtype), torch.randn((), dtype=dtype)]
-    gradients = [[torch.randn_like(value) for value in initial] for _ in range(9)]
-    params = [torch.nn.Parameter(value.clone()) for value in initial]
-    legacy_params = [torch.nn.Parameter(value.clone()) for value in initial]
-    try:
-        optimizer = Engine(params, suds_adamw, **values)
-        with _legacy_eager():
-            legacy_optimizer = heavyball_legacy.SUDSAdamW(
-                legacy_params,
-                lr=values["lr"],
-                betas=(values["beta1"], values["beta2"]),
-                eps=values["eps"],
-                weight_decay=values["weight_decay"],
-                precond_lr=values["precond_lr"],
-                storage_dtype=storage_dtype,
-                compile_step=False,
-            )
-            for step, step_gradients in enumerate(gradients, start=1):
-                before = [parameter.detach().clone() for parameter in params]
-                legacy_before = [parameter.detach().clone() for parameter in legacy_params]
-                _copy_grads(params, step_gradients)
-                for parameter, gradient in zip(legacy_params, step_gradients, strict=True):
-                    parameter.grad = gradient.clone()
-
-                optimizer.step()
-                legacy_optimizer.step()
-
-                for index, (parameter, legacy_parameter, prior, legacy_prior) in enumerate(
-                    zip(params, legacy_params, before, legacy_before, strict=True)
-                ):
-                    torch.testing.assert_close(
-                        prior - parameter,
-                        legacy_prior - legacy_parameter,
-                        rtol=rtol,
-                        atol=atol,
-                        msg=f"step {step}, parameter delta {index}",
-                    )
-                    torch.testing.assert_close(
-                        parameter,
-                        legacy_parameter,
-                        rtol=rtol,
-                        atol=atol,
-                        msg=f"step {step}, parameter {index}",
-                    )
-    finally:
-        torch._dynamo.reset()
 
 
 def _trajectory(dtype: torch.dtype, gradients, *, compiled: bool):
@@ -195,7 +175,7 @@ for _ in range(3):
 
 
 def test_suds_fullgraph_clean(tmp_path):
-    """SUDS compiles as a scalar-free full graph and has no legacy dependency."""
+    """SUDS compiles as a scalar-free full graph."""
 
     artifact = _compiled_code(tmp_path).lower()
     for forbidden in (".item(", "while_loop", "torch.cond", "cond", "torch.stack", "stack", "_local_scalar_dense"):
@@ -206,17 +186,14 @@ def test_suds_fullgraph_clean(tmp_path):
         source = Path(__file__).parents[1] / "heavyball" / "suds.py"
     text = source.read_text()
     assert not re.search(r"_foreach|vmap|torch\.cond|while_loop|dynamic=True|torch\.stack|\.item\(|autocast", text)
-    assert "heavyball_legacy.utils" not in text
-    assert "heavyball_legacy.chainable" not in text
 
 
 def test_suds_oja_update_converges_to_the_top_eigenvector():
     """SUDS learns its rank-1 Fisher direction by an Oja power-iteration step (oja_update advances
     state['fisher_approx'] every step). Its defining property: fed a gradient stream whose covariance has a
     dominant direction u (cov = I + 20 uu^T, eigen-gap 21:1), the iterate converges to +-u. Checked against
-    a hand-constructed top eigenvector -- independent of legacy AND of the shipped step. The isotropic
-    control (no dominant direction) must NOT converge to u, so the alignment is the learned signal, not an
-    artifact. test_suds_matches_legacy pins this learning only against a second HeavyBall implementation."""
+    a hand-constructed top eigenvector. The isotropic control (no dominant direction) must NOT converge
+    to u, so the alignment is the learned signal, not an artifact."""
 
     dimension = 8
     torch.manual_seed(0)

@@ -3,7 +3,6 @@ import torch
 
 import heavyball
 
-
 _STEPS = 8
 _FACADES = (heavyball.AdamW, heavyball.SOAP, heavyball.PSGDKron, heavyball.KLSOAP)
 _ALL_FACADES = tuple(

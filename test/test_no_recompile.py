@@ -6,11 +6,10 @@ existing coverage runs each normal and refresh step type only once.
 
 import pytest
 import torch
-import torch.nn as nn
 import torch._dynamo
+import torch.nn as nn
 
 import heavyball
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="compile-first GPU path"

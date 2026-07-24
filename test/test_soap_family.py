@@ -1,13 +1,11 @@
 from unittest.mock import patch
 
 import pytest
+import reference
 import torch
 
 from heavyball.core import build
 from heavyball.matrix import soap_ademamix_recipe, soap_nadam_recipe, soap_recipe, solp_recipe
-
-import reference
-
 
 _BASE_HYPER = dict(
     lr=1e-2,

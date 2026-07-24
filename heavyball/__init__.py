@@ -1,7 +1,7 @@
 """HeavyBall: a compile-first PyTorch optimizer library.
 
 Each optimizer compiles to a single ``torch.compile(fullgraph=True)`` graph over slab-batched
-state. Construct one like any ``torch.optim`` optimizer::
+state. Construct one through its ``torch.optim.Optimizer``-style facade::
 
     optimizer = heavyball.AdamW(model.parameters(), lr=1e-3)
 
@@ -439,13 +439,14 @@ from .optim import (  # noqa: E402
     WhitenAdamW,
     Whitening,
 )
+from .registry import describe, estimate_state_bytes, list_optimizers  # noqa: E402
 
 __all__ = [
     "ADOPT", "AdEMAMix", "AdaMuon", "AdamC", "AdamW", "Aurora", "CautiousAdamW", "HeavyBallOptimizer", "HeavyKLSOAP", "HeavyKLShampoo", "HeavySOAP", "HeavySOAPAdEMAMix", "HeavySOAPNAdam", "HeavySOLP", "HyperBallAdamW", "KLSOAP",
     "KLShampoo", "LATHER", "LaProp", "LaPropOrtho", "Lion", "MARSAdamW", "MSAM", "Muon", "MuonLaProp",
     "NAdam", "NorMuon", "Oblique", "OrthoGradAdamW", "OrthoLaProp", "PSGD", "PSGDKron", "PSGDLRA", "PSGDNfactor", "PSGDPro", "PolarGrad", "QSGD", "RMSprop", "SGD", "SOAP", "SOAPAdEMAMix", "SOAPNAdam", "SOLP", "SpEL",
     "SUDSAdamW", "SFAdamW", "ScheduleFree", "Scion", "Shampoo", "SignLaProp", "SignSGD", "SplitOpt", "TrueGradAdam", "TrueGradLaProp", "TrueGradNAdam", "TrueGradRMSprop", "UnscaledAdamW",
-    "WhitenAdamW", "Whitening",
+    "WhitenAdamW", "Whitening", "describe", "estimate_state_bytes", "list_optimizers",
     "Engine", "Group", "ParamInfo", "Program", "Recipe", "RefreshCadence", "Route", "SAM", "adam", "adamc", "adamc_commit", "adamw", "ademamix",
     "adamuon", "ademamix_transform", "adopt", "adopt_transform", "aurora", "balanced_orthogonalize", "beta_debias", "build", "caution", "cautious_adamw",
     "KronCadence", "kron", "kron_adamw", "lather", "lather_adamw", "lather_init", "lather_transform", "laprop", "laprop_ortho", "laprop_transform", "lion", "lion_transform", "make_lather", "make_psgd_kron", "make_retraction_commit",

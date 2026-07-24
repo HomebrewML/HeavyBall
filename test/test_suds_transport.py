@@ -9,8 +9,8 @@ Four invariants:
    |1-beta| / |1 - beta*exp(i*delta)| < 1 and nonzero phase error.
 """
 
-import torch
 import pytest
+import torch
 
 from heavyball.suds import (
     _householder_vec_e1_to_v,

@@ -4,9 +4,8 @@ Engine.load_state_dict must stage both tensor copies and scalar fills before tou
 These tests cover late failures in each staging path.
 """
 
-from unittest.mock import patch
-
 import copy
+from unittest.mock import patch
 
 import pytest
 import torch

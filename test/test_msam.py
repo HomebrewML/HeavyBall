@@ -4,7 +4,6 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -12,31 +11,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-import heavyball
-import heavyball_legacy
 from heavyball import Engine, msam_laprop
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield
-    finally:
-        legacy.compile_mode = previous
 
 
 def _copy_grads(params, gradients):
     for param, gradient in zip(params, gradients, strict=True):
         param.grad.copy_(gradient)
-
-
-def _assert_params_close(actual, expected, *, rtol, atol, stage):
-    for index, (result, reference) in enumerate(zip(actual, expected, strict=True)):
-        torch.testing.assert_close(result, reference, rtol=rtol, atol=atol, msg=f"{stage}, parameter {index}")
 
 
 def _cautious_msam_recipe():
@@ -47,23 +27,16 @@ def _cautious_msam_recipe():
 
 
 @pytest.mark.parametrize(
-    ("dtype", "rtol", "atol", "storage_dtype"),
+    ("dtype", "rtol", "atol"),
     (
-        (torch.float64, 1e-12, 1e-12, "float64"),
-        (torch.float32, 2e-6, 2e-6, "float32"),
+        (torch.float64, 1e-12, 1e-12),
+        (torch.float32, 2e-6, 2e-6),
     ),
 )
 @pytest.mark.parametrize("caution", (False, True))
-def test_msam_matches_legacy(dtype, rtol, atol, storage_dtype, caution):
-    """Every MSAM step and eval/train swap matches legacy, including caution."""
+def test_msam_matches_direct_rmsprop_momentum_sam_recurrence(dtype, rtol, atol, caution):
+    """Recompute RMS normalization, caution, master decay, and SAM perturbation directly."""
 
-    if dtype is torch.float64 and caution:
-        pytest.skip(
-            "4.0 computes the caution rescale in the parameter's fp64 compute dtype while legacy uses "
-            "fp32, so exact parity cannot hold. The fp64 rescale is verified through cautious_adamw's "
-            "reference; the caution integration is covered by the fp32 case here."
-        )
-    torch._dynamo.reset()
     torch.manual_seed(81)
     values = dict(
         lr=0.017,
@@ -78,38 +51,77 @@ def test_msam_matches_legacy(dtype, rtol, atol, storage_dtype, caution):
     initial = [torch.randn(3, 2, dtype=dtype), torch.randn(3, 2, dtype=dtype)]
     gradients = [[torch.randn_like(value) for value in initial] for _ in range(9)]
     params = [torch.nn.Parameter(value.clone()) for value in initial]
-    legacy_params = [torch.nn.Parameter(value.clone()) for value in initial]
-    try:
+    states = [
+        {
+            "z": value.clone(),
+            "raw_momentum": torch.zeros_like(value),
+            "raw_variance": torch.zeros_like(value),
+        }
+        for value in initial
+    ]
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
         optimizer = Engine(params, _cautious_msam_recipe(), **values)
-        with _legacy_eager():
-            legacy_optimizer = heavyball_legacy.MSAMLaProp(
-                legacy_params,
-                lr=values["lr"],
-                betas=(values["beta1"], values["beta2"]),
-                eps=values["eps"],
-                weight_decay=values["weight_decay"],
-                sam_step_size=values["sam_step_size"],
-                caution=values["caution"],
-                cautious_weight_decay=values["cautious_weight_decay"],
-                storage_dtype=storage_dtype,
-                compile_step=False,
+
+    for step, step_gradients in enumerate(gradients, start=1):
+        expected_params = []
+        expected_momenta = []
+        for state, gradient in zip(states, step_gradients, strict=True):
+            state["raw_variance"].mul_(values["beta2"]).addcmul_(
+                gradient,
+                gradient,
+                value=1 - values["beta2"],
             )
-            for step, step_gradients in enumerate(gradients, start=1):
-                _copy_grads(params, step_gradients)
-                for param, gradient in zip(legacy_params, step_gradients, strict=True):
-                    param.grad = gradient.clone()
-                optimizer.step()
-                legacy_optimizer.step()
-                _assert_params_close(params, legacy_params, rtol=rtol, atol=atol, stage=f"step {step}")
-                if step == 4:
-                    optimizer.eval()
-                    legacy_optimizer.eval()
-                    _assert_params_close(params, legacy_params, rtol=rtol, atol=atol, stage="eval")
-                    optimizer.train()
-                    legacy_optimizer.train()
-                    _assert_params_close(params, legacy_params, rtol=rtol, atol=atol, stage="train")
-    finally:
-        torch._dynamo.reset()
+            rms = (state["raw_variance"] / (1 - values["beta2"] ** step)).sqrt()
+            normalized = gradient / rms.clamp_min(values["eps"] ** 0.5)
+            state["raw_momentum"].mul_(values["beta1"]).add_(
+                normalized,
+                alpha=1 - values["beta1"],
+            )
+            momentum = state["raw_momentum"] / (1 - values["beta1"] ** step)
+            filtered = momentum
+            if caution:
+                aligned = ((gradient > 0) & (momentum > 0)) | ((gradient < 0) & (momentum < 0))
+                scale = momentum.numel() / aligned.sum().clamp_min(1).to(dtype)
+                filtered = torch.where(aligned, momentum, torch.zeros_like(momentum)) * scale
+            decay = torch.where(
+                ((state["z"] > 0) & (filtered > 0)) | ((state["z"] < 0) & (filtered < 0)),
+                torch.as_tensor(values["weight_decay"], dtype=dtype),
+                torch.zeros((), dtype=dtype),
+            )
+            state["z"] = state["z"] * (1 - decay * values["lr"]) - filtered * values["lr"]
+            norm = torch.linalg.vector_norm(filtered)
+            direction = filtered / torch.where(norm != 0, norm, torch.ones_like(norm))
+            expected_params.append(state["z"] - direction * values["sam_step_size"])
+            expected_momenta.append(momentum)
+
+        _copy_grads(params, step_gradients)
+        optimizer.step()
+        for index, (param, expected) in enumerate(zip(params, expected_params, strict=True)):
+            torch.testing.assert_close(
+                param,
+                expected,
+                rtol=rtol,
+                atol=atol,
+                msg=f"step {step}, parameter {index}",
+            )
+        commit_state = optimizer.groups[0].commit_state
+        torch.testing.assert_close(commit_state["z"], torch.stack([state["z"] for state in states]), rtol=rtol, atol=atol)
+        torch.testing.assert_close(commit_state["exp_avg"], torch.stack(expected_momenta), rtol=rtol, atol=atol)
+        if step == 4:
+            optimizer.eval()
+            torch.testing.assert_close(
+                torch.stack([param.detach() for param in params]),
+                torch.stack([state["z"] for state in states]),
+                rtol=rtol,
+                atol=atol,
+            )
+            optimizer.train()
+            torch.testing.assert_close(
+                torch.stack([param.detach() for param in params]),
+                torch.stack(expected_params),
+                rtol=rtol,
+                atol=atol,
+            )
 
 
 def _msam_trajectory(dtype: torch.dtype, gradients, *, compiled: bool):
@@ -279,9 +291,7 @@ def test_msam_perturbs_the_master_by_exactly_the_sam_radius(radius):
     """MSAM's defining SAM geometry: the training iterate sits at a fixed distance sam_step_size from the
     master iterate z (along the normalized first-moment direction), so the forward/backward pass sees a
     perturbed point. Verified through the public eval/train swap -- eval exposes the master z, train restores
-    the perturbed iterate -- so ||param_train - z|| = sam_step_size and scales linearly with it. Independent
-    of legacy AND of the shipped commit; test_msam_matches_legacy pins the step only against a second
-    HeavyBall implementation, and the radius formula otherwise sits unasserted in the eval-swap test."""
+    the perturbed iterate -- so ||param_train - z|| = sam_step_size and scales linearly with it."""
 
     torch.manual_seed(0)
     param = torch.nn.Parameter(torch.randn(4, 3, dtype=torch.float64))

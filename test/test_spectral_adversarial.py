@@ -1,5 +1,5 @@
-import pytest
 import torch
+
 from heavyball.kron import _max_singular_value_power_iter
 
 

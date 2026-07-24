@@ -54,13 +54,17 @@ def test_bf16_adam_lands_closer_to_fp64_than_torch_baseline():
         p64 = torch.nn.Parameter(torch.zeros(dim, dtype=torch.float64))
         o64 = heavyball.AdamW([p64], lr=lr, weight_decay=0.0)
         for _ in range(steps):
-            o64.zero_grad(); set_grad(p64, torch.float64); o64.step()
+            o64.zero_grad()
+            set_grad(p64, torch.float64)
+            o64.step()
         ideal = p64.detach().double()
 
         phb = torch.nn.Parameter(torch.zeros(dim, dtype=torch.bfloat16))
         ohb = heavyball.AdamW([phb], lr=lr, weight_decay=0.0)
         for _ in range(steps):
-            ohb.zero_grad(); set_grad(phb, torch.bfloat16); ohb.step()
+            ohb.zero_grad()
+            set_grad(phb, torch.bfloat16)
+            ohb.step()
         err_hb = (phb.detach().double() - ideal).norm().item()
 
     pt = torch.nn.Parameter(torch.zeros(dim, dtype=torch.bfloat16))
@@ -103,22 +107,29 @@ def test_soap_bf16_weight_distance_misleads_and_ecc_preserves_loss():
         return w0, target @ design, design
 
     def run(mode, seed):  # returns (final weight fp64, final loss) with only the STATE dtype/rounding varied
-        rtn = lambda value, noise: value.to(torch.bfloat16)
-        with patch("heavyball.core.torch.compile", lambda f, **k: f):
-            with patch.object(numerics, "stochastic_round_bfloat16", rtn) if mode == "bf16-RTN" else contextlib.nullcontext():
-                torch.manual_seed(0)
-                w0, b, a = problem(seed)
-                weight = torch.nn.Parameter(w0.to(torch.float32).clone())  # fp32 params; only STATE varies
-                kwargs = {"storage_dtype": torch.bfloat16} if mode != "fp32" else {}
-                if mode == "ecc8":
-                    kwargs["ecc"] = 8
-                optimizer = heavyball.SOAP([weight], lr=0.02, weight_decay=0.0, **kwargs)
-                for _ in range(120):
-                    ((weight.to(torch.float64) @ a - b) ** 2).mean().backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
-                w = weight.detach().to(torch.float64)
-                return w, float(((w @ a - b) ** 2).mean())
+        def rtn(value, noise):
+            del noise
+            return value.to(torch.bfloat16)
+
+        rounding = (
+            patch.object(numerics, "stochastic_round_bfloat16", rtn)
+            if mode == "bf16-RTN"
+            else contextlib.nullcontext()
+        )
+        with patch("heavyball.core.torch.compile", lambda f, **k: f), rounding:
+            torch.manual_seed(0)
+            w0, b, a = problem(seed)
+            weight = torch.nn.Parameter(w0.to(torch.float32).clone())  # fp32 params; only STATE varies
+            kwargs = {"storage_dtype": torch.bfloat16} if mode != "fp32" else {}
+            if mode == "ecc8":
+                kwargs["ecc"] = 8
+            optimizer = heavyball.SOAP([weight], lr=0.02, weight_decay=0.0, **kwargs)
+            for _ in range(120):
+                ((weight.to(torch.float64) @ a - b) ** 2).mean().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            w = weight.detach().to(torch.float64)
+            return w, float(((w @ a - b) ** 2).mean())
 
     sr_dist, rtn_dist, sr_loss, rtn_loss, ecc_loss, ref_loss = [], [], [], [], [], []
     for seed in range(6):
@@ -128,7 +139,10 @@ def test_soap_bf16_weight_distance_misleads_and_ecc_preserves_loss():
         _, ecc_l = run("ecc8", seed)
         sr_dist.append((sr_w - ref_w).norm().item() / ref_w.norm().item())
         rtn_dist.append((rtn_w - ref_w).norm().item() / ref_w.norm().item())
-        sr_loss.append(sr_l); rtn_loss.append(rtn_l); ecc_loss.append(ecc_l); ref_loss.append(ref_l)
+        sr_loss.append(sr_l)
+        rtn_loss.append(rtn_l)
+        ecc_loss.append(ecc_l)
+        ref_loss.append(ref_l)
 
     # Weight-distance would rank SR the clear winner (much closer to fp32's path)...
     assert sum(sr_dist) < 0.6 * sum(rtn_dist)

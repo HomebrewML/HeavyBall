@@ -123,7 +123,9 @@ def test_full_step_compiled(name, feature):
     tag = f"{name} {fname}"
     assert all(map(math.isfinite, losses)), f"{tag}: NONFINITE loss"
     assert all(p.isfinite().all() for p in model.parameters()), f"{tag}: NONFINITE params"
-    assert all(not torch.equal(p, b) for p, b in zip(model.parameters(), before)), f"{tag}: a parameter route never updated"
+    assert all(
+        not torch.equal(p, b) for p, b in zip(model.parameters(), before, strict=True)
+    ), f"{tag}: a parameter route never updated"
     # Every narrowable state slab must take the feature's dtype (this is where bf16 halves the state);
     # deliberately higher-precision slabs (PSGD/LATHER keep fp64 stability scalars) are allowed. A slab at
     # the WRONG low precision means the feature did not engage, or a matrix route was masked by an fp32/bf16

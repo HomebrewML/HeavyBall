@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,18 +15,6 @@ import torch
 
 from heavyball import Engine, Scion, scion, scion_lmo, scion_param_init, sgd
 from heavyball.transforms import Tempo
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield legacy
-    finally:
-        legacy.compile_mode = previous
 
 
 def _tempo(count: int, dtype: torch.dtype, *, scale: float = 1.25) -> Tempo:
@@ -46,35 +34,44 @@ def _tempo(count: int, dtype: torch.dtype, *, scale: float = 1.25) -> Tempo:
     ("dtype", "rtol", "atol"),
     ((torch.float64, 1e-12, 1e-12), (torch.float32, 1e-6, 1e-6)),
 )
-def test_scion_lmo_matches_legacy(dtype, rtol, atol):
-    """The batched dispatch must match legacy's per-leaf auto LMO."""
+def test_scion_lmo_matches_closed_form_for_each_leaf_rank(dtype, rtol, atol):
+    """Recompute vector and spectral LMO branches from norm and SVD definitions."""
 
     for shape in ((5, 3), (4, 3, 2, 3), (7,)):
         torch.manual_seed(202)
         update = torch.randn(3, *shape, dtype=dtype)
-        expected = update.clone()
-        with _legacy_eager() as legacy:
-            torch.manual_seed(301)
-            legacy.scion_auto_lmo_(
-                [expected[index] for index in range(expected.shape[0])],
-                torch.tensor(1.25, dtype=dtype),
-                torch.tensor(1e-8, dtype=dtype),
-            )
-        torch.manual_seed(301)
         actual, _, _ = scion_lmo(update.clone(), None, None, {}, _tempo(update.shape[0], dtype))
-        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        if len(shape) == 1:
+            expected = update / torch.linalg.vector_norm(update, dim=1, keepdim=True)
+            expected = expected * (1.25 * math.sqrt(shape[0]))
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+            continue
+
+        flat = update.reshape(update.shape[0], shape[0], -1)
+        u, _, vh = torch.linalg.svd(flat, full_matrices=False)
+        polar = u @ vh
+        if len(shape) >= 3:
+            spatial = math.prod(shape[2:])
+            factor = 1.25 * math.sqrt(shape[0] / shape[1]) / spatial
+        else:
+            factor = 1.25 * math.sqrt(shape[0] / shape[1])
+        expected = (polar * factor).reshape_as(actual)
+        relative_error = (actual - expected).norm() / expected.norm()
+        assert relative_error < 0.05
 
 
 def test_scion_applies_lmo_to_debiased_first_moment():
     parameter = torch.nn.Parameter(torch.tensor((9.0, -7.0), dtype=torch.float64))
     beta1 = 0.9
     lr = 0.1
-    optimizer = Scion([parameter], lr=lr, beta1=beta1, eps=1e-8, scale=1.0, weight_decay=0.0)
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
+        optimizer = Scion([parameter], lr=lr, beta1=beta1, eps=1e-8, scale=1.0, weight_decay=0.0)
+    bootstrap = torch.tensor((-3.0, 4.0), dtype=torch.float64)
     gradients = (
         torch.tensor((10.0, 0.0), dtype=torch.float64),
         torch.tensor((0.0, 1.0), dtype=torch.float64),
     )
-    for gradient in gradients:
+    for gradient in (bootstrap, *gradients):
         before = parameter.detach().clone()
         parameter.grad.copy_(gradient)
         optimizer.step()
@@ -90,15 +87,31 @@ def test_scion_applies_lmo_to_debiased_first_moment():
     assert "exp_avg" in optimizer._engine.groups[0].states[0]
 
 
+def _reference_scion_init(value: torch.Tensor, *, seed: int, scale: float) -> torch.Tensor:
+    """Directly apply seeded orthogonal slices and the Scion fan scaling."""
+
+    generator = torch.Generator(device=value.device)
+    generator.manual_seed(seed)
+    if value.ndim < 2:
+        return torch.zeros_like(value)
+    expected = value.double().clone()
+    for spatial_index in product(*(range(size) for size in expected.shape[2:])):
+        torch.nn.init.orthogonal_(
+            expected[(slice(None), slice(None), *spatial_index)],
+            generator=generator,
+        )
+    spatial = math.prod(expected.shape[2:])
+    expected.mul_(math.sqrt(expected.shape[0] / expected.shape[1]) / max(spatial, 1))
+    return expected.to(value.dtype) * scale
+
+
 @pytest.mark.parametrize("shape", ((5, 3), (4, 3, 2, 3), (7,)))
-def test_scion_param_init_matches_legacy(shape):
-    """The build hook's per-leaf initializer has legacy's seeded result."""
+def test_scion_param_init_follows_seeded_orthogonal_slice_recipe(shape):
+    """The initializer follows the independently recomputed PyTorch orthogonal recipe."""
 
     seed = 17
-    expected = torch.randn(*shape, dtype=torch.float64)
-    actual = expected.clone()
-    with _legacy_eager() as legacy:
-        legacy.scion_auto_init_param_(expected, torch.tensor(1.0, dtype=torch.float64), seed=seed)
+    actual = torch.randn(*shape, dtype=torch.float64)
+    expected = _reference_scion_init(actual, seed=seed, scale=1.0)
     scion_param_init(actual, seed=seed)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -138,8 +151,8 @@ def test_scion_fp64_accuracy():
     torch._dynamo.reset()
 
 
-def test_scion_param_init_applied_at_build():
-    """Build-time initialization uses global parameter order, not slab bucket order."""
+def test_scion_param_init_is_deferred_and_uses_global_parameter_order():
+    """Construction is non-mutating; first step initializes by supplied parameter order."""
 
     params = [
         torch.nn.Parameter(torch.randn(2, 2, dtype=torch.float64), requires_grad=False),
@@ -150,13 +163,17 @@ def test_scion_param_init_applied_at_build():
     before = [param.detach().clone() for param in params]
     init_scale = 1.75
     with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        Engine(params, scion, scale=init_scale)
+        optimizer = Engine(params, scion, scale=init_scale, lr=0.0)
+
+    for param, initial in zip(params, before, strict=True):
+        torch.testing.assert_close(param, initial, rtol=0, atol=0)
+    for param in params[1:]:
+        param.grad.zero_()
+    optimizer.step()
 
     torch.testing.assert_close(params[0], before[0], rtol=0, atol=0)
     for seed, (param, initial) in enumerate(zip(params[1:], before[1:], strict=True), start=1):
-        expected = initial.clone()
-        with _legacy_eager() as legacy:
-            legacy.scion_auto_init_param_(expected, torch.tensor(init_scale, dtype=torch.float64), seed=seed)
+        expected = _reference_scion_init(initial, seed=seed, scale=init_scale)
         assert not torch.equal(param, initial)
         torch.testing.assert_close(param, expected, rtol=0, atol=0)
 
@@ -178,6 +195,9 @@ params = [
     torch.nn.Parameter(torch.randn(7)),
 ]
 optimizer = Engine(params, scion)
+for param in params:
+    param.grad.normal_()
+optimizer.step()
 for param in params:
     param.grad.normal_()
 optimizer.step()
@@ -225,24 +245,13 @@ optimizer.step()
         text=True,
     )
     assert banned.returncode == 1, banned.stdout + banned.stderr
-    imports = subprocess.run(
-        ["grep", "-rn", r"heavyball_legacy.utils\|heavyball_legacy.chainable", "heavyball/scion.py", "heavyball/core.py"],
-        cwd=Path(__file__).parents[1],
-        capture_output=True,
-        text=True,
-    )
-    assert imports.returncode == 1, imports.stdout + imports.stderr
-
-
 @pytest.mark.parametrize(("rows", "cols"), ((4, 6), (6, 4), (5, 5)))
 def test_scion_lmo_is_the_scaled_spectral_polar(rows, cols):
     """Scion's defining spectral-norm LMO (arXiv 2502.07529): the matrix update is the norm-ball
     linear-minimization-oracle output, scale * sqrt(fan_out/fan_in) * polar(M), where polar(M) = U @ Vh
     from M = U diag(S) Vh. So a wide input spectrum is driven to near-constant singular values (a
-    semi-orthogonal matrix). Checked against torch.linalg.svd's polar factor and the closed-form scale --
-    independent of legacy AND of the shipped Newton-Schulz orthogonalize, which only approximates the
-    polar in 5 steps (hence the 5% band). test_scion_lmo_matches_legacy pins this branch only against a
-    second HeavyBall implementation, so a bug shared by both would pass it; this cannot."""
+    semi-orthogonal matrix). Checked against torch.linalg.svd's polar factor and the closed-form scale;
+    the shipped Newton-Schulz orthogonalizer approximates the polar in 5 steps, hence the 5% band."""
 
     torch.manual_seed(1)
     left = torch.linalg.qr(torch.randn(rows, rows, dtype=torch.float64))[0]

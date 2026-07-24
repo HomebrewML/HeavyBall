@@ -9,7 +9,6 @@ resume. Uses torch.distributed.checkpoint. float64. Two torchrun invocations sha
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest

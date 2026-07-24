@@ -5,7 +5,6 @@ import torch
 
 import heavyball
 
-
 _STEPS = 8
 
 
@@ -31,8 +30,7 @@ def _trajectory(facade, *, storage_dtype=..., ecc=...):
 def _state_and_corrections(optimizer):
     for engine in optimizer._engines:
         for group in engine.groups:
-            for state, corrections in zip(group.states, group.state_corrections, strict=True):
-                yield state, corrections
+            yield from zip(group.states, group.state_corrections, strict=True)
             yield group.commit_state, group.commit_corrections
 
 

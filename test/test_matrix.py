@@ -191,5 +191,3 @@ def test_soap_fullgraph_clean(tmp_path):
         source = Path(__file__).parents[1] / "heavyball" / "matrix.py"
     text = source.read_text()
     assert not re.search(r"_foreach|vmap|torch\.cond|dynamic=True|torch\.stack|\.item\(|\benabled\b|\bamp\b", text)
-    assert "heavyball_legacy.utils" not in text
-    assert "heavyball_legacy.chainable" not in text

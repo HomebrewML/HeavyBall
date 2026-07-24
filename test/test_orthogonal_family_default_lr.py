@@ -9,8 +9,9 @@ siblings share the mechanism).  Oblique is deliberately left at 0.0025 because
 it is adam-based and 0.02 measurably OVERSHOOTS (0.051 -> 0.067).
 """
 
-import heavyball
 import torch
+
+import heavyball
 
 
 def test_orthogonal_family_user_facing_default_lr():

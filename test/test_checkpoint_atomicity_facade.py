@@ -104,7 +104,7 @@ def test_malformed_public_hyper_rolls_back_engine():
     checkpoint = copy.deepcopy(optimizer.state_dict())
     checkpoint["param_groups"][0]["lr"] = "not-a-number"  # _sync -> _scalar raises
 
-    with pytest.raises(Exception):
+    with pytest.raises(TypeError):
         optimizer.load_state_dict(checkpoint)
     assert optimizer.param_groups[0]["lr"] == 0.1
     assert float(optimizer._engine.groups[0].hyper.lr) == engine_lr_before

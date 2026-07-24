@@ -211,7 +211,7 @@ def test_optimizer_rejects_foreign_parameter_and_malformed_engine_checkpoints():
     checkpoint = optimizer.state_dict()
     missing = copy.deepcopy(checkpoint)
     del missing["engines"]
-    with pytest.raises(ValueError, match="expected a HeavyBallOptimizer state dict with Engine state"):
+    with pytest.raises(ValueError, match="expected a HeavyBallOptimizer 4.0 state dict with Engine state"):
         optimizer.load_state_dict(missing)
 
     wrong_count = copy.deepcopy(checkpoint)
@@ -233,17 +233,23 @@ def test_scion_scalar_direction_is_sign_and_zero_preserving():
     assert torch.equal(direction, torch.tensor((-1.0, 0.0, 1.0), dtype=torch.float64))
 
 
-def test_scion_bfloat16_seeded_initialization_matches_legacy():
-    from heavyball_legacy.utils import scion_auto_init_param_
+def test_scion_bfloat16_seeded_initialization_is_deterministic_and_scaled_orthogonal():
+    """The current bf16 path is seed-stable and preserves Scion's scaled-orthogonal contract."""
 
     seed = 23
     scale = torch.tensor(1.75)
-    expected = torch.full((8, 8), 0.125, dtype=torch.bfloat16)
-    actual = expected.clone()
+    initial = torch.full((8, 8), 0.125, dtype=torch.bfloat16)
+    actual = initial.clone()
+    repeated = initial.clone()
+    other_seed = initial.clone()
 
-    scion_auto_init_param_(expected, scale, seed=seed)
     scion_param_init(actual, seed=seed, scale=scale)
+    scion_param_init(repeated, seed=seed, scale=scale)
+    scion_param_init(other_seed, seed=seed + 1, scale=scale)
 
-    assert torch.equal(actual, expected)
+    assert actual.dtype is torch.bfloat16
+    assert torch.equal(actual, repeated)
+    assert not torch.equal(actual, initial)
+    assert not torch.equal(actual, other_seed)
     gram = actual.float().mT @ actual.float()
     torch.testing.assert_close(gram, torch.eye(8) * scale.square(), rtol=0, atol=0.025)

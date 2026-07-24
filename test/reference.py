@@ -1,7 +1,7 @@
-"""Reference optimizers, implemented from the standard update formulas -- NOT from ``heavyball`` or
-``heavyball_legacy``. The parity tests in test_reference.py check the shipped optimizers against these,
-so they validate the MATH, not merely agreement with the legacy oracle (a bug replicated from legacy
-into 4.0 would pass a legacy-parity test but fail here).
+"""Reference optimizers, implemented from standard formulas rather than optimizer code.
+
+The parity tests in ``test_reference.py`` check the shipped optimizers against these, so they validate
+the math instead of agreement between two implementations.
 
 Each function computes at ``init``'s dtype: fp64 gives the truth; a low-precision ``init`` gives the
 naive same-math baseline (optimizer state kept at that dtype) that the shipped fp32-state path must beat.

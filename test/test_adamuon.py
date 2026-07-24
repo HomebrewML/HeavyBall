@@ -8,12 +8,10 @@ and ships a working facade. See test_adamuon_rms_align.py for the RMS-0.2 shape-
 
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from heavyball import Engine, adamuon
-from heavyball.transforms import momentum, orthogonalize, rms_align, sgd_commit
-from heavyball.transforms import rmsprop as rmsprop_transform
+from heavyball.transforms import momentum, orthogonalize, rms_align, rmsprop as rmsprop_transform, sgd_commit
 
 
 def test_adamuon_is_muon_rmsprop_then_rms_aligned():

@@ -1,17 +1,16 @@
-"""Shipped first-order optimizers match pure fp64 references (independent of the legacy oracle).
+"""Shipped first-order optimizers match pure fp64 textbook references.
 
-The other matrix/PSGD parity tests check 4.0 against heavyball_legacy; a bug replicated from legacy
-into 4.0 would pass those. These check the core first-order optimizers against textbook math
-implemented from scratch in reference.py, so they catch that class.
+These checks compare the core first-order optimizers with math implemented from scratch in
+``reference.py``, so agreement between two optimizer implementations cannot mask a shared bug.
 """
 
 from unittest.mock import patch
 
 import pytest
+import reference
 import torch
 
 import heavyball
-import reference
 from heavyball.core import build
 
 

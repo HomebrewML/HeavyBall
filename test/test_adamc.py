@@ -41,7 +41,6 @@ def test_adamc_equals_adamw_when_max_lr_equals_lr():
 def test_adamc_halves_weight_decay_when_max_lr_doubled():
     # Zero gradient isolates weight decay: param *= (1 - lr * wd_effective).
     zero = [torch.zeros(8)]
-    base = torch.nn.Parameter(torch.ones(8))  # reference start
     adamw = _trajectory("AdamW", lr=0.01, weight_decay=0.5, grads=zero)
     adamc = _trajectory("AdamC", lr=0.01, weight_decay=0.5, grads=zero, max_lr=0.02)
     start = _trajectory("AdamW", lr=0.0, weight_decay=0.0, grads=zero)  # unchanged init

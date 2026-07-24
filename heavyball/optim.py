@@ -4,7 +4,7 @@ import copy
 import inspect
 import os
 import warnings
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -276,18 +276,20 @@ def _materialize_params(
 
 
 class HeavyBallOptimizer(torch.optim.Optimizer):
-    """A ``torch.optim.Optimizer`` facade over HeavyBall Engines.
+    """A ``torch.optim.Optimizer``-style facade over HeavyBall Engines.
 
     Construction slab-backs the supplied parameters, so construct this optimizer
     before wrapping the model with DDP or ``torch.compile``. For a supported
     componentwise recipe, call ``Optimizer.fsdp2(model, ...)`` after ``fully_shard(model)``.
 
-    Slab contract (differs from ``torch.optim``): parameters and gradients are bound into persistent
-    buffers, so call ``optimizer.zero_grad(set_to_none=False)`` (the default), never reassign
-    ``p.data``/``p.grad`` (write them in place), and do not change parameter storage after
-    construction (e.g. ``model.to(...)``). Every optimized parameter advances on every step -- weight
-    decay, moments, and the step clock all update even for parameters that received no gradient -- so
-    freeze/unused-branch and conditional workflows need care.
+    The interface deliberately differs from ``torch.optim``. Parameters and gradients are slab-bound
+    into persistent buffers, so call ``optimizer.zero_grad(set_to_none=False)`` (the default), never
+    reassign ``p.data``/``p.grad`` (write them in place), and do not change parameter storage after
+    construction (e.g. ``model.to(...)``). By default every optimized parameter advances on every
+    step -- weight decay, moments, and the step clock update even when it received no gradient -- but
+    conditional, MoE, and frozen workflows can pass ``observed=`` to ``step()`` to mark inactive
+    parameters. Defaults differ from similarly named ``torch.optim`` optimizers, and hyperparameters
+    are keyword-only.
 
     Low-precision optimizer state (opt-in per optimizer; compute always promotes to
     fp32, so accuracy is preserved and only storage shrinks):
@@ -533,7 +535,20 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                     self._engine.set_hyper(name, value, group_id=group_id)
                     synced[name] = value
 
-    def step(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:
+    def step(
+        self,
+        closure: Callable[[], Tensor] | None = None,
+        observed: Sequence[bool] | Mapping[Tensor, bool] | None = None,
+    ) -> Tensor | None:
+        """Run one optimizer step and return the closure loss, if any.
+
+        ``observed`` accepts one host bool per trainable parameter, either as a sequence in
+        construction order or as a mapping containing every parameter. Marking a parameter
+        ``False`` prevents it from advancing on this step, which supports conditional/MoE branches
+        and temporarily frozen parameters whose persistent gradient slab received no gradient.
+        Omitting it preserves HeavyBall's default that every parameter is observed.
+        """
+
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -548,7 +563,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                         "normalization reduces over the full logical parameter."
                     )
         self._sync_hypers_from_groups(force=False)
-        self._engine.step()
+        self._engine.step(observed=observed)
         return loss
 
     @torch.no_grad()
@@ -924,7 +939,11 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict: Mapping) -> None:
         if "engines" not in state_dict:
-            raise ValueError("expected a HeavyBallOptimizer state dict with Engine state")
+            raise ValueError(
+                "expected a HeavyBallOptimizer 4.0 state dict with Engine state; HeavyBall 3.x "
+                "optimizer checkpoints are not migratable to 4.0 because the Engine state structure "
+                "changed. Restart training or warmstart from model weights only."
+            )
         torch_state_dict = dict(state_dict)
         engine_states = torch_state_dict.pop("engines")
         if not isinstance(engine_states, (list, tuple)) or len(engine_states) != len(self._engines):

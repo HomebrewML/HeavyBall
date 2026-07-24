@@ -21,7 +21,6 @@ from heavyball.transforms import (
     Tempo,
     normuon_normalize,
     normuon_normalize_init,
-    orthogonalize,
     polargrad_direction,
 )
 

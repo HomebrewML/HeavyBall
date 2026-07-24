@@ -1,17 +1,10 @@
-"""Convolution preconditioning via bind-time dimension merging.
-
-Conv parity to legacy is proven by reduction, not by re-driving legacy on a conv:
-``merged_matrix_shape`` reproduces legacy ``dim_merger`` exactly, and the merge is a
-byte-exact reshape (opt SOAP on a merged conv equals opt SOAP on the native 2D leaf),
-so conv preconditioning inherits the native-2D parity the matrix suite already proves.
-"""
+"""Convolution preconditioning via bind-time dimension merging."""
 
 from unittest.mock import patch
 
 import pytest
 import torch
 
-import heavyball_legacy.utils as legacy_utils
 from heavyball import build, soap_adamw
 from heavyball.matrix import matrix_route, merged_matrix_shape
 
@@ -23,15 +16,27 @@ class _Info:
 
 
 @pytest.mark.parametrize(
-    "shape",
-    [(128, 64, 3, 3), (4, 3, 3, 3), (8, 4, 2, 2), (16, 8), (10,), (128, 1000, 3, 3), (1, 5)],
+    ("shape", "max_precond_dim", "expected"),
+    (
+        ((128, 64, 3, 3), 16, (128, 64, 9)),
+        ((128, 64, 3, 3), 64, (128, 64, 9)),
+        ((128, 64, 3, 3), 2048, (128, 576)),
+        ((4, 3, 3, 3), 16, (4, 3, 9)),
+        ((4, 3, 3, 3), 64, (4, 27)),
+        ((4, 3, 3, 3), 2048, (4, 27)),
+        ((8, 4, 2, 2), 16, (8, 16)),
+        ((8, 4, 2, 2), 64, (8, 16)),
+        ((8, 4, 2, 2), 2048, (8, 16)),
+        ((16, 8), 16, (16, 8)),
+        ((10,), 64, (10,)),
+        ((128, 1000, 3, 3), 2048, (128, 1000, 9)),
+        ((1, 5), 16, (1, 5)),
+    ),
 )
-def test_merged_matrix_shape_matches_legacy_dim_merger(shape):
-    """The bind-time merge reproduces legacy dim_merger's shape exactly."""
+def test_merged_matrix_shape_follows_right_to_left_product_rule(shape, max_precond_dim, expected):
+    """Goldens obtained by hand-applying the documented right-to-left product limit."""
 
-    for max_precond_dim in (16, 64, 2048):
-        expected = tuple(legacy_utils.dim_merger(torch.zeros(shape), max_precond_dim).shape)
-        assert merged_matrix_shape(shape, max_precond_dim) == expected
+    assert merged_matrix_shape(shape, max_precond_dim) == expected
 
 
 def test_matrix_route_selects_leaves_that_merge_to_2d():
@@ -53,7 +58,7 @@ def _run_soap(leaf0, gradients, *, as_conv, native_shape):
 
 
 def test_conv_soap_equals_native_2d_because_the_merge_is_a_noop_reshape():
-    """A merged conv trains bit-identically to the native 2D leaf -> conv parity = native-2D parity."""
+    """A merged convolution trains bit-identically to the equivalent native matrix."""
 
     torch.manual_seed(0)
     leaf0 = torch.randn(4, 3, 3, 3, dtype=torch.float64)

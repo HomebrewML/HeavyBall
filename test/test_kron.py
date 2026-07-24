@@ -154,8 +154,6 @@ def test_kron_fullgraph_clean(tmp_path):
 
     source = (Path(__file__).parents[1] / "heavyball" / "kron.py").read_text()
     assert not re.search(r"_foreach|vmap|while_loop|torch\.cond|dynamic=True|torch\.stack|\.item\(|autocast", source)
-    assert "heavyball_legacy.utils" not in source
-    assert "heavyball_legacy.chainable" not in source
 
 
 def test_lower_bound_weights_history_like_li():

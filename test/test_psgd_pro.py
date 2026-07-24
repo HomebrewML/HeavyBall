@@ -4,30 +4,16 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
 
-import heavyball_legacy.chainable as legacy_chainable
 from heavyball import adamw, psgd_pro_adamw, qsgd_adamw
 from heavyball.core import Engine
 from heavyball.psgd_pro import psgd_pro, psgd_pro_init, qsgd
 from heavyball.transforms import Tempo
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield
-    finally:
-        legacy.compile_mode = previous
 
 
 def _eager_engine(params, recipe=psgd_pro, **hyper) -> Engine:
@@ -35,129 +21,42 @@ def _eager_engine(params, recipe=psgd_pro, **hyper) -> Engine:
         return Engine(params, recipe, **hyper)
 
 
-def _legacy_group(dtype: torch.dtype, *, refresh: bool, sqrt: bool, step: int) -> dict:
-    return {
-        "caution": False,
-        "dampening": 1e-6,
-        "is_preconditioning": refresh,
-        "lower_bound_beta": 0.9,
-        "max_size_triangular": 8,
-        "memory_save_mode": None,
-        "min_ndim_triangular": 2,
-        "momentum_into_precond_update": True,
-        "precond_grad_accum": False,
-        "precond_init_scale": 1.0,
-        "precond_init_scale_scale": 1.0,
-        "precond_init_scale_power": None,
-        "precond_lr": 0.05,
-        "precond_update_power_iterations": 2,
-        "q_dtype": str(dtype).removeprefix("torch."),
-        "sqrt": sqrt,
-        "step": step,
-        "step_count": step,
-        "store_triu_as_line": False,
-    }
+@pytest.mark.parametrize(("recipe", "sqrt"), ((psgd_pro, False), (qsgd, True)), ids=("psgd_pro", "qsgd"))
+@pytest.mark.parametrize(("shape", "max_size"), (((3, 4), 8), ((12, 4), 8)), ids=("full", "mixed"))
+def test_psgd_pro_applies_explicit_factor_product(recipe, sqrt, shape, max_size):
+    """Normal steps apply either ``Q`` once or the independently computed ``QᵀQ``."""
 
-
-def _legacy_slot(state: dict, label: str):
-    prefix = f"scale_by_psgd_pro_{label}_"
-    for key, value in state.items():
-        if key.startswith(prefix):
-            return value
-        if key.startswith("__bucket_") and isinstance(value, dict):
-            found = _legacy_slot(value, label)
-            if found is not None:
-                return found
-    return None
-
-
-def _legacy_transform():
-    (transform,) = legacy_chainable.set_indices((legacy_chainable.scale_by_psgd_pro,), retain=False)
-    return transform
-
-
-def _copy_legacy_state(optimizer: Engine, legacy_state: dict) -> None:
+    parameter = torch.nn.Parameter(torch.zeros(shape, dtype=torch.float64))
+    optimizer = _eager_engine(
+        [parameter],
+        recipe,
+        lr=0.1,
+        max_size_triangular=max_size,
+        weight_decay=0.0,
+    )
     state = optimizer.groups[0].states[0]
-    q0, q1 = _legacy_slot(legacy_state, "Q")
-    lower0, lower1 = _legacy_slot(legacy_state, "running_lower_bound")
-    state["Q_0"].copy_(q0)
-    state["Q_1"].copy_(q1)
-    state["running_lower_bound_0"].copy_(lower0)
-    state["running_lower_bound_1"].copy_(lower1)
+    if state["Q_0"].ndim == 2:
+        q0 = torch.linspace(0.7, 1.3, shape[0], dtype=torch.float64)
+    else:
+        q0 = torch.eye(shape[0], dtype=torch.float64)
+        q0 = q0 + torch.triu(torch.full_like(q0, 0.07), diagonal=1)
+    q1 = torch.eye(shape[1], dtype=torch.float64)
+    q1 = q1 + torch.triu(torch.full_like(q1, -0.05), diagonal=1)
+    state["Q_0"][0].copy_(q0)
+    state["Q_1"][0].copy_(q1)
+    before_state = {name: value.clone() for name, value in state.items()}
+    gradient = torch.linspace(-1.2, 1.4, parameter.numel(), dtype=torch.float64).reshape(shape)
 
+    left = q0 if sqrt else (q0.square() if q0.ndim == 1 else q0.mT @ q0)
+    right = q1 if sqrt else q1.mT @ q1
+    expected = (left.unsqueeze(1) * gradient if left.ndim == 1 else left @ gradient) @ right.mT
 
-def _assert_matches_legacy(*, sqrt: bool, shape: tuple[int, ...] = (3, 4), engine_max_size_triangular: int | None = None) -> None:
-    recipe = qsgd if sqrt else psgd_pro
-    with _legacy_eager():
-        for dtype, tolerance in ((torch.float64, 1e-11), (torch.float32, 2e-5)):
-            torch.manual_seed(52)
-            legacy_param = torch.nn.Parameter(torch.randn(*shape, dtype=dtype))
-            legacy_state: dict = {}
-            transform = _legacy_transform()
+    parameter.grad.copy_(gradient)
+    optimizer.step(step_type="normal")
 
-            def state_fn(_param):
-                return legacy_state
-
-            bootstrap = torch.randn_like(legacy_param)
-            transform(
-                state_fn,
-                _legacy_group(dtype, refresh=False, sqrt=sqrt, step=0),
-                [bootstrap.clone()],
-                [bootstrap.clone()],
-                [legacy_param],
-            )
-
-            opt_param = torch.nn.Parameter(legacy_param.detach().clone())
-            engine_hyper = dict(lr=0.1, precond_lr=0.05, lower_bound_beta=0.9, dampening=1e-6, weight_decay=0.0)
-            if engine_max_size_triangular is not None:
-                engine_hyper["max_size_triangular"] = engine_max_size_triangular
-            optimizer = _eager_engine([opt_param], recipe, **engine_hyper)
-            _copy_legacy_state(optimizer, legacy_state)
-
-            for step, refresh in enumerate((False, True, False, True, True), start=1):
-                gradient = torch.randn_like(legacy_param)
-                before = opt_param.detach().clone()
-                opt_param.grad.copy_(gradient)
-                probe_seed = 900 + step
-
-                torch.manual_seed(probe_seed)
-                expected = transform(
-                    state_fn,
-                    _legacy_group(dtype, refresh=refresh, sqrt=sqrt, step=step),
-                    [gradient.clone()],
-                    [gradient.clone()],
-                    [legacy_param],
-                )[0]
-
-                torch.manual_seed(probe_seed)
-                with patch.object(Tempo, "randn_like", lambda _tempo, value: torch.randn_like(value)):
-                    optimizer.step(step_type="refresh" if refresh else "normal")
-                actual = (before - opt_param.detach()) / 0.1
-                torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-                state = optimizer.groups[0].states[0]
-                legacy_q0, legacy_q1 = _legacy_slot(legacy_state, "Q")
-                legacy_lower0, legacy_lower1 = _legacy_slot(legacy_state, "running_lower_bound")
-                torch.testing.assert_close(state["Q_0"], legacy_q0, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(state["Q_1"], legacy_q1, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(
-                    state["running_lower_bound_0"], legacy_lower0, rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    state["running_lower_bound_1"], legacy_lower1, rtol=tolerance, atol=tolerance
-                )
-
-
-def test_psgd_pro_matches_legacy():
-    """PRO updates and Q factors directly match legacy with synchronized probes."""
-
-    _assert_matches_legacy(sqrt=False)
-
-
-def test_qsgd_matches_legacy():
-    """QSGD directly matches legacy's apply-once path with synchronized probes."""
-
-    _assert_matches_legacy(sqrt=True)
+    torch.testing.assert_close(-parameter / 0.1, expected, rtol=1e-12, atol=1e-12)
+    for name, value in before_state.items():
+        torch.testing.assert_close(state[name], value, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("recipe", (psgd_pro, qsgd), ids=("psgd_pro", "qsgd"))
@@ -183,18 +82,6 @@ def test_psgd_pro_mixed_oversized_compiles_and_matches_eager(recipe):
     eager = trajectory(compiled=False)
     assert torch.isfinite(compiled).all()
     torch.testing.assert_close(compiled, eager, rtol=2e-5, atol=2e-5)
-
-
-def test_psgd_pro_mixed_oversized_axis_matches_legacy():
-    """An oversized axis (> max_size_triangular) takes a diagonal factor and matches legacy's mixed update."""
-
-    _assert_matches_legacy(sqrt=False, shape=(12, 4), engine_max_size_triangular=8)
-
-
-def test_qsgd_mixed_oversized_axis_matches_legacy():
-    """QSGD apply-once with a diagonal factor on the oversized axis matches legacy."""
-
-    _assert_matches_legacy(sqrt=True, shape=(12, 4), engine_max_size_triangular=8)
 
 
 def _run_trajectory(
@@ -345,8 +232,6 @@ def test_psgd_pro_fullgraph_clean(tmp_path, recipe_name):
 
     source = (Path(__file__).parents[1] / "heavyball" / "psgd_pro.py").read_text()
     assert not re.search(r"_foreach|vmap|while_loop|torch\.cond|dynamic=True|torch\.stack|\.item\(|autocast", source)
-    assert "heavyball_legacy.utils" not in source
-    assert "heavyball_legacy.chainable" not in source
 
 
 def test_psgd_pro_rejects_leaves_that_do_not_merge_to_2d():
@@ -364,10 +249,9 @@ def test_psgd_pro_adamw_routes_matrices_not_vectors(route):
 
 
 def test_psgd_pro_whitens_the_gradient_covariance():
-    """PSGD-PRO's defining purpose, checked independently of legacy AND of the shipped code: for a
+    """PSGD-PRO's defining purpose, checked against a covariance identity: for a
     stationary Kronecker-structured gradient distribution the P = QᵀQ preconditioner drives the
-    preconditioned-gradient covariance toward the identity. Catches a correlated whitening bug (shared
-    by shipped and legacy) that a shipped-vs-legacy parity test cannot."""
+    preconditioned-gradient covariance toward the identity."""
 
     torch.manual_seed(0)
     rows, cols = 6, 4
@@ -398,7 +282,7 @@ def test_psgd_pro_diagonal_factor_whitens_a_diagonal_axis_covariance(big_first):
     """PSGD-PRO with a large axis forced to a diagonal factor, both axis orders, so BOTH branches of the
     mixed-factor refresh are exercised: q0-triangular/q1-diagonal (big axis second) uses distinct einsum
     index patterns from the q0-diagonal/q1-triangular case (big axis first). Verifies the mixed
-    preconditioner still whitens a diagonal-axis covariance. Independent of legacy AND the shipped code."""
+    preconditioner still whitens a diagonal-axis covariance."""
 
     torch.manual_seed(0)
     big, small = 12, 4

@@ -10,9 +10,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from heavyball import kl_shampoo as kl_shampoo_export
-from heavyball import kl_shampoo_adamw, kl_soap_adamw
-from heavyball import kl_soap as kl_soap_export
+from heavyball import kl_shampoo as kl_shampoo_export, kl_shampoo_adamw, kl_soap as kl_soap_export, kl_soap_adamw
 from heavyball.core import Engine
 from heavyball.kl import kl_shampoo_recipe, kl_soap_recipe
 from heavyball.matrix import _project

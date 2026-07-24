@@ -60,7 +60,7 @@ def test_mixed_dtype_optimizer_updates_both_params_finitely():
             param.grad.fill_(1.0)
         before = [p.detach().clone() for p in params]
         opt.step()
-        for param, prior in zip(params, before):
+        for param, prior in zip(params, before, strict=True):
             assert torch.isfinite(param).all()
             assert not torch.equal(param, prior)
 
@@ -80,10 +80,10 @@ def test_mixed_dtype_checkpoint_roundtrip_preserves_both_hypers():
     opt2.load_state_dict(checkpoint)
 
     grads = [torch.randn_like(p) for p in params]
-    for param, restored_param, grad in zip(params, restored, grads):
+    for param, restored_param, grad in zip(params, restored, grads, strict=True):
         param.grad.copy_(grad)
         restored_param.grad.copy_(grad)
     opt.step()
     opt2.step()
-    for param, restored_param in zip(params, restored):
+    for param, restored_param in zip(params, restored, strict=True):
         torch.testing.assert_close(param, restored_param, rtol=0, atol=0)

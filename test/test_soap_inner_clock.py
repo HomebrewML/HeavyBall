@@ -12,7 +12,6 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 with patch("heavyball.core.torch.compile", lambda f, **k: f):

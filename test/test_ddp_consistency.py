@@ -10,7 +10,6 @@ the grad-flow guarantee is compile-independent, and it avoids CPU multi-process 
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest

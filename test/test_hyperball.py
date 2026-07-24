@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import reference
 import torch
 
 import heavyball
-import reference
 from heavyball import Engine, hyperball, hyperball_adamw, hyperball_commit
 
 

@@ -5,40 +5,21 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import reference
 import torch
 
 import heavyball
-import heavyball_legacy
-import reference
 from heavyball import Engine, adamw, sf_adamw
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield
-    finally:
-        legacy.compile_mode = previous
 
 
 def _copy_grads(params, gradients):
     for param, gradient in zip(params, gradients, strict=True):
         param.grad.copy_(gradient)
-
-
-def _assert_params_close(actual, expected, *, rtol, atol, stage):
-    for index, (result, reference) in enumerate(zip(actual, expected, strict=True)):
-        torch.testing.assert_close(result, reference, rtol=rtol, atol=atol, msg=f"{stage}, parameter {index}")
 
 
 @pytest.mark.parametrize(
@@ -150,7 +131,7 @@ def test_sf_master_iterate_is_fp32_for_low_precision_params():
 
 
 def test_sf_eval_swap_roundtrip():
-    """Eval follows legacy's representation swap and train restores the prior iterate."""
+    """Eval follows the schedule-free representation swap and train restores the prior iterate."""
 
     torch._dynamo.reset()
     param = torch.nn.Parameter(torch.tensor((1.0, -2.0), dtype=torch.float64))
@@ -199,8 +180,8 @@ def test_sf_zero_beta1_eval_swap_is_noop():
 
 
 @pytest.mark.parametrize("cautious_weight_decay", (False, True))
-def test_sf_caution_and_decay_match_legacy(cautious_weight_decay):
-    """Schedule-free folds decay before general caution, including cautious decay."""
+def test_sf_caution_and_decay_match_direct_recurrence(cautious_weight_decay):
+    """Independently recompute decay-before-caution and schedule-free averaging."""
 
     values = dict(
         lr=0.1,
@@ -211,39 +192,84 @@ def test_sf_caution_and_decay_match_legacy(cautious_weight_decay):
         caution=True,
         cautious_weight_decay=cautious_weight_decay,
     )
+    weight_lr_power = 2.0
     params = [
         torch.nn.Parameter(torch.tensor((100.0, -100.0), dtype=torch.float64)),
         torch.nn.Parameter(torch.tensor((-2.0, 3.0), dtype=torch.float64)),
     ]
-    legacy_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
+    states = [
+        {
+            "param": param.detach().clone(),
+            "z": param.detach().clone(),
+            "variance": torch.zeros_like(param),
+            "weight_sum": torch.zeros((), dtype=param.dtype),
+            "lr_max": torch.zeros((), dtype=param.dtype),
+        }
+        for param in params
+    ]
     recipe = replace(
         sf_adamw,
         defaults={**sf_adamw.defaults, "caution": 0.0, "cautious_weight_decay": 0.0},
     )
     with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
         optimizer = Engine(params, recipe, **values)
-    with _legacy_eager():
-        legacy_optimizer = heavyball_legacy.SFAdamW(
-            legacy_params,
-            lr=values["lr"],
-            betas=(values["beta1"], values["beta2"]),
-            eps=values["eps"],
-            weight_decay=values["weight_decay"],
-            caution=values["caution"],
-            cautious_weight_decay=cautious_weight_decay,
-            storage_dtype="float64",
-            compile_step=False,
-        )
-        for step_gradients in (
+    for step, step_gradients in enumerate(
+        (
             (torch.tensor((-0.01, 0.01), dtype=torch.float64), torch.tensor((0.5, -0.5), dtype=torch.float64)),
             (torch.tensor((0.2, -0.3), dtype=torch.float64), torch.tensor((-0.4, 0.6), dtype=torch.float64)),
-        ):
-            _copy_grads(params, step_gradients)
-            for param, gradient in zip(legacy_params, step_gradients, strict=True):
-                param.grad = gradient.clone()
-            optimizer.step()
-            legacy_optimizer.step()
-            _assert_params_close(params, legacy_params, rtol=1e-12, atol=1e-12, stage="caution")
+        ),
+        start=1,
+    ):
+        for state, gradient in zip(states, step_gradients, strict=True):
+            state["variance"].mul_(values["beta2"]).addcmul_(
+                gradient,
+                gradient,
+                value=1 - values["beta2"],
+            )
+            rms = (state["variance"] / (1 - values["beta2"] ** step)).sqrt()
+            update = gradient / rms.clamp_min(values["eps"] ** 0.5)
+            if cautious_weight_decay:
+                decay_aligned = (
+                    ((state["param"] > 0) & (update > 0))
+                    | ((state["param"] < 0) & (update < 0))
+                )
+                decay_param = torch.where(decay_aligned, state["param"], torch.zeros_like(state["param"]))
+            else:
+                decay_param = state["param"]
+            update = update + decay_param * values["weight_decay"]
+            aligned = ((gradient > 0) & (update > 0)) | ((gradient < 0) & (update < 0))
+            caution_scale = update.numel() / aligned.sum().clamp_min(1).to(update.dtype)
+            update = torch.where(aligned, update, torch.zeros_like(update)) * caution_scale
+
+            state["lr_max"] = torch.maximum(
+                state["lr_max"],
+                state["lr_max"].new_tensor(abs(values["lr"])),
+            )
+            weight = state["lr_max"].pow(weight_lr_power)
+            state["weight_sum"] = state["weight_sum"] + weight
+            ckp1 = weight / state["weight_sum"]
+            state["param"] = torch.lerp(state["param"], state["z"], ckp1)
+            state["param"] = state["param"] + update * (
+                values["lr"] * (values["beta1"] * (1 - ckp1)) - values["lr"]
+            )
+            state["z"] = state["z"] - update * values["lr"]
+
+        _copy_grads(params, step_gradients)
+        optimizer.step()
+        torch.testing.assert_close(
+            torch.stack([param.detach() for param in params]),
+            torch.stack([state["param"] for state in states]),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        commit_state = optimizer.groups[0].commit_state
+        torch.testing.assert_close(commit_state["z"], torch.stack([state["z"] for state in states]), rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(
+            commit_state["weight_sum"],
+            torch.stack([state["weight_sum"] for state in states]),
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
 
 def test_sf_train_mode_checkpointed():

@@ -49,7 +49,9 @@ def test_muon_public_route_matches_keller_jordan(shape):
         p = nn.Parameter(torch.zeros(*shape, dtype=torch.float64))
         opt = heavyball.Muon([p], lr=lr, beta1=beta, weight_decay=wd)
         for g in grads:
-            opt.zero_grad(); p.grad.copy_(g); opt.step()
+            opt.zero_grad()
+            p.grad.copy_(g)
+            opt.step()
         hb = p.detach()
     ref = _kj_muon(grads, shape, lr, beta, wd)
     torch.testing.assert_close(hb, ref, rtol=0, atol=1e-12)

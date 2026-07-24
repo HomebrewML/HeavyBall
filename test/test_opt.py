@@ -13,15 +13,49 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import reference
 import torch
 
-import heavyball
-import reference
 from heavyball import (
-    Engine, ParamInfo, Recipe, Route, SAM, adam, adamw, ademamix, adopt, build, caution, cautious_adamw,
-    laprop, laprop_ortho, laprop_transform, lion, mars, mars_adamw, momentum, muon, muon_commit, muon_laprop,
-    nadam, ortho_laprop, orthogonalize, orthograd, orthograd_adamw, rmsprop, sgd, sgd_commit, shampoo,
-    shampoo_adamw, sign_laprop, signsgd, soap, soap_adamw, truegrad_adam, unscaled_adamw, whiten_adamw, whitening,
+    SAM,
+    Engine,
+    ParamInfo,
+    Recipe,
+    Route,
+    adam,
+    adamw,
+    ademamix,
+    adopt,
+    build,
+    caution,
+    cautious_adamw,
+    laprop,
+    laprop_ortho,
+    laprop_transform,
+    lion,
+    mars_adamw,
+    momentum,
+    muon,
+    muon_commit,
+    muon_laprop,
+    nadam,
+    ortho_laprop,
+    orthogonalize,
+    orthograd,
+    orthograd_adamw,
+    rmsprop,
+    sgd,
+    sgd_commit,
+    shampoo,
+    shampoo_adamw,
+    sign_laprop,
+    signsgd,
+    soap,
+    soap_adamw,
+    truegrad_adam,
+    unscaled_adamw,
+    whiten_adamw,
+    whitening,
 )
 from heavyball.transforms import Tempo
 
@@ -1520,7 +1554,7 @@ def test_orthogonalize_matches_svd_polar_factor(capsys):
     for shape in ((4, 7), (7, 4), (16, 16), (32, 8)):
         slab = torch.randn(2, *shape, dtype=torch.float64)
         output = _orthogonalized(slab)
-        for leaf_out, leaf_in in zip(output, slab):
+        for leaf_out, leaf_in in zip(output, slab, strict=True):
             u, _, vh = torch.linalg.svd(leaf_in, full_matrices=False)
             worst = max(worst, (leaf_out - u @ vh).abs().max().item())
     with capsys.disabled():
@@ -1714,7 +1748,7 @@ def test_sam_rejects_observation_missing_from_second_closure():
 
     assert calls == 2
     assert torch.equal(param, original)
-    assert not getattr(param, "_heavyball_observation_binding").produced
+    assert not param._heavyball_observation_binding.produced
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))

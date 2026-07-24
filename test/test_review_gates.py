@@ -85,7 +85,9 @@ def test_lifecycle_swap_bumps_version():
         p = nn.Parameter(torch.tensor([2.0]))
         opt = heavyball.ScheduleFree([p], lr=0.1)
         for _ in range(3):
-            opt.zero_grad(); (p * p).sum().backward(); opt.step()
+            opt.zero_grad()
+            (p * p).sum().backward()
+            opt.step()
         opt.train()
         y = (p * p).sum()
         v0 = p._version

@@ -4,29 +4,16 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 
-import heavyball_legacy.chainable as legacy_chainable
 from heavyball.core import Engine
 from heavyball.lather import lather
 from heavyball.matrix import _project
 from heavyball.transforms import Tempo, beta_debias
-
-
-@contextmanager
-def _legacy_eager():
-    import heavyball_legacy.utils as legacy
-
-    previous = legacy.compile_mode
-    legacy.compile_mode = None
-    try:
-        yield
-    finally:
-        legacy.compile_mode = previous
 
 
 def _eager_engine(params, **hyper) -> Engine:
@@ -36,236 +23,86 @@ def _eager_engine(params, **hyper) -> Engine:
         return Engine(params, lather, **hyper)
 
 
-def _legacy_group(dtype: torch.dtype, *, refresh: bool, step: int) -> dict:
-    return {
-        "betas": (0.9, 0.999),
-        "caution": False,
-        "dampening": 1e-6,
-        "eps": 1e-8,
-        "is_preconditioning": refresh,
-        "lower_bound_beta": 0.9,
-        "max_size_triangular": 8,
-        "memory_save_mode": None,
-        "min_ndim_triangular": 2,
-        "momentum_into_precond_update": True,
-        "precond_grad_accum": False,
-        "precond_init_scale": 1.0,
-        "precond_init_scale_scale": 1.0,
-        "precond_init_scale_power": None,
-        "precond_lr": 0.05,
-        "precond_update_power_iterations": 2,
-        "q_dtype": str(dtype).removeprefix("torch."),
-        "step": step,
-        "step_count": step,
-        "storage_dtype": str(dtype).removeprefix("torch."),
-        "store_triu_as_line": False,
-    }
+def _orthogonal(dimension: int, *, dtype: torch.dtype) -> torch.Tensor:
+    values = torch.arange(1, dimension * dimension + 1, dtype=dtype).reshape(dimension, dimension)
+    return torch.linalg.qr(values + torch.eye(dimension, dtype=dtype) * dimension).Q
 
 
-def _legacy_slot(state: dict, label: str):
-    prefix = f"scale_by_lather_{label}_"
-    for key, value in state.items():
-        if key.startswith(prefix):
-            return value
-        if key.startswith("__bucket_") and isinstance(value, dict):
-            found = _legacy_slot(value, label)
-            if found is not None:
-                return found
-    return None
+def _reference_project(
+    matrix: torch.Tensor,
+    left: torch.Tensor | None,
+    right: torch.Tensor | None,
+    *,
+    back: bool,
+) -> torch.Tensor:
+    if left is not None:
+        matrix = (left if back else left.mT) @ matrix
+    if right is not None:
+        matrix = matrix @ (right.mT if back else right)
+    return matrix
 
 
-def _legacy_scale_by_lather():
-    (transform,) = legacy_chainable.set_indices((legacy_chainable.scale_by_lather,), retain=False)
-    return transform
+@pytest.mark.parametrize(("shape", "max_size"), (((3, 4), 8), ((12, 5), 8)))
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    ((torch.float64, 1e-12, 1e-12), (torch.float32, 2e-6, 2e-6)),
+)
+def test_lather_normal_step_is_adam_in_the_stored_basis(shape, max_size, dtype, rtol, atol):
+    """Recompute projection, debiased Adam, and inverse projection from their equations."""
 
-
-def _copy_legacy_state(optimizer: Engine, legacy_state: dict) -> None:
-    state = optimizer.groups[0].states[0]
-    q0, q1 = _legacy_slot(legacy_state, "Q")
-    basis0, basis1 = _legacy_slot(legacy_state, "Q_basis")
-    lower0, lower1 = _legacy_slot(legacy_state, "running_lower_bound")
-    state["Q_0"].copy_(q0)
-    state["Q_1"].copy_(q1)
-    for key, basis in (("Q_basis_0", basis0), ("Q_basis_1", basis1)):
-        if basis is None:
-            assert key not in state
-        else:
-            state[key].copy_(basis)
-    state["running_lower_bound_0"].copy_(lower0)
-    state["running_lower_bound_1"].copy_(lower1)
-    state["exp_avg"].copy_(_legacy_slot(legacy_state, "exp_avg"))
-    state["exp_avg_sq"].copy_(_legacy_slot(legacy_state, "exp_avg_sq"))
-
-
-def test_lather_matches_legacy():
-    """RNG-synced direct parity with legacy ``scale_by_lather`` and all its state."""
-
-    with _legacy_eager():
-        for dtype, tolerance in ((torch.float64, 1e-10), (torch.float32, 2e-5)):
-            torch.manual_seed(52)
-            legacy_param = torch.nn.Parameter(torch.randn(3, 4, dtype=dtype))
-            legacy_state: dict = {}
-            transform = _legacy_scale_by_lather()
-
-            def state_fn(_param):
-                return legacy_state
-
-            bootstrap = torch.randn_like(legacy_param)
-            assert transform(
-                state_fn,
-                _legacy_group(dtype, refresh=False, step=1),
-                [bootstrap.clone()],
-                [bootstrap.clone()],
-                [legacy_param],
-            ) is legacy_chainable._SKIP
-
-            opt_param = torch.nn.Parameter(legacy_param.detach().clone())
-            optimizer = _eager_engine(
-                [opt_param],
-                lr=0.1,
-                precond_lr=0.05,
-                lower_bound_beta=0.9,
-                dampening=1e-6,
-                weight_decay=0.0,
-            )
-            _copy_legacy_state(optimizer, legacy_state)
-
-            for step, refresh in enumerate((False, True, False, True), start=2):
-                gradient = torch.randn_like(legacy_param)
-                before = opt_param.detach().clone()
-                opt_param.grad.copy_(gradient)
-                probe_seed = 900 + step
-
-                torch.manual_seed(probe_seed)
-                expected = transform(
-                    state_fn,
-                    _legacy_group(dtype, refresh=refresh, step=step),
-                    [gradient.clone()],
-                    [gradient.clone()],
-                    [legacy_param],
-                )[0]
-
-                torch.manual_seed(probe_seed)
-                with patch.object(Tempo, "randn_like", lambda _tempo, value: torch.randn_like(value)):
-                    optimizer.step(step_type="refresh" if refresh else "normal")
-                actual = (before - opt_param.detach()) / 0.1
-                torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-                state = optimizer.groups[0].states[0]
-                legacy_q0, legacy_q1 = _legacy_slot(legacy_state, "Q")
-                legacy_basis0, legacy_basis1 = _legacy_slot(legacy_state, "Q_basis")
-                legacy_lower0, legacy_lower1 = _legacy_slot(legacy_state, "running_lower_bound")
-                torch.testing.assert_close(state["Q_0"], legacy_q0, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(state["Q_1"], legacy_q1, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(state["Q_basis_0"], legacy_basis0, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(state["Q_basis_1"], legacy_basis1, rtol=tolerance, atol=tolerance)
-                torch.testing.assert_close(
-                    state["running_lower_bound_0"], legacy_lower0, rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    state["running_lower_bound_1"], legacy_lower1, rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    state["exp_avg"], _legacy_slot(legacy_state, "exp_avg"), rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    state["exp_avg_sq"],
-                    _legacy_slot(legacy_state, "exp_avg_sq"),
-                    rtol=tolerance,
-                    atol=tolerance,
-                )
-
-
-def test_lather_mixed_oversized_axis_matches_legacy(capsys):
-    """A diagonal axis omits its basis and remains fp64-equivalent to legacy."""
-
-    tolerance = 1e-10
-    max_abs_diff = 0.0
-    with _legacy_eager():
-        torch.manual_seed(52)
-        legacy_param = torch.nn.Parameter(torch.randn(12, 5, dtype=torch.float64))
-        legacy_state: dict = {}
-        transform = _legacy_scale_by_lather()
-
-        def state_fn(_param):
-            return legacy_state
-
-        bootstrap = torch.randn_like(legacy_param)
-        assert transform(
-            state_fn,
-            _legacy_group(torch.float64, refresh=False, step=1),
-            [bootstrap.clone()],
-            [bootstrap.clone()],
-            [legacy_param],
-        ) is legacy_chainable._SKIP
-
-        opt_param = torch.nn.Parameter(legacy_param.detach().clone())
-        optimizer = _eager_engine(
-            [opt_param],
-            lr=0.1,
-            precond_lr=0.05,
-            lower_bound_beta=0.9,
-            dampening=1e-6,
-            max_size_triangular=8,
-            weight_decay=0.0,
-        )
-        _copy_legacy_state(optimizer, legacy_state)
-        state = optimizer.groups[0].states[0]
-        assert state["Q_0"].shape == (1, 12)
-        assert state["Q_1"].shape == (1, 5, 5)
-        assert state["Q_0"][0].ndim == 1
-        assert state["Q_1"][0].ndim == 2
+    beta1, beta2, eps, lr = 0.9, 0.999, 1e-8, 0.1
+    parameter = torch.nn.Parameter(torch.zeros(shape, dtype=dtype))
+    optimizer = _eager_engine(
+        [parameter],
+        lr=lr,
+        beta1=beta1,
+        beta2=beta2,
+        eps=eps,
+        max_size_triangular=max_size,
+        weight_decay=0.0,
+    )
+    group = optimizer.groups[0]
+    state = group.states[0]
+    left = None
+    right = None
+    if "Q_basis_0" in state:
+        left = _orthogonal(shape[0], dtype=dtype).unsqueeze(0)
+        state["Q_basis_0"].copy_(left)
+    if "Q_basis_1" in state:
+        right = _orthogonal(shape[1], dtype=dtype).unsqueeze(0)
+        state["Q_basis_1"].copy_(right)
+    if shape[0] > max_size:
+        assert state["Q_0"].shape == (1, shape[0])
         assert "Q_basis_0" not in state
-        assert "Q_basis_1" in state
 
-        for step, refresh in enumerate((True, False, False, True, False), start=2):
-            gradient = torch.randn_like(legacy_param)
-            before = opt_param.detach().clone()
-            opt_param.grad.copy_(gradient)
-            probe_seed = 900 + step
+    old_avg = torch.linspace(-0.4, 0.6, parameter.numel(), dtype=dtype).reshape(1, *shape)
+    old_rms = torch.linspace(0.3, 0.9, parameter.numel(), dtype=dtype).reshape(1, *shape)
+    state["exp_avg"].copy_(old_avg)
+    state["exp_avg_sq"].copy_(old_rms)
+    group.age.fill_(1)
+    q_state = {name: value.clone() for name, value in state.items() if name.startswith(("Q_", "running_"))}
+    gradient = torch.linspace(-1.1, 1.3, parameter.numel(), dtype=dtype).reshape(shape)
 
-            torch.manual_seed(probe_seed)
-            expected = transform(
-                state_fn,
-                _legacy_group(torch.float64, refresh=refresh, step=step),
-                [gradient.clone()],
-                [gradient.clone()],
-                [legacy_param],
-            )[0]
+    projected = _reference_project(gradient.unsqueeze(0), left, right, back=False)
+    debiased_beta1 = beta1 / (1 + beta1)
+    debiased_beta2 = beta2 / (1 + beta2)
+    expected_avg = old_avg * debiased_beta1 + projected * (1 - debiased_beta1)
+    expected_rms = (
+        old_rms.square() * debiased_beta2
+        + projected.square() * (1 - debiased_beta2)
+    ).sqrt()
+    projected_direction = expected_avg / expected_rms.clamp_min(eps**0.5)
+    expected_direction = _reference_project(projected_direction, left, right, back=True)[0]
 
-            torch.manual_seed(probe_seed)
-            with patch.object(Tempo, "randn_like", lambda _tempo, value: torch.randn_like(value)):
-                optimizer.step(step_type="refresh" if refresh else "normal")
-            actual = (before - opt_param.detach()) / 0.1
-            max_abs_diff = max(max_abs_diff, float((actual - expected).abs().max()))
-            torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    before = parameter.detach().clone()
+    parameter.grad.copy_(gradient)
+    optimizer.step(step_type="normal")
 
-            legacy_q0, legacy_q1 = _legacy_slot(legacy_state, "Q")
-            _, legacy_basis1 = _legacy_slot(legacy_state, "Q_basis")
-            legacy_lower0, legacy_lower1 = _legacy_slot(legacy_state, "running_lower_bound")
-            torch.testing.assert_close(state["Q_0"], legacy_q0, rtol=tolerance, atol=tolerance)
-            torch.testing.assert_close(state["Q_1"], legacy_q1, rtol=tolerance, atol=tolerance)
-            torch.testing.assert_close(state["Q_basis_1"], legacy_basis1, rtol=tolerance, atol=tolerance)
-            torch.testing.assert_close(
-                state["running_lower_bound_0"], legacy_lower0, rtol=tolerance, atol=tolerance
-            )
-            torch.testing.assert_close(
-                state["running_lower_bound_1"], legacy_lower1, rtol=tolerance, atol=tolerance
-            )
-            torch.testing.assert_close(
-                state["exp_avg"], _legacy_slot(legacy_state, "exp_avg"), rtol=tolerance, atol=tolerance
-            )
-            torch.testing.assert_close(
-                state["exp_avg_sq"],
-                _legacy_slot(legacy_state, "exp_avg_sq"),
-                rtol=tolerance,
-                atol=tolerance,
-            )
-            assert "Q_basis_0" not in state
-            assert "Q_basis_1" in state
-
-    with capsys.disabled():
-        print(f"lather mixed oversized fp64 max abs diff: {max_abs_diff:.9e}")
+    torch.testing.assert_close((before - parameter) / lr, expected_direction, rtol=rtol, atol=atol)
+    torch.testing.assert_close(state["exp_avg"], expected_avg, rtol=rtol, atol=atol)
+    torch.testing.assert_close(state["exp_avg_sq"], expected_rms, rtol=rtol, atol=atol)
+    for name, value in q_state.items():
+        torch.testing.assert_close(state[name], value, rtol=0, atol=0)
 
 
 def test_lather_both_oversized_axes_use_linear_factor_storage():
@@ -370,7 +207,7 @@ def test_lather_refresh_transports():
     beta1 = beta_debias(hyper.beta1, age).reshape(1, 1, 1)
     beta2 = beta_debias(hyper.beta2, age).reshape(1, 1, 1)
     raw_avg = old_avg * beta1 + projected * (1 - beta1)
-    raw_avg_sq = old_avg_sq * beta2 + projected.square() * (1 - beta2)
+    raw_avg_sq = (old_avg_sq.square() * beta2 + projected.square() * (1 - beta2)).sqrt()
     physical_before_transport = _project(raw_avg, old_left, old_right, back=True)
 
     param.grad.copy_(second)
@@ -388,7 +225,12 @@ def test_lather_refresh_transports():
     torch.testing.assert_close(physical_after_transport, physical_before_transport, rtol=2e-5, atol=2e-5)
     left_transition = torch.einsum("nia,nic->nac", old_left, refreshed["Q_basis_0"]).square()
     right_transition = torch.einsum("njb,njd->nbd", old_right, refreshed["Q_basis_1"]).square()
-    expected_sq = torch.einsum("nab,nac,nbd->ncd", raw_avg_sq, left_transition, right_transition).clamp_min(0)
+    expected_sq = torch.einsum(
+        "nab,nac,nbd->ncd",
+        raw_avg_sq.square(),
+        left_transition,
+        right_transition,
+    ).clamp_min(0).sqrt()
     torch.testing.assert_close(state["exp_avg_sq"], expected_sq, rtol=2e-5, atol=2e-5)
     assert not torch.equal(state["exp_avg"], raw_avg)
     assert not torch.equal(state["exp_avg_sq"], raw_avg_sq)
@@ -450,5 +292,3 @@ def test_lather_fullgraph_clean(tmp_path):
         r"_foreach|vmap|torch\.cond|while_loop|dynamic=True|torch\.stack|\.item\(|autocast|\benabled\b|\bamp\b",
         source,
     )
-    assert "heavyball_legacy.utils" not in source
-    assert "heavyball_legacy.chainable" not in source

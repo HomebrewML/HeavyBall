@@ -12,7 +12,6 @@ import torch.nn as nn
 
 import heavyball
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="compile-first GPU path"
 )
