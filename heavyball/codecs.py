@@ -9,6 +9,8 @@ keep all 16 lower bits and therefore reconstruct the float32 bit-exactly.
 import torch
 from torch.distributed.tensor import DTensor
 
+from .numerics import _stochastic_keep_finite
+
 _CORRECTION_BITS = {torch.int8: 8, torch.int16: 16}
 
 
@@ -28,7 +30,7 @@ def _stochastic_keep(bits: torch.Tensor, keep_bits: int, random: torch.Tensor) -
     if discarded == 0:
         return bits
     noise = (random * (1 << discarded)).to(torch.int32)
-    return (bits + noise).bitwise_and(-(1 << discarded))
+    return _stochastic_keep_finite(bits, noise, keep_bits)
 
 
 def encode(

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .core import Recipe
-from .numerics import _wide, stable_l2_normalize
+from .numerics import _stochastic_keep_finite, _wide, stable_l2_normalize
 from .transforms import WHOLE, Tempo, first_moment, orthogonalize, sgd_commit
 
 
@@ -76,7 +76,7 @@ def _copy_initialized_(target: Tensor, source: Tensor, generator: torch.Generato
             device=bits.device,
             generator=generator,
         )
-        source = (bits + noise).bitwise_and(-65536).view(torch.float32).bfloat16()
+        source = _stochastic_keep_finite(bits, noise, 16).view(torch.float32).bfloat16()
     target.copy_(source)
 
 
@@ -106,6 +106,7 @@ scion_lmo.init = scion_lmo_init
 scion_lmo.distributed_scope = WHOLE
 scion_lmo.param_init = scion_param_init
 scion_lmo.param_init_hyper = ("scale",)
+scion_lmo.param_init_deferred = True
 
 scion = Recipe(
     chain=(first_moment, scion_lmo),

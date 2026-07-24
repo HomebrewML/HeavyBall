@@ -78,14 +78,19 @@ def _transport_rank1_first_moment(m, old_w, new_w):
 
 
 def _transport_rank1_second_moment(q, old_w, new_w):
+    dtype = q.dtype
+    q = q.double().square()
+    old_w = old_w.double()
+    new_w = new_w.double()
     c = (old_w * new_w).sum(dim=-1, keepdim=True)
     p = -2.0 * old_w + 4.0 * c * new_w
     r = -2.0 * new_w
     qaa = (q * old_w.square()).sum(dim=-1, keepdim=True)
     qbb = (q * new_w.square()).sum(dim=-1, keepdim=True)
     qab = (q * old_w * new_w).sum(dim=-1, keepdim=True)
-    return (q + 2.0 * q * (old_w * p + new_w * r)
-            + p.square() * qaa + r.square() * qbb + 2.0 * p * r * qab).clamp_min(0)
+    variance = (q + 2.0 * q * (old_w * p + new_w * r)
+                + p.square() * qaa + r.square() * qbb + 2.0 * p * r * qab).clamp_min(0)
+    return variance.sqrt().to(dtype)
 
 
 def suds_init(ref_leaf: Tensor) -> dict[str, Tensor]:

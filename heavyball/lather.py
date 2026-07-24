@@ -21,7 +21,14 @@ from .matrix import (
     merged_matrix_shape,
 )
 from .numerics import _wide, broadcast_leaf
-from .transforms import WHOLE, Tempo, beta_debias, sgd_commit
+from .transforms import (
+    WHOLE,
+    Tempo,
+    _second_moment,
+    _second_moment_denom,
+    beta_debias,
+    sgd_commit,
+)
 
 
 def _next_psgd_eigenbasis(q: Tensor, old_basis: Tensor | None) -> Tensor | None:
@@ -115,9 +122,15 @@ def make_lather(power_iterations: int = 2):
         beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), projected)
         beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), projected)
         next_exp_avg = exp_avg * beta1 + projected * (1 - beta1)
-        next_exp_avg_sq = exp_avg_sq * beta2 + projected.square() * (1 - beta2)
+        next_exp_avg_sq = _second_moment(exp_avg_sq, projected, beta2)
         preconditioned = _project(
-            next_exp_avg / next_exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps), old_left, old_right, back=True
+            next_exp_avg
+            / _second_moment_denom(
+                next_exp_avg_sq, tempo.hyper.eps, projected.dtype
+            ),
+            old_left,
+            old_right,
+            back=True,
         )
 
         q0 = _wide(state["Q_0"])

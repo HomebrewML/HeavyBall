@@ -1,7 +1,5 @@
 """Proofs for HeavyBall 4.0's slab-native optimizer core."""
 
-from __future__ import annotations
-
 import inspect
 import os
 import re
@@ -437,9 +435,21 @@ def test_whiten_preconditions_update_stream():
     torch.testing.assert_close(base_group.states[0]["GG"], transformed_group.states[1]["GG"])
     torch.testing.assert_close(base_group.states[0]["Q"], transformed_group.states[1]["Q"])
     assert not torch.equal(base_param, transformed_param)
-    expected = transformed_group.states[1]["Q"] @ (gradient + torch.ones_like(gradient))
+    factor = transformed_group.states[1]["Q"]
+    transformed_update = gradient + torch.ones_like(gradient)
+    if bool((transformed_group.states[1]["GG_scale"] < 0).all()):
+        expected = factor @ (factor.mT @ transformed_update)
+    else:
+        expected = factor @ transformed_update
     torch.testing.assert_close((transformed_before - transformed_param) / values["lr"], expected[0])
-    torch.testing.assert_close((base_before - base_param) / values["lr"], (base_group.states[0]["Q"] @ gradient)[0])
+    base_factor = base_group.states[0]["Q"]
+    if bool((base_group.states[0]["GG_scale"] < 0).all()):
+        base_expected = base_factor @ (base_factor.mT @ gradient)
+    else:
+        base_expected = base_factor @ gradient
+    torch.testing.assert_close(
+        (base_before - base_param) / values["lr"], base_expected[0]
+    )
 
 
 def test_failed_whitening_construction_preserves_parameter_bindings():
@@ -672,7 +682,12 @@ def test_shampoo_nonuniform_state_shapes():
     state = Engine(params, shampoo).groups[0].states[0]
 
     assert {name: tuple(value.shape) for name, value in state.items()} == {
-        "GG_l": (3, 3, 3), "GG_r": (3, 5, 5), "L": (3, 3, 3), "R": (3, 5, 5),
+        "GG_l": (3, 3, 3),
+        "GG_l_scale": (3,),
+        "GG_r": (3, 5, 5),
+        "GG_r_scale": (3,),
+        "L": (3, 3, 3),
+        "R": (3, 5, 5),
     }
     torch.testing.assert_close(state["L"], torch.eye(3).expand_as(state["L"]), rtol=0, atol=0)
     torch.testing.assert_close(state["R"], torch.eye(5).expand_as(state["R"]), rtol=0, atol=0)
@@ -739,14 +754,33 @@ def test_shampoo_preconditions_update_stream():
     transformed_state = transformed.groups[0].states[1]
     base_update = gradient.unsqueeze(0)
     transformed_update = base_update + torch.ones_like(base_update)
-    torch.testing.assert_close(base_state["GG_l"], base_update @ base_update.mT)
-    torch.testing.assert_close(base_state["GG_r"], base_update.mT @ base_update)
-    torch.testing.assert_close(transformed_state["GG_l"], transformed_update @ transformed_update.mT)
-    torch.testing.assert_close(transformed_state["GG_r"], transformed_update.mT @ transformed_update)
+    torch.testing.assert_close(
+        base_state["GG_l"], base_update @ base_update.mT
+    )
+    torch.testing.assert_close(
+        base_state["GG_r"], base_update.mT @ base_update
+    )
+    torch.testing.assert_close(
+        transformed_state["GG_l"],
+        transformed_update @ transformed_update.mT,
+    )
+    torch.testing.assert_close(
+        transformed_state["GG_r"],
+        transformed_update.mT @ transformed_update,
+    )
     assert not torch.equal(base_state["GG_l"], transformed_state["GG_l"])
     assert not torch.equal(base_state["GG_r"], transformed_state["GG_r"])
     assert not torch.equal(base_param, transformed_param)
-    expected = transformed_state["L"] @ transformed_update @ transformed_state["R"]
+    if bool((transformed_state["GG_l_scale"] < 0).all()):
+        expected = transformed_state["L"] @ (
+            transformed_state["L"].mT @ transformed_update
+        )
+    else:
+        expected = transformed_state["L"] @ transformed_update
+    if bool((transformed_state["GG_r_scale"] < 0).all()):
+        expected = (expected @ transformed_state["R"]) @ transformed_state["R"].mT
+    else:
+        expected = expected @ transformed_state["R"]
     torch.testing.assert_close((transformed_before - transformed_param) / values["lr"], expected[0])
     torch._dynamo.reset()
 
@@ -1269,7 +1303,16 @@ def test_state_dict_is_logical():
         optimizer_a.step()
 
     state_dict = optimizer_a.state_dict()
-    assert set(state_dict) == {"format", "train_mode", "step", "age", "hyper", "state", "fingerprint"}
+    assert set(state_dict) == {
+        "format",
+        "train_mode",
+        "step",
+        "age",
+        "hyper",
+        "state",
+        "fingerprint",
+        "param_init_pending",
+    }
     assert state_dict["format"] == 3
     assert state_dict["train_mode"] is True
     assert set(state_dict["age"]) == set(keys)

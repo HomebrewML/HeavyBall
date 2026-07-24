@@ -7,7 +7,8 @@ state. Construct one like any ``torch.optim`` optimizer::
 
 Every facade's hyperparameters are explicit in its signature (IDE autocomplete / ``inspect.signature``)
 and its docstring names the algorithm (``help(heavyball.SOAP)``). Matrix-preconditioned optimizers
-(SOAP, Shampoo, PSGDKron, KLSOAP, ...) route non-matrix parameters through AdamW.
+(SOAP, Shampoo, PSGDKron, KLSOAP, ...) route non-matrix parameters through AdamW; ``PSGD`` instead
+selects a PSGD-family preconditioner for every leaf by shape.
 
 Optimizer state can be stored in low precision to save memory and bandwidth: pass
 ``storage_dtype=torch.bfloat16`` (half the state memory, often faster) or ``ecc=8`` (bfloat16 plus an
@@ -105,6 +106,10 @@ from .truegrad import register_truegrad
 from .utils import set_torch
 
 KronCadence = RefreshCadence
+whiten.__doc__ = (
+    "Whiten each square-matrix parameter's gradient to unit covariance by left-multiplying it by "
+    "the inverse spectral root of its running Gram (Shampoo-style factored spectral root)."
+)
 
 adamw = Recipe(
     chain=(adam,),
@@ -114,7 +119,7 @@ adamw = Recipe(
 adamc = Recipe(
     chain=(adam,),
     commit=adamc_commit,
-    defaults=dict(lr=0.0025, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0, max_lr=0.0025),
+    defaults=dict(lr=0.0025, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0, max_lr=None),
 )
 mars_adamw = Recipe(
     chain=(mars, adam),
@@ -335,6 +340,14 @@ whiten_adamw = Route(
     whitening,
     adamw,
 )
+
+
+def _psgd_lra_route(info):
+    """Use LRA after a multidimensional leaf crosses PSGD's default full-factor axis limit."""
+
+    return info.ndim >= 2 and any(size > 2048 for size in info.shape)
+
+
 shampoo_adamw = Route(matrix_route, shampoo, adamw)
 soap_adamw = Route(matrix_route, soap, adamw)
 hyperball_adamw = Route(matrix_route, hyperball, adamw)
@@ -347,6 +360,11 @@ heavy_kl_soap_adamw = Route(matrix_route, heavy_kl_soap, adamw)
 heavy_kl_shampoo_adamw = Route(matrix_route, heavy_kl_shampoo, adamw)
 kron_adamw = Route(matrix_route, kron, adamw)
 lather_adamw = Route(matrix_route, lather, adamw)
+psgd = Route(
+    _psgd_lra_route,
+    lra,
+    Route(matrix_route, kron, psgd_nfactor),
+)
 psgd_nfactor_adamw = Route(nfactor_route, psgd_nfactor, Route(matrix_route, psgd_pro, adamw))
 psgd_pro_adamw = Route(matrix_route, psgd_pro, adamw)
 qsgd_adamw = Route(matrix_route, qsgd, adamw)
@@ -398,12 +416,14 @@ from .optim import (  # noqa: E402
     Oblique,
     OrthoGradAdamW,
     OrthoLaProp,
+    PSGD,
     PSGDKron,
     PSGDLRA,
     PSGDNfactor,
     PSGDPro,
     PolarGrad,
     RMSprop,
+    SFAdamW,
     ScheduleFree,
     Scion,
     Shampoo,
@@ -423,8 +443,8 @@ from .optim import (  # noqa: E402
 __all__ = [
     "ADOPT", "AdEMAMix", "AdaMuon", "AdamC", "AdamW", "Aurora", "CautiousAdamW", "HeavyBallOptimizer", "HeavyKLSOAP", "HeavyKLShampoo", "HeavySOAP", "HeavySOAPAdEMAMix", "HeavySOAPNAdam", "HeavySOLP", "HyperBallAdamW", "KLSOAP",
     "KLShampoo", "LATHER", "LaProp", "LaPropOrtho", "Lion", "MARSAdamW", "MSAM", "Muon", "MuonLaProp",
-    "NAdam", "NorMuon", "Oblique", "OrthoGradAdamW", "OrthoLaProp", "PSGDKron", "PSGDLRA", "PSGDNfactor", "PSGDPro", "PolarGrad", "QSGD", "RMSprop", "SGD", "SOAP", "SOAPAdEMAMix", "SOAPNAdam", "SOLP", "SpEL",
-    "SUDSAdamW", "ScheduleFree", "Scion", "Shampoo", "SignLaProp", "SignSGD", "SplitOpt", "TrueGradAdam", "TrueGradLaProp", "TrueGradNAdam", "TrueGradRMSprop", "UnscaledAdamW",
+    "NAdam", "NorMuon", "Oblique", "OrthoGradAdamW", "OrthoLaProp", "PSGD", "PSGDKron", "PSGDLRA", "PSGDNfactor", "PSGDPro", "PolarGrad", "QSGD", "RMSprop", "SGD", "SOAP", "SOAPAdEMAMix", "SOAPNAdam", "SOLP", "SpEL",
+    "SUDSAdamW", "SFAdamW", "ScheduleFree", "Scion", "Shampoo", "SignLaProp", "SignSGD", "SplitOpt", "TrueGradAdam", "TrueGradLaProp", "TrueGradNAdam", "TrueGradRMSprop", "UnscaledAdamW",
     "WhitenAdamW", "Whitening",
     "Engine", "Group", "ParamInfo", "Program", "Recipe", "RefreshCadence", "Route", "SAM", "adam", "adamc", "adamc_commit", "adamw", "ademamix",
     "adamuon", "ademamix_transform", "adopt", "adopt_transform", "aurora", "balanced_orthogonalize", "beta_debias", "build", "caution", "cautious_adamw",
@@ -434,7 +454,7 @@ __all__ = [
     "kl_soap_init", "kl_soap_recipe",
     "hyperball", "hyperball_adamw", "hyperball_commit", "mars", "mars_adamw", "momentum", "momentum_init", "msam_commit", "msam_laprop",
     "muon", "muon_commit", "muon_laprop", "nadam", "nadam_transform", "normuon", "normuon_normalize", "oblique", "oblique_normalization", "oblique_tangent_projection", "orthogonalize", "orthogonalize_init", "orthograd", "polargrad", "polargrad_direction",
-    "lra", "make_psgd_lra", "psgd_lra", "psgd_lra_adamw", "psgd_lra_init",
+    "lra", "make_psgd_lra", "psgd", "psgd_lra", "psgd_lra_adamw", "psgd_lra_init",
     "psgd_kron", "psgd_kron_init", "make_psgd_nfactor", "make_psgd_pro", "nfactor_route", "psgd_nfactor", "psgd_nfactor_adamw", "psgd_nfactor_init", "psgd_nfactor_transform", "psgd_pro", "psgd_pro_adamw", "psgd_pro_init",
     "produce", "psgd_pro_transform", "qsgd", "qsgd_adamw", "qsgd_transform", "register_truegrad",
     "ortho_laprop", "orthograd_adamw", "rms_align", "rmsprop", "rmsprop_transform", "sgd", "sgd_commit", "shampoo",

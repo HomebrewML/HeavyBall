@@ -7,8 +7,6 @@ makes the same whitening-property assertion fail.  That is the silent no-op this
 file is meant to catch.
 """
 
-from __future__ import annotations
-
 from functools import cache
 from typing import NamedTuple
 
@@ -38,6 +36,7 @@ _VARYING_GRADIENTS = (
     _THIRD_GRADIENT,
     _ANISOTROPIC_GRADIENT,
 )
+_DEPRECATED_FACADE_ALIASES = frozenset(("ScheduleFree", "WhitenAdamW"))
 
 
 class _Run(NamedTuple):
@@ -58,7 +57,8 @@ def _facade_classes() -> tuple[type[optim.HeavyBallOptimizer], ...]:
     return tuple(
         value
         for name in optim.__all__
-        if isinstance((value := getattr(optim, name)), type)
+        if name not in _DEPRECATED_FACADE_ALIASES
+        and isinstance((value := getattr(optim, name)), type)
         and issubclass(value, optim.HeavyBallOptimizer)
         and value is not optim.HeavyBallOptimizer
     )
@@ -411,7 +411,8 @@ def _assert_schedule_free(optimizer_class: type[optim.HeavyBallOptimizer]) -> No
     representation_gap = (train_parameter - eval_parameter).norm().item()
     round_trip_error = (train_parameter - restored_parameter).abs().max().item()
     assert representation_gap > 1e-5 and round_trip_error < 1e-7, (
-        f"ScheduleFree: train/eval iterate swap missing; representation gap={representation_gap:.6g}, "
+        f"{optimizer_class.__name__}: train/eval iterate swap missing; "
+        f"representation gap={representation_gap:.6g}, "
         f"round-trip error={round_trip_error:.6g}"
     )
 
@@ -498,6 +499,7 @@ _PROPERTY_RULES = {
     "NAdam": _assert_nadam,
     "OrthoGradAdamW": _assert_orthograd_first,
     "OrthoLaProp": _assert_orthograd_first,
+    "PSGD": _assert_cross_axis_preconditioning,
     "PSGDKron": _assert_cross_axis_preconditioning,
     "PSGDPro": _assert_cross_axis_preconditioning,
     "QSGD": _assert_cross_axis_preconditioning,
@@ -505,7 +507,7 @@ _PROPERTY_RULES = {
     "SGD": _assert_sgd,
     "SOAP": _assert_cross_axis_preconditioning,
     "SUDSAdamW": _assert_suds,
-    "ScheduleFree": _assert_schedule_free,
+    "SFAdamW": _assert_schedule_free,
     "Scion": _assert_scion,
     "Shampoo": _assert_cross_axis_preconditioning,
     "SignLaProp": _assert_sign_laprop,
@@ -515,7 +517,6 @@ _PROPERTY_RULES = {
     "TrueGradNAdam": _assert_truegrad_training,
     "TrueGradRMSprop": _assert_truegrad_training,
     "UnscaledAdamW": _assert_unscaled_adam,
-    "WhitenAdamW": _assert_whitening,
     "Whitening": _assert_whitening,
 }
 

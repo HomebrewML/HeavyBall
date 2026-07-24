@@ -1,7 +1,5 @@
 """Proofs for the slab-native matrix preconditioners."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess
@@ -123,16 +121,18 @@ def test_soap_refresh_transports():
     beta1 = beta_debias(hyper.beta1, age).reshape(1, 1, 1)
     beta2 = beta_debias(hyper.beta2, age).reshape(1, 1, 1)
     raw_avg = first_avg * beta1 + projected * (1 - beta1)
-    raw_avg_sq = first_avg_sq * beta2 + projected.square() * (1 - beta2)
+    raw_variance = first_avg_sq.square() * beta2 + projected.square() * (1 - beta2)
     physical_before_transport = _project(raw_avg, first_left, first_right, back=True)
     physical_after_transport = _project(state["exp_avg"], refreshed_left, refreshed_right, back=True)
     torch.testing.assert_close(physical_after_transport, physical_before_transport, rtol=2e-5, atol=2e-5)
     left_transition = torch.einsum("nAa,nAc->nac", first_left, refreshed_left).square()
     right_transition = torch.einsum("nBb,nBd->nbd", first_right, refreshed_right).square()
-    transported_avg_sq = torch.einsum("nab,nac,nbd->ncd", raw_avg_sq, left_transition, right_transition)
+    transported_avg_sq = torch.einsum(
+        "nab,nac,nbd->ncd", raw_variance, left_transition, right_transition
+    ).sqrt()
     torch.testing.assert_close(state["exp_avg_sq"], transported_avg_sq, rtol=2e-5, atol=2e-5)
     assert not torch.equal(state["exp_avg"], raw_avg)
-    assert not torch.equal(state["exp_avg_sq"], raw_avg_sq)
+    assert not torch.equal(state["exp_avg_sq"], raw_variance.sqrt())
 
     shampoo_beta = beta_debias(hyper.shampoo_beta, age).reshape(1, 1, 1)
     expected_left = first_gg_left * shampoo_beta + (second.unsqueeze(0) @ second.unsqueeze(0).mT) * (1 - shampoo_beta)

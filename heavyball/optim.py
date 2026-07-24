@@ -3,6 +3,7 @@
 import copy
 import inspect
 import os
+import warnings
 from typing import Callable, Iterable, Mapping
 
 import torch
@@ -36,6 +37,7 @@ from . import (
     ortho_laprop,
     orthograd_adamw,
     polargrad,
+    psgd,
     psgd_lra_adamw,
     psgd_nfactor_adamw,
     psgd_pro_adamw,
@@ -97,8 +99,13 @@ def _recipe_defaults(recipe: Recipe | Route, overrides: Mapping[str, object]) ->
     return defaults
 
 
-def _recipe_hyperparameters(recipe: Recipe | Route) -> tuple[tuple[str, type, object], ...]:
-    return tuple((name, type(default), default) for name, default in _recipe_defaults(recipe, {}).items())
+def _recipe_hyperparameters(recipe: Recipe | Route) -> tuple[tuple[str, object, object], ...]:
+    # Sentinel-None recipe hypers (e.g. AdamC ``max_lr``, which inherits ``lr``) are nullable numeric
+    # references; annotate them ``float | None`` instead of the bare ``NoneType``.
+    return tuple(
+        (name, (float | None) if default is None else type(default), default)
+        for name, default in _recipe_defaults(recipe, {}).items()
+    )
 
 
 # Engine-level knobs every facade accepts through ``**hyper`` (build/Engine, not recipe defaults).
@@ -275,6 +282,13 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
     before wrapping the model with DDP or ``torch.compile``. For a supported
     componentwise recipe, call ``Optimizer.fsdp2(model, ...)`` after ``fully_shard(model)``.
 
+    Slab contract (differs from ``torch.optim``): parameters and gradients are bound into persistent
+    buffers, so call ``optimizer.zero_grad(set_to_none=False)`` (the default), never reassign
+    ``p.data``/``p.grad`` (write them in place), and do not change parameter storage after
+    construction (e.g. ``model.to(...)``). Every optimized parameter advances on every step -- weight
+    decay, moments, and the step clock all update even for parameters that received no gradient -- so
+    freeze/unused-branch and conditional workflows need care.
+
     Low-precision optimizer state (opt-in per optimizer; compute always promotes to
     fp32, so accuracy is preserved and only storage shrinks):
 
@@ -343,7 +357,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             )
             if not cls._fsdp2_disabled(caution) or not cls._fsdp2_disabled(cautious_weight_decay):
                 raise ValueError(
-                    "ScheduleFree.fsdp2() requires caution=0 and cautious_weight_decay=0 because cautious "
+                    f"{cls.__name__}.fsdp2() requires caution=0 and cautious_weight_decay=0 because cautious "
                     "normalization reduces over the full logical parameter."
                 )
         resolved_bindings = fsdp2_bindings(model)
@@ -374,7 +388,6 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         if cls.recipe is not None:
             cls.__signature__ = inspect.Signature(
                 [
-                    inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
                     inspect.Parameter(
                         "params", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Iterable[Tensor]
                     ),
@@ -391,7 +404,14 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         _fsdp2_bindings: Mapping[int, FSDP2Binding] | None = None,
         **hyper,
     ) -> None:
-        recipe = recipe if recipe is not None else type(self).recipe
+        if recipe is None:
+            recipe = type(self).recipe
+        elif not isinstance(recipe, (Recipe, Route)):
+            raise TypeError(
+                f"{type(self).__name__}() second positional argument is the internal 'recipe' "
+                f"(expected Recipe/Route, got {type(recipe).__name__}). Pass hyperparameters such as "
+                f"the learning rate by keyword: {type(self).__name__}(params, lr=...)."
+            )
         torch_params = _materialize_params(params)
         _validate_param_group_options(recipe, torch_params, hyper)
         defaults = _recipe_defaults(recipe, hyper)
@@ -418,10 +438,22 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             super().__init__(torch_params, defaults=defaults)
         finally:
             self._initializing = False
+        self._resolve_inherited_hypers()
         self._synced_hypers = [
             {name: param_group[name] for name in self._hyper_names if name in param_group}
             for param_group in self.param_groups
         ]
+
+    def _resolve_inherited_hypers(self) -> None:
+        # AdamC's ``max_lr`` defaults to the per-group ``lr``. Resolve the None sentinel in the public
+        # param groups so _sync_hypers_from_groups (set_hyper -> _scalar, which rejects None) and
+        # user-facing state match the Engine's per-group resolution in core.py.
+        for group in self.param_groups:
+            if "max_lr" in group and group["max_lr"] is None:
+                lr = group["lr"]
+                # Clone tensor LRs: an in-place scheduler update (group["lr"].fill_(...)) must not also
+                # move max_lr, which would collapse lr/max_lr to 1 and defeat the decay scaling.
+                group["max_lr"] = lr.detach().clone() if isinstance(lr, Tensor) else lr
 
     def add_param_group(self, param_group: dict[str, object]) -> None:
         if getattr(self, "_initializing", False):
@@ -451,7 +483,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         )
 
         migrated = engine.state_dict()
-        for name in ("age", "state"):
+        for name in ("age", "state", "param_init_pending"):
             migrated[name].update(old_state[name])
         if "corrections" in old_state:
             migrated["corrections"].update(old_state["corrections"])
@@ -474,6 +506,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                     param.grad.copy_(old_grads[id(param)])
 
         super().add_param_group(materialized_group)
+        self._resolve_inherited_hypers()
         self._engine = engine
         self._engines = [engine]
         self._engine_by_param_id = {id(param): engine for param in engine.params}
@@ -511,7 +544,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                     param_group["cautious_weight_decay"]
                 ):
                     raise ValueError(
-                        "ScheduleFree.fsdp2() requires caution=0 and cautious_weight_decay=0 because cautious "
+                        f"{type(self).__name__}.fsdp2() requires caution=0 and cautious_weight_decay=0 because cautious "
                         "normalization reduces over the full logical parameter."
                     )
         self._sync_hypers_from_groups(force=False)
@@ -701,6 +734,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                 "train_mode": engine._train_mode,
                 "cadence": cadence,
                 "rng": {"seed": engine._rng_seed, "leaf_indices": rng_leaf_indices},
+                "param_init_pending": dict(engine._deferred_param_init_pending),
             }
             metadata["engines"].append(engine_metadata)
             state_dict["engines"][engine_key] = {
@@ -754,7 +788,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                 raise ValueError("DCP checkpoint Engine state does not match this optimizer")
             saved_static = dict(saved_engine)
             expected_static = dict(expected_engine)
-            for name in ("train_mode", "cadence", "rng"):
+            for name in ("train_mode", "cadence", "rng", "param_init_pending"):
                 saved_static.pop(name, None)
                 expected_static.pop(name, None)
             if saved_static != expected_static:
@@ -762,6 +796,24 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             if not isinstance(saved_engine.get("train_mode"), bool):
                 raise ValueError("DCP checkpoint train mode must be a bool")
             self._validate_dcp_cadence(saved_engine.get("cadence"), self._engines[engine_index])
+            saved_param_init_pending = saved_engine.get("param_init_pending")
+            expected_param_init_pending = expected_engine["param_init_pending"]
+            if saved_param_init_pending is not None and (
+                not isinstance(saved_param_init_pending, Mapping)
+                or set(saved_param_init_pending) != set(expected_param_init_pending)
+                or any(not isinstance(value, bool) for value in saved_param_init_pending.values())
+            ):
+                raise ValueError(
+                    "DCP checkpoint deferred parameter initialization does not match this optimizer"
+                )
+            self._engines[engine_index]._validate_deferred_param_init_pending(
+                {
+                    param_key: False
+                    for param_key in expected_param_init_pending
+                }
+                if saved_param_init_pending is None
+                else saved_param_init_pending
+            )
             rng = saved_engine.get("rng")
             if not isinstance(rng, Mapping) or set(rng) != {"seed", "leaf_indices"}:
                 raise ValueError("DCP checkpoint RNG state does not match this optimizer")
@@ -850,6 +902,15 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         for engine, saved_engine in zip(self._engines, metadata["engines"], strict=True):
             engine._train_mode = saved_engine["train_mode"]
             engine._rng_seed = saved_engine["rng"]["seed"]
+            saved_param_init_pending = saved_engine.get("param_init_pending")
+            engine._deferred_param_init_pending = (
+                {
+                    param_key: False
+                    for param_key in engine._deferred_param_init_pending
+                }
+                if saved_param_init_pending is None
+                else dict(saved_param_init_pending)
+            )
             seeds.add(engine._rng_seed)
             if engine._cadence is not None:
                 cadence = saved_engine["cadence"]
@@ -875,17 +936,36 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             current_ecc = None if engine.ecc is None else (8 if engine.ecc is torch.int8 else 16)
             if saved_ecc != current_ecc:
                 raise ValueError("checkpoint ECC configuration does not match this optimizer")
-        super().load_state_dict(torch_state_dict)
-        for index, engine in enumerate(self._engines):
-            engine.load_state_dict(engine_states[index])
-        # Push the restored public group hypers into the Engine cells. A scheduler value set AFTER the
-        # last step leaves the Engine cell stale at checkpoint time; the public group is the source of
-        # truth, so resume must adopt it (else the P==C sync cache below would skip the update forever).
-        self._sync_hypers_from_groups(force=True)
-        seeds = {engine._rng_seed for engine in self._engines}
-        if len(seeds) != 1:
-            raise ValueError("checkpoint Engine RNG seeds do not match")
-        self._rng_seed = next(iter(seeds))
+        # Stage a rollback snapshot so a failure ANYWHERE in the load -- Engine commit, Torch public
+        # commit, the post-load hyper sync, or the RNG-seed check -- leaves the optimizer unchanged
+        # (true atomicity in both directions). Swapping the two commits cannot provide this.
+        engine_snapshots = [engine.state_dict() for engine in self._engines]
+        group_snapshots = [dict(group) for group in self.param_groups]
+        state_snapshot = copy.deepcopy(self.state)
+        synced_snapshot = [dict(synced) for synced in self._synced_hypers]
+        rng_seed_snapshot = self._rng_seed
+        try:
+            for index, engine in enumerate(self._engines):
+                engine.load_state_dict(engine_states[index])
+            super().load_state_dict(torch_state_dict)
+            # Push the restored public group hypers into the Engine cells, then validate RNG seeds.
+            # Both can fail on a malformed checkpoint, so they belong inside the transaction.
+            self._sync_hypers_from_groups(force=True)
+            seeds = {engine._rng_seed for engine in self._engines}
+            if len(seeds) != 1:
+                raise ValueError("checkpoint Engine RNG seeds do not match")
+            self._rng_seed = next(iter(seeds))
+        except BaseException:
+            for engine, snapshot in zip(self._engines, engine_snapshots, strict=True):
+                engine.load_state_dict(snapshot)
+            for group, snapshot in zip(self.param_groups, group_snapshots, strict=True):
+                group.clear()
+                group.update(snapshot)
+            self.state = state_snapshot
+            self._synced_hypers = synced_snapshot
+            self._rng_seed = rng_seed_snapshot
+            self._sync_hypers_from_groups(force=True)
+            raise
 
 
 class AdamW(HeavyBallOptimizer):
@@ -896,7 +976,12 @@ class AdamW(HeavyBallOptimizer):
 
 class AdamC(HeavyBallOptimizer):
     """AdamW whose weight decay is scaled by ``lr / max_lr``, so the effective decay follows the
-    learning-rate schedule."""
+    learning-rate schedule.
+
+    ``max_lr`` is the reference learning rate at which ``weight_decay`` is specified; omit it to
+    inherit the (per-group) construction ``lr`` so the effective decay stays constant as ``lr``
+    schedules.
+    """
 
     recipe = adamc
 
@@ -999,7 +1084,11 @@ class SignSGD(HeavyBallOptimizer):
 
 
 class SGD(HeavyBallOptimizer):
-    """Stochastic gradient descent (raw-gradient step) with decoupled weight decay."""
+    """Stochastic gradient descent: a stateless raw-gradient step with decoupled weight decay.
+
+    Unlike ``torch.optim.SGD``, this exposes no momentum or Nesterov state. For heavy-ball momentum
+    use ``torch.optim.SGD(momentum=...)`` or a custom Recipe built on ``heavyball.momentum``.
+    """
 
     recipe = sgd
 
@@ -1008,24 +1097,49 @@ class Scion(HeavyBallOptimizer):
     """Scion (arXiv:2502.07529): momentum passed through a norm-constrained linear-minimization
     oracle (spectral for matrices, RMS for vectors).
 
-    Construction REINITIALIZES the model in place -- matrices to a random orthogonal frame, vectors
-    to zero -- because the oracle assumes a norm-constrained starting point. Construct Scion *before*
-    loading a checkpoint or pretrained weights, or those weights are silently overwritten.
+    A fresh Scion optimizer reinitializes its parameters in place -- matrices to a seeded orthogonal
+    frame, vectors to zero -- on the FIRST ``step()`` (not at construction), because the oracle assumes
+    a norm-constrained starting point. Because that gradient was computed at the pre-initialization
+    values, the first step performs ONLY the reinitialization and applies no update (it does not
+    consume the gradient); training effectively begins on the second step. Constructing Scion does not
+    mutate parameters, but the first ``step()`` overwrites their current values, so loading model or
+    pretrained weights before the first step does NOT preserve them. Only resuming from a Scion
+    checkpoint skips the reinitialization (the checkpoint records that it has already occurred).
     """
 
     recipe = scion
 
 
-class ScheduleFree(HeavyBallOptimizer):
+class SFAdamW(HeavyBallOptimizer):
     """Schedule-free AdamW (Defazio et al.): an averaged evaluation iterate that removes the
-    learning-rate schedule."""
+    learning-rate schedule.
+
+    Switch to the evaluation iterate with ``optimizer.eval()`` for validation/inference and back to
+    the training iterate with ``optimizer.train()`` before resuming training.
+    """
 
     recipe = sf_adamw
 
 
+class ScheduleFree(SFAdamW):
+    """Deprecated alias for :class:`SFAdamW`."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        warnings.warn(
+            "ScheduleFree is deprecated; use SFAdamW instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
+
 class MSAM(HeavyBallOptimizer):
     """Momentum-SAM (arXiv:2401.12033): a sharpness-aware perturbation along the momentum direction,
-    normalized per leaf."""
+    normalized per leaf.
+
+    Uses distinct train/eval iterates: call ``optimizer.eval()`` for validation/inference and
+    ``optimizer.train()`` before resuming training.
+    """
 
     recipe = msam_laprop
 
@@ -1086,17 +1200,25 @@ class Oblique(HeavyBallOptimizer):
 
 
 class Whitening(HeavyBallOptimizer):
-    """Left-whitening preconditioner for square 2D weights (Q = GG^-1/2 from the gradient Gram,
-    rebuilt on refresh); AdamW on other parameters."""
+    """Whiten each square-matrix parameter's gradient to unit covariance by left-multiplying it by
+    the inverse spectral root of its running Gram (Shampoo-style factored spectral root).
+
+    Non-square and non-matrix parameters use AdamW.
+    """
 
     recipe = whiten_adamw
 
 
-class WhitenAdamW(HeavyBallOptimizer):
-    """Left-whitening preconditioner for square 2D weights (Q = GG^-1/2 from the gradient Gram,
-    rebuilt on the refresh cadence); AdamW on other parameters."""
+class WhitenAdamW(Whitening):
+    """Deprecated alias for :class:`Whitening`."""
 
-    recipe = whiten_adamw
+    def __init__(self, *args, **kwargs) -> None:
+        warnings.warn(
+            "WhitenAdamW is deprecated; use Whitening instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
 
 
 class SOAP(HeavyBallOptimizer):
@@ -1187,38 +1309,50 @@ class HeavyKLShampoo(HeavyBallOptimizer):
     recipe = heavy_kl_shampoo_adamw
 
 
+class PSGD(HeavyBallOptimizer):
+    """Recommended general PSGD entry point. Multi-dimensional leaves with an axis larger than 2048
+    use PSGD-LRA, other matrix-mergeable leaves use PSGD-Kron, and vectors or remaining small leaves
+    use N-factor PSGD."""
+
+    recipe = psgd
+
+
 class PSGDKron(HeavyBallOptimizer):
-    """PSGD-Kron (Li's psgd_torch): an online gradient-whitening Kronecker preconditioner (P = QᵀQ);
-    triangular factors up to ``max_size_triangular``, diagonal beyond; AdamW on non-matrix
-    parameters. The preconditioned update carries no momentum; ``LATHER`` runs Adam (with momentum)
-    in the same whitening basis."""
+    """Explicit PSGD-Kron override (use :class:`PSGD` for general use): Li's online
+    gradient-whitening Kronecker preconditioner (P = QᵀQ), with triangular factors up to
+    ``max_size_triangular`` and diagonal factors beyond; AdamW on non-matrix parameters. The
+    preconditioned update carries no momentum; ``LATHER`` runs Adam (with momentum) in the same
+    whitening basis."""
 
     recipe = kron_adamw
 
 
 class PSGDLRA(HeavyBallOptimizer):
-    """PSGD-LRA: diagonal + low-rank preconditioner fit by Lie-group gradient descent."""
+    """Explicit PSGD-LRA override (use :class:`PSGD` for general use): a diagonal + low-rank
+    preconditioner fit by Lie-group gradient descent."""
 
     recipe = psgd_lra_adamw
 
 
 class PSGDNfactor(HeavyBallOptimizer):
-    """N-factor PSGD-PRO: one Q factor per axis for higher-rank parameters; AdamW on other parameters."""
+    """Explicit N-factor PSGD override (use :class:`PSGD` for general use): one Q factor per axis for
+    higher-rank parameters; AdamW on other parameters."""
 
     recipe = psgd_nfactor_adamw
 
 
 class PSGDPro(HeavyBallOptimizer):
-    """PSGD-PRO (Li's psgd_torch): full per-dimension Q factors fit by a stochastic Procrustes update
-    and applied as P = QᵀQ; AdamW on non-matrix parameters. The preconditioned update carries
-    no momentum."""
+    """Explicit PSGD-PRO override (use :class:`PSGD` for general use): Li's full per-dimension Q
+    factors fit by a stochastic Procrustes update and applied as P = QᵀQ; AdamW on non-matrix
+    parameters. The preconditioned update carries no momentum."""
 
     recipe = psgd_pro_adamw
 
 
 class QSGD(HeavyBallOptimizer):
-    """QSGD (Li's psgd_torch): the PSGD-PRO preconditioner applied once per axis (Q, not QᵀQ); AdamW
-    on non-matrix parameters. The preconditioned update carries no momentum."""
+    """Explicit QSGD override (use :class:`PSGD` for general use): Li's PSGD-PRO preconditioner
+    applied once per axis (Q, not QᵀQ); AdamW on non-matrix parameters. The preconditioned update
+    carries no momentum."""
 
     recipe = qsgd_adamw
 
@@ -1239,28 +1373,44 @@ class SUDSAdamW(HeavyBallOptimizer):
 
 class TrueGradAdam(HeavyBallOptimizer):
     """TrueGrad Adam: Adam whose second-moment EMA uses per-sample gradient-squared observations
-    instead of the stochastic gradient squared."""
+    instead of the stochastic gradient squared.
+
+    Requires per-sample gradient observations: call ``heavyball.register_truegrad(model)`` before the
+    first forward pass (only module types supported by that helper can produce them).
+    """
 
     recipe = truegrad_adam
 
 
 class TrueGradRMSprop(HeavyBallOptimizer):
     """TrueGrad RMSprop: RMSprop whose second-moment EMA uses per-sample gradient-squared
-    observations."""
+    observations.
+
+    Requires per-sample gradient observations: call ``heavyball.register_truegrad(model)`` before the
+    first forward pass (only module types supported by that helper can produce them).
+    """
 
     recipe = truegrad_rmsprop
 
 
 class TrueGradLaProp(HeavyBallOptimizer):
     """TrueGrad LaProp: LaProp whose second-moment normalization uses per-sample gradient-squared
-    observations."""
+    observations.
+
+    Requires per-sample gradient observations: call ``heavyball.register_truegrad(model)`` before the
+    first forward pass (only module types supported by that helper can produce them).
+    """
 
     recipe = truegrad_laprop
 
 
 class TrueGradNAdam(HeavyBallOptimizer):
     """TrueGrad NAdam: NAdam whose second-moment EMA uses per-sample gradient-squared
-    observations."""
+    observations.
+
+    Requires per-sample gradient observations: call ``heavyball.register_truegrad(model)`` before the
+    first forward pass (only module types supported by that helper can produce them).
+    """
 
     recipe = truegrad_nadam
 
@@ -1323,8 +1473,16 @@ class SplitOpt(torch.optim.Optimizer):
         expected = [f"{type(opt).__module__}.{type(opt).__qualname__}" for opt in self.optimizers]
         if state_dict["classes"] != expected:
             raise ValueError(f"Expected optimizer classes {expected}, got {state_dict['classes']}")
-        for opt, state in zip(self.optimizers, states):
-            opt.load_state_dict(state)
+        # Commit all children atomically: a failure loading one child (e.g. a fingerprint mismatch)
+        # must not leave earlier children mutated.
+        snapshots = [opt.state_dict() for opt in self.optimizers]
+        try:
+            for opt, state in zip(self.optimizers, states, strict=True):
+                opt.load_state_dict(state)
+        except BaseException:
+            for opt, snapshot in zip(self.optimizers, snapshots, strict=True):
+                opt.load_state_dict(snapshot)
+            raise
 
     def add_param_group(self, param_group):
         if self._initializing:
@@ -1363,6 +1521,7 @@ __all__ = [
     "Oblique",
     "OrthoGradAdamW",
     "OrthoLaProp",
+    "PSGD",
     "PSGDKron",
     "PSGDLRA",
     "PSGDNfactor",
@@ -1370,6 +1529,7 @@ __all__ = [
     "PolarGrad",
     "QSGD",
     "RMSprop",
+    "SFAdamW",
     "SGD",
     "SOAP",
     "SOAPAdEMAMix",

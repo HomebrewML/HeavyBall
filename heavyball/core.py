@@ -12,6 +12,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 import torch
 from torch import Tensor
 
+from ._inductor_config import STEP_COMPILE_OPTIONS
 from .codecs import decode, encode
 from .numerics import _wide, broadcast_leaf, stochastic_copy_
 from .transforms import _STATE_PHILOX_ROUNDS, SHARD, Tempo, Whole
@@ -373,6 +374,62 @@ def _storage_view_matches(actual: Tensor, expected: Tensor) -> bool:
     )
 
 
+def _dense_storage_span(value: Tensor) -> tuple[int, int] | None:
+    if value.numel() == 0:
+        start = value.storage_offset() * value.element_size()
+        return start, start
+    expected_stride = 1
+    for stride, size in sorted(
+        (stride, size) for size, stride in zip(value.shape, value.stride(), strict=True) if size > 1
+    ):
+        if stride != expected_stride:
+            return None
+        expected_stride *= size
+    start = value.storage_offset() * value.element_size()
+    return start, start + value.numel() * value.element_size()
+
+
+def _storage_element_starts(value: Tensor) -> tuple[int, ...]:
+    offsets = {value.storage_offset()}
+    for size, stride in zip(value.shape, value.stride(), strict=True):
+        offsets = {offset + index * stride for offset in offsets for index in range(size)}
+    element_size = value.element_size()
+    return tuple(sorted(offset * element_size for offset in offsets))
+
+
+def _storage_views_overlap(first: Tensor, second: Tensor) -> bool:
+    if first.numel() == 0 or second.numel() == 0:
+        return False
+    first_span = _dense_storage_span(first)
+    second_span = _dense_storage_span(second)
+    if first_span is not None and second_span is not None:
+        return first_span[0] < second_span[1] and second_span[0] < first_span[1]
+    if first_span is not None:
+        return any(
+            start < first_span[1] and first_span[0] < start + second.element_size()
+            for start in _storage_element_starts(second)
+        )
+    if second_span is not None:
+        return any(
+            start < second_span[1] and second_span[0] < start + first.element_size()
+            for start in _storage_element_starts(first)
+        )
+
+    first_starts = _storage_element_starts(first)
+    second_starts = _storage_element_starts(second)
+    first_index = second_index = 0
+    while first_index < len(first_starts) and second_index < len(second_starts):
+        first_start = first_starts[first_index]
+        second_start = second_starts[second_index]
+        if first_start < second_start + second.element_size() and second_start < first_start + first.element_size():
+            return True
+        if first_start + first.element_size() <= second_start:
+            first_index += 1
+        else:
+            second_index += 1
+    return False
+
+
 @dataclass(frozen=True)
 class PlainBinding:
     """Own the ordinary parameter/gradient aliases at the slab boundary."""
@@ -390,6 +447,13 @@ class PlainBinding:
         self.param.data, self.param.grad = snapshot
 
     def bind_param(self, row: Tensor) -> None:
+        if not self.param.data.is_contiguous():
+            raise ValueError(
+                f"parameter of shape {tuple(self.param.shape)} has non-contiguous strides "
+                f"{tuple(self.param.stride())}; heavyball needs C-contiguous parameters. Make it contiguous "
+                "before constructing the optimizer, e.g. "
+                "nn.Parameter(p.detach().contiguous(), requires_grad=p.requires_grad)."
+            )
         row.copy_(self.param.detach())
         self.param.data = row
 
@@ -403,13 +467,17 @@ class PlainBinding:
     def validate(self, param_row: Tensor, grad_row: Tensor) -> None:
         if self.param.grad is None or not _plain_view_matches(self.param.grad, grad_row):
             raise ValueError(
-                f"gradient for parameter {tuple(self.param.shape)} is no longer slab-bound; write gradients in place "
-                "with loss.backward() or p.grad.copy_(g) instead of reassigning p.grad."
+                f"gradient for parameter {tuple(self.param.shape)} is no longer slab-bound. Write gradients in "
+                "place (loss.backward() or p.grad.copy_(g)), not by reassigning p.grad; this also happens if the "
+                "parameter's storage changed after construction (e.g. model.to(...) after building the optimizer) "
+                "-- place final device/dtype before constructing heavyball."
             )
         if not _plain_view_matches(self.param.data, param_row):
             raise ValueError(
-                f"weights for parameter {tuple(self.param.shape)} are no longer slab-bound; update them in place "
-                "with p.data.copy_(w) instead of reassigning p.data."
+                f"weights for parameter {tuple(self.param.shape)} are no longer slab-bound. Update them in place "
+                "(p.data.copy_(w)), not by reassigning p.data; this also happens if the parameter's storage "
+                "changed after construction (e.g. model.to(...) after building the optimizer) -- place final "
+                "device/dtype before constructing heavyball."
             )
 
 
@@ -1198,6 +1266,10 @@ def _make_fsdp2_whole_segment_transform(
             for transform, _ in param_initializers
             for name in getattr(transform, "param_init_hyper", ())
         ))
+        fsdp2_whole_segment.param_init_deferred = all(
+            getattr(transform, "param_init_deferred", False)
+            for transform, _ in param_initializers
+        )
     names = "_".join(transform.__name__ for _, transform in segment.indexed_transforms)
     if segment.terminal_commit:
         names = f"{names + '_' if names else ''}{recipe.commit.__name__}"
@@ -1210,7 +1282,15 @@ def _make_fsdp2_shard_transform(transform: Transform, logical_shape: tuple[int, 
     def fsdp2_shard_transform(update, obs, param, state, tempo):
         return transform(update, obs, param, state, tempo._replace(logical_shape=logical_shape))
 
-    for name in ("init", "state_init_hyper", "param_init", "param_init_group", "param_init_hyper"):
+    for name in (
+        "init",
+        "state_init_hyper",
+        "state_init_seeded",
+        "param_init",
+        "param_init_group",
+        "param_init_hyper",
+        "param_init_deferred",
+    ):
         if hasattr(transform, name):
             setattr(fsdp2_shard_transform, name, getattr(transform, name))
     fsdp2_shard_transform.__name__ = f"fsdp2_shard_{transform.__name__}"
@@ -1426,15 +1506,15 @@ class Engine:
                     "constructing it from model.parameters()."
                 )
         if not fsdp2_mode:
-            spans: dict[int, list[tuple[int, int]]] = {}
+            storage_groups: dict[torch.UntypedStorage, list[Tensor]] = {}
             for param in self.params:
-                start = param.storage_offset() * param.element_size()
-                spans.setdefault(param.untyped_storage().data_ptr(), []).append(
-                    (start, start + param.numel() * param.element_size())
-                )
-            for ranges in spans.values():  # same storage is fine (e.g. distinct slab rows); OVERLAP is not
-                ranges.sort()
-                if any(current[1] > nxt[0] for current, nxt in zip(ranges, ranges[1:])):
+                storage_groups.setdefault(param.untyped_storage(), []).append(param)
+            for storage_params in storage_groups.values():
+                if any(
+                    _storage_views_overlap(current, nxt)
+                    for index, current in enumerate(storage_params)
+                    for nxt in storage_params[index + 1:]
+                ):
                     raise ValueError(
                         "two parameters share overlapping storage (weight tying via separate "
                         "nn.Parameter objects, or a parameter and a view of another); heavyball binds "
@@ -1618,6 +1698,7 @@ class Engine:
         hypers: dict[tuple[int, int, torch.device, torch.dtype], SimpleNamespace] = {}
         clip_norms: dict[torch.device, Tensor] = {}
         self.groups = []
+        deferred_param_initializers = []
         missing = object()
         original_bindings = tuple(
             (
@@ -1667,6 +1748,12 @@ class Engine:
                         for name, value in recipe.defaults.items()
                         if name not in _HOST_ONLY_HYPERPARAMETERS
                     }
+                    if "max_lr" in values and values["max_lr"] is None and "lr" in values:
+                        # AdamC's ``max_lr`` inherits the per-group ``lr``; resolve before ``_scalar``
+                        # (which rejects None). This is the shared choke point for facades and direct build().
+                        # Require the key to be present (None sentinel), not merely absent, so non-AdamC
+                        # recipes do not acquire a spurious max_lr cell (which would break old checkpoints).
+                        values["max_lr"] = values["lr"]
                     hypers[hyper_key] = SimpleNamespace(
                         **{name: _scalar(value, reference) for name, value in values.items()}
                     )
@@ -1679,25 +1766,36 @@ class Engine:
                 for chain_transform in recipe.chain:
                     group_init_fn = getattr(chain_transform, "param_init_group", None)
                     init_fn = getattr(chain_transform, "param_init", None)
+                    if group_init_fn is None and init_fn is None:
+                        continue
+                    init_hyper = {
+                        name: getattr(hyper, name)
+                        for name in getattr(chain_transform, "param_init_hyper", ())
+                    }
+                    seeds = tuple(param_init_seeds[id(param)] for param in leaves)
+                    if getattr(chain_transform, "param_init_deferred", False):
+                        deferred_param_initializers.append(
+                            (
+                                group_init_fn,
+                                init_fn,
+                                slab,
+                                seeds,
+                                init_hyper,
+                                tuple(self._param_keys[id(param)] for param in leaves),
+                            )
+                        )
+                        continue
                     if group_init_fn is not None:
-                        init_hyper = {
-                            name: getattr(hyper, name)
-                            for name in getattr(chain_transform, "param_init_hyper", ())
-                        }
                         group_init_fn(
                             slab,
-                            seeds=tuple(param_init_seeds[id(param)] for param in leaves),
+                            seeds=seeds,
                             **init_hyper,
                         )
                     elif init_fn is not None:
                         # Hooks stay seed-only unless a transform explicitly
                         # opts into named build-time hyperparameters.
-                        init_hyper = {
-                            name: getattr(hyper, name)
-                            for name in getattr(chain_transform, "param_init_hyper", ())
-                        }
-                        for index, param in enumerate(leaves):
-                            init_fn(slab[index], seed=param_init_seeds[id(param)], **init_hyper)
+                        for index, seed in enumerate(seeds):
+                            init_fn(slab[index], seed=seed, **init_hyper)
                 grad_slab = torch.zeros_like(slab)
                 observed = torch.ones(len(leaves), dtype=torch.bool, device=device)
                 age = torch.zeros(len(leaves), dtype=torch.int64, device=device)
@@ -1754,7 +1852,20 @@ class Engine:
                         state_hyper = {
                             name: getattr(hyper, name) for name in getattr(transform, "state_init_hyper", ())
                         }
-                        initial_states = tuple(transform.init(leaf, **state_hyper) for leaf in initializer_references)
+                        if getattr(transform, "state_init_seeded", False):
+                            initial_states = tuple(
+                                transform.init(
+                                    leaf,
+                                    seed=(self._rng_seed + param_rng_indices[id(param)]) % (1 << 64),
+                                    **state_hyper,
+                                )
+                                for param, leaf in zip(leaves, initializer_references, strict=True)
+                            )
+                        else:
+                            initial_states = tuple(
+                                transform.init(leaf, **state_hyper)
+                                for leaf in initializer_references
+                            )
                         first_state = initial_states[0]
                         for initial_state in initial_states[1:]:
                             if initial_state.keys() != first_state.keys():
@@ -1883,6 +1994,12 @@ class Engine:
             self._steps = tuple(steps.values())
             self._rng_seeds = rng_seeds
             self._clip_norms = tuple(clip_norms.values())
+            self._deferred_param_initializers = tuple(deferred_param_initializers)
+            self._deferred_param_init_pending = {
+                param_key: True
+                for initializer in deferred_param_initializers
+                for param_key in initializer[-1]
+            }
             self.hyper, self.step_count = self.groups[0].hyper, self._steps[0]
             from torch.distributed.tensor import DTensor
 
@@ -1980,6 +2097,7 @@ class Engine:
             for group in self.groups
         )
         clip_norm = self._clip_norms[0] if self._clip_norms else None
+        steps = self._steps
 
         def whole_step():
             pending = []
@@ -2130,11 +2248,16 @@ class Engine:
                     shared_noise=param_noise,
                 )
                 age.copy_(age_now)
+            for step in steps:
+                step.add_(1)
 
         compile_scope = id(self.recipe) if hasattr(self, "_fsdp2_manifest") else None
         plan_abi = _plan_abi(self.groups, clip_norm=clip_norm, compile_scope=compile_scope)
         whole_step = _keyed_compile_fn(whole_step, (plan_abi, "step", refresh))
-        return torch.compile(whole_step, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+        # max_autotune is mandatory: it is what produces fast kernels. "Faster compile" must never come
+        # from disabling it (that only ships slower kernels). Passed as an option so it composes with
+        # the scalar-CSE pass; no cudagraphs (matches the prior max-autotune-no-cudagraphs behavior).
+        return torch.compile(whole_step, fullgraph=True, dynamic=False, options=STEP_COMPILE_OPTIONS)
 
     def _compile_eval_swap(self, *, entering_train: bool):
         plans = tuple(
@@ -2201,7 +2324,7 @@ class Engine:
         compile_scope = id(self.recipe) if hasattr(self, "_fsdp2_manifest") else None
         plan_abi = _plan_abi(self.groups, eval_swap=True, compile_scope=compile_scope)
         whole_swap = _keyed_compile_fn(whole_swap, (plan_abi, "eval_swap", entering_train))
-        return torch.compile(whole_swap, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+        return torch.compile(whole_swap, fullgraph=True, dynamic=False, options=STEP_COMPILE_OPTIONS)
 
     @torch.no_grad()
     def set_hyper(self, name: str, value, *, group_id: int | None = None) -> None:
@@ -2236,6 +2359,34 @@ class Engine:
         if name not in group.recipe.observations:
             raise ValueError(f"{name!r} is not a declared observation for this parameter's group")
         produce(param, name, value)
+
+    @torch.no_grad()
+    def _run_deferred_param_init(self) -> bool:
+        if not any(self._deferred_param_init_pending.values()):
+            return False
+        initialized = []
+        for group_init_fn, init_fn, slab, seeds, init_hyper, param_keys in self._deferred_param_initializers:
+            pending = tuple(
+                index for index, key in enumerate(param_keys)
+                if self._deferred_param_init_pending[key]
+            )
+            if group_init_fn is not None:
+                if pending and len(pending) != len(seeds):
+                    raise ValueError("grouped deferred parameter initialization state is inconsistent")
+                if pending:
+                    group_init_fn(slab, seeds=seeds, **init_hyper)
+            else:
+                for index in pending:
+                    init_fn(slab[index], seed=seeds[index], **init_hyper)
+            initialized.extend(param_keys[index] for index in pending)
+        for param_key in initialized:
+            self._deferred_param_init_pending[param_key] = False
+        return True
+
+    def _validate_deferred_param_init_pending(self, pending: Mapping[str, bool]) -> None:
+        for group_init_fn, _, _, _, _, param_keys in self._deferred_param_initializers:
+            if group_init_fn is not None and len({pending[param_key] for param_key in param_keys}) > 1:
+                raise ValueError("checkpoint grouped deferred parameter initialization is inconsistent")
 
     @torch.no_grad()
     def step(self, *, step_type: str | None = None,
@@ -2292,15 +2443,24 @@ class Engine:
                     group_values, dtype=torch.bool, device=group.param_slab.device
                 ))
                 group.observed_cache = group_values
+        if self._run_deferred_param_init():
+            # Deferred (re)initialization just rewrote parameters from seeded frames. The gradient in
+            # the slab was computed at the pre-initialization parameter values, so applying it now would
+            # update the wrong parameters. Invalidate autograd versions and return without applying an
+            # update or advancing the step clock; the next forward/backward produces a gradient at the
+            # initialized parameters.
+            self._bump_versions()
+            return
         compiled_step()
         self._bump_versions()
-        for step in self._steps:
-            step.add_(1)
 
     @torch.no_grad()
     def zero_grad(self, *, set_to_none: bool = False) -> None:
         if set_to_none:
-            raise ValueError("slab-backed gradients must remain bound; use the in-place default")
+            raise ValueError(
+                "heavyball requires persistent gradient buffers; call optimizer.zero_grad(set_to_none=False) "
+                "(the default)."
+            )
         for group in self.groups:
             for slab in vars(group.observations).values():
                 slab.zero_()
@@ -2393,6 +2553,7 @@ class Engine:
             "train_mode": self._train_mode,
             "step": step,
             "age": age,
+            "param_init_pending": dict(self._deferred_param_init_pending),
             "hyper": hyper,
             "state": state,
             "fingerprint": fingerprint,
@@ -2469,6 +2630,20 @@ class Engine:
         saved_age = state_dict.get("age")
         if not isinstance(saved_age, Mapping) or set(saved_age) != set(self._param_locations):
             raise ValueError("checkpoint ages do not match this Engine")
+        saved_param_init_pending = state_dict.get("param_init_pending")
+        if saved_param_init_pending is None:
+            restored_param_init_pending = {
+                param_key: False for param_key in self._deferred_param_init_pending
+            }
+        elif (
+            not isinstance(saved_param_init_pending, Mapping)
+            or set(saved_param_init_pending) != set(self._deferred_param_init_pending)
+            or any(not isinstance(value, bool) for value in saved_param_init_pending.values())
+        ):
+            raise ValueError("checkpoint deferred parameter initialization does not match this Engine")
+        else:
+            restored_param_init_pending = dict(saved_param_init_pending)
+        self._validate_deferred_param_init_pending(restored_param_init_pending)
         copies = []
         fills = []
         restored_rng_seed = None
@@ -2666,6 +2841,7 @@ class Engine:
             ) = cadence_state
         if restored_rng_seed is not None:
             self._rng_seed = restored_rng_seed
+        self._deferred_param_init_pending = restored_param_init_pending
         self._train_mode = saved_train_mode
 
 

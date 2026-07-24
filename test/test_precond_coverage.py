@@ -146,7 +146,13 @@ def test_soap_left_only_basis_refresh_transports_both_moments():
         weight_decay=0.0,
     )
     state = optimizer.groups[0].states[0]
-    assert set(state) == {"GG_l", "Q_l", "exp_avg", "exp_avg_sq"}
+    assert set(state) == {
+        "GG_l",
+        "GG_l_scale",
+        "Q_l",
+        "exp_avg",
+        "exp_avg_sq",
+    }
     first = torch.tensor(
         [[3.0, 0.0, 1.0, 0.0, 2.0], [0.0, 2.0, 0.0, 1.0, 1.0]], dtype=torch.float64
     )

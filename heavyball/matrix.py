@@ -1,10 +1,12 @@
 """Batched matrix preconditioners for the slab-native optimizer.
 
 This module keeps the SOAP state in the same coordinates as the legacy
-implementation: ``exp_avg`` and ``exp_avg_sq`` live in the current Shampoo
-eigenbasis, while the Gram factors live in parameter coordinates.  Higher-rank
-leaves use legacy's exact bind-time dimension merge when that produces a
-matrix; N-factor preconditioning remains unsupported.
+implementation: ``exp_avg`` and the RMS stored in the historical
+``exp_avg_sq`` slot live in the current Shampoo eigenbasis. Gram matrices use
+``matrix / scale**2`` plus one scalar per factor, so finite fp32 gradients do
+not require permanent fp64 matrices. Higher-rank leaves use legacy's exact
+bind-time dimension merge when that produces a matrix; N-factor
+preconditioning remains unsupported.
 """
 
 import math
@@ -15,7 +17,19 @@ from torch import Tensor
 
 from .core import Recipe, Transform
 from .numerics import _wide, broadcast_leaf
-from .transforms import WHOLE, Tempo, adam, ademamix, beta_debias, laprop, nadam, sgd_commit
+from .transforms import (
+    WHOLE,
+    Tempo,
+    _eigh_regularized_root,
+    _eigh_scaled_gram_decomposition,
+    _root_requires_spectral_application,
+    adam,
+    ademamix,
+    beta_debias,
+    laprop,
+    nadam,
+    sgd_commit,
+)
 
 _DEFAULT_MAX_PRECOND_DIM = 2048
 
@@ -111,24 +125,96 @@ def _project(
     return torch.einsum("nij,nia,njb->nab", gradient, left, right)
 
 
-def _update_gram(gram: Tensor, outer: Tensor, beta: Tensor) -> Tensor:
-    return gram * broadcast_leaf(beta, gram) + outer * (1 - broadcast_leaf(beta, gram))
+def _gram_value(gram: Tensor, scale: Tensor) -> Tensor:
+    """Materialize a scaled Gram transiently in fp64 for a refresh."""
+
+    scale = broadcast_leaf(scale.double(), gram)
+    return gram.double() * scale.square()
+
+
+def _combine_gram(
+    gram: Tensor,
+    scale: Tensor,
+    outer: Tensor,
+    outer_scale: Tensor,
+    old_weight: Tensor,
+    new_weight: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Combine two ``matrix / scale**2`` representations without large squares."""
+
+    next_scale = torch.maximum(scale, outer_scale)
+    safe_scale = torch.where(next_scale != 0, next_scale, torch.ones_like(next_scale))
+    old_ratio = broadcast_leaf((scale / safe_scale).to(gram.dtype), gram)
+    new_ratio = broadcast_leaf((outer_scale / safe_scale).to(gram.dtype), gram)
+    old_weight = broadcast_leaf(old_weight.to(gram.dtype), gram)
+    new_weight = broadcast_leaf(new_weight.to(gram.dtype), gram)
+    combined = (
+        gram * old_ratio.square() * old_weight
+        + outer.to(gram.dtype) * new_ratio.square() * new_weight
+    )
+    return combined, next_scale
+
+
+def _update_gram(
+    gram: Tensor,
+    scale: Tensor,
+    outer: Tensor,
+    outer_scale: Tensor,
+    beta: Tensor,
+) -> tuple[Tensor, Tensor]:
+    leaf_beta = beta.expand_as(scale)
+    return _combine_gram(
+        gram, scale, outer, outer_scale, leaf_beta, 1 - leaf_beta
+    )
+
+
+def _accumulate_gram(
+    gram: Tensor, scale: Tensor, outer: Tensor, outer_scale: Tensor
+) -> tuple[Tensor, Tensor]:
+    ones = torch.ones_like(scale)
+    return _combine_gram(gram, scale, outer, outer_scale, ones, ones)
 
 
 def _outer(a: Tensor, b: Tensor) -> Tensor:
-    """Batched outer product in the tensors' stored dtype."""
-    return a @ b
+    """Batched outer product in fp64 for callers that need the physical value."""
+
+    return a.double() @ b.double()
+
+
+def _scaled_outer(a: Tensor, b: Tensor) -> tuple[Tensor, Tensor]:
+    """Form ``a @ b`` as ``outer / scale**2`` before a finite input can overflow.
+
+    Ordinary inputs retain ``scale == 1`` and therefore the pre-hardening
+    coordinates.  Only contractions whose conservative fp32 quadratic bound is
+    unsafe are normalized.
+    """
+
+    dimensions = tuple(range(1, a.ndim))
+    maximum = torch.maximum(
+        a.abs().amax(dim=dimensions), b.abs().amax(dim=dimensions)
+    )
+    contraction = max(1, a.shape[-1])
+    limit = math.sqrt(torch.finfo(a.dtype).max / contraction)
+    needs_scale = maximum > limit
+    scale = torch.where(needs_scale, maximum, torch.ones_like(maximum))
+    scaled_a = a / broadcast_leaf(scale, a)
+    scaled_b = b / broadcast_leaf(scale, b)
+    direct = a @ b
+    normalized = scaled_a @ scaled_b
+    outer = torch.where(broadcast_leaf(needs_scale, direct), normalized, direct)
+    return outer, scale
 
 
 def _qr_basis(gram: Tensor, basis: Tensor) -> Tensor:
     """One legacy SOAP QR iteration, including its eigenvalue ordering rule."""
 
-    work = gram @ basis
-    eigenvalues = torch.einsum("nij,nij->nj", basis, work)
+    basis_work = basis.to(gram.dtype)
+    work = gram @ basis_work
+    eigenvalues = torch.einsum("nij,nij->nj", basis_work, work)
     order = torch.argsort(eigenvalues, dim=-1, descending=True)
     index = order.unsqueeze(-2).expand_as(work)
     orthogonal, _ = torch.linalg.qr(work.gather(-1, index))
-    return work.scatter(-1, index, orthogonal)
+    return work.scatter(-1, index, orthogonal).to(basis.dtype)
 
 
 def _transport_exp_avg(
@@ -163,19 +249,31 @@ def _transport_exp_avg_sq(
     new_left: Tensor | None,
     new_right: Tensor | None,
 ) -> Tensor:
-    """Re-express the diagonal second moment in the new basis; variances rotate as the squared change."""
+    """Re-express a stored RMS in the new basis as ``sqrt(rotate(rms**2))``."""
 
+    dtype = exp_avg_sq.dtype
+    variance = exp_avg_sq.double().square()
+
+    if old_left is not None:
+        old_left = old_left.double()
+        new_left = new_left.double()
+    if old_right is not None:
+        old_right = old_right.double()
+        new_right = new_right.double()
     if old_left is None:
         if old_right is None:
             return exp_avg_sq
         right = torch.einsum("nBb,nBd->nbd", old_right, new_right).square()
-        return torch.einsum("nab,nbd->nad", exp_avg_sq, right).clamp_min(0)
+        transported = torch.einsum("nab,nbd->nad", variance, right)
+        return transported.clamp_min(0).sqrt().to(dtype)
     if old_right is None:
         left = torch.einsum("nAa,nAc->nac", old_left, new_left).square()
-        return torch.einsum("nab,nac->ncb", exp_avg_sq, left).clamp_min(0)
+        transported = torch.einsum("nab,nac->ncb", variance, left)
+        return transported.clamp_min(0).sqrt().to(dtype)
     left = torch.einsum("nAa,nAc->nac", old_left, new_left).square()
     right = torch.einsum("nBb,nBd->nbd", old_right, new_right).square()
-    return torch.einsum("nab,nac,nbd->ncd", exp_avg_sq, left, right).clamp_min(0)
+    transported = torch.einsum("nab,nac,nbd->ncd", variance, left, right)
+    return transported.clamp_min(0).sqrt().to(dtype)
 
 
 def _soap_basis_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> tuple[dict[str, Tensor], Tensor]:
@@ -186,9 +284,11 @@ def _soap_basis_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> tuple[dict
     if 1 < rows <= limit:
         left = torch.eye(rows, dtype=ref.dtype, device=ref.device)
         state["GG_l"] = torch.zeros_like(left)
+        state["GG_l_scale"] = torch.ones((), dtype=ref.dtype, device=ref.device)
     if 1 < columns <= limit:
         right = torch.eye(columns, dtype=ref.dtype, device=ref.device)
         state["GG_r"] = torch.zeros_like(right)
+        state["GG_r_scale"] = torch.ones((), dtype=ref.dtype, device=ref.device)
     if 1 < rows <= limit:
         state["Q_l"] = left
     if 1 < columns <= limit:
@@ -222,12 +322,30 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
         shampoo_beta = beta_debias(tempo.hyper.shampoo_beta, tempo.age)
         old_gg_left = _wide(state["GG_l"]) if "GG_l" in state else None
         old_gg_right = _wide(state["GG_r"]) if "GG_r" in state else None
-        next_gg_left = (
-            _update_gram(old_gg_left, _outer(update, update.mT), shampoo_beta) if old_gg_left is not None else None
-        )
-        next_gg_right = (
-            _update_gram(old_gg_right, _outer(update.mT, update), shampoo_beta) if old_gg_right is not None else None
-        )
+        old_scale_left = _wide(state["GG_l_scale"]) if old_gg_left is not None else None
+        old_scale_right = _wide(state["GG_r_scale"]) if old_gg_right is not None else None
+        if old_gg_left is not None:
+            left_outer, left_outer_scale = _scaled_outer(update, update.mT)
+            next_gg_left, next_scale_left = _update_gram(
+                old_gg_left,
+                old_scale_left,
+                left_outer,
+                left_outer_scale,
+                shampoo_beta,
+            )
+        else:
+            next_gg_left = next_scale_left = None
+        if old_gg_right is not None:
+            right_outer, right_outer_scale = _scaled_outer(update.mT, update)
+            next_gg_right, next_scale_right = _update_gram(
+                old_gg_right,
+                old_scale_right,
+                right_outer,
+                right_outer_scale,
+                shampoo_beta,
+            )
+        else:
+            next_gg_right = next_scale_right = None
 
         next_left, next_right = old_left, old_right
         if tempo.refresh:
@@ -240,7 +358,7 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
                 inner_state[name] = _transport_exp_avg(
                     inner_state[name], old_left, old_right, next_left, next_right
                 )
-            # Second moments are diagonal variance estimates; without this they stay in the stale basis.
+            # RMS slots represent diagonal variances; without this transport they stay in the stale basis.
             for name in squared:
                 inner_state[name] = _transport_exp_avg_sq(
                     inner_state[name], old_left, old_right, next_left, next_right
@@ -249,6 +367,10 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
         next_state = {"GG_l": next_gg_left} if next_gg_left is not None else {}
         if next_gg_right is not None:
             next_state["GG_r"] = next_gg_right
+        if next_gg_left is not None:
+            next_state["GG_l_scale"] = next_scale_left
+        if next_gg_right is not None:
+            next_state["GG_r_scale"] = next_scale_right
         if next_gg_left is not None:
             next_state["Q_l"] = next_left
         if next_gg_right is not None:
@@ -280,12 +402,7 @@ soap_ademamix.__name__ = "soap_ademamix"
 
 
 def _inverse_fourth_root(gram: Tensor, eps: Tensor) -> Tensor:
-    regularized = gram * 0.5 + gram.mH * 0.5 + eps * torch.eye(  # halve before adding: no overflow near fp32 max
-        gram.shape[-1], dtype=gram.dtype, device=gram.device
-    )
-    values, vectors = torch.linalg.eigh(regularized)
-    scale = values.clamp_min(eps).rsqrt().sqrt()
-    return (vectors * scale.unsqueeze(-2)) @ vectors.mT
+    return _eigh_regularized_root(gram, eps, -0.25)
 
 
 def shampoo_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> dict[str, Tensor]:
@@ -298,9 +415,11 @@ def shampoo_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> dict[str, Tens
     if 1 < rows <= limit:
         left = torch.eye(rows, dtype=ref.dtype, device=ref.device)
         state["GG_l"] = torch.zeros_like(left)
+        state["GG_l_scale"] = torch.ones((), dtype=ref.dtype, device=ref.device)
     if 1 < columns <= limit:
         right = torch.eye(columns, dtype=ref.dtype, device=ref.device)
         state["GG_r"] = torch.zeros_like(right)
+        state["GG_r_scale"] = torch.ones((), dtype=ref.dtype, device=ref.device)
     if 1 < rows <= limit:
         state["L"] = left
     if 1 < columns <= limit:
@@ -309,33 +428,105 @@ def shampoo_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> dict[str, Tens
 
 
 def shampoo(update: Tensor, obs, param: Tensor, state: dict[str, Tensor], tempo: Tempo):
-    """Apply real two-sided Shampoo factors rebuilt on host-selected refreshes."""
+    """Apply real two-sided Shampoo factors rebuilt on host-selected refreshes.
+
+    The sign of each Gram scale is representation metadata: positive means the
+    same-size factor slot stores a materialized root, negative means it stores
+    the spectral factor whose ``B @ B.mT`` application preserves null modes.
+    """
 
     del obs, param
     if not state:
         return _wide(update), {}, tempo.live
     old_gg_left = _wide(state["GG_l"]) if "GG_l" in state else None
     old_gg_right = _wide(state["GG_r"]) if "GG_r" in state else None
-    next_gg_left = old_gg_left + update @ update.mT if old_gg_left is not None else None
-    next_gg_right = old_gg_right + update.mT @ update if old_gg_right is not None else None
+    stored_scale_left = _wide(state["GG_l_scale"]) if old_gg_left is not None else None
+    stored_scale_right = _wide(state["GG_r_scale"]) if old_gg_right is not None else None
+    left_spectral = stored_scale_left < 0 if stored_scale_left is not None else None
+    right_spectral = stored_scale_right < 0 if stored_scale_right is not None else None
+    old_scale_left = stored_scale_left.abs() if stored_scale_left is not None else None
+    old_scale_right = stored_scale_right.abs() if stored_scale_right is not None else None
+    if old_gg_left is not None:
+        left_outer, left_outer_scale = _scaled_outer(update, update.mT)
+        next_gg_left, next_scale_left = _accumulate_gram(
+            old_gg_left, old_scale_left, left_outer, left_outer_scale
+        )
+    else:
+        next_gg_left = next_scale_left = None
+    if old_gg_right is not None:
+        right_outer, right_outer_scale = _scaled_outer(update.mT, update)
+        next_gg_right, next_scale_right = _accumulate_gram(
+            old_gg_right, old_scale_right, right_outer, right_outer_scale
+        )
+    else:
+        next_gg_right = next_scale_right = None
 
     left = _wide(state["L"]) if "GG_l" in state else None
     right = _wide(state["R"]) if "GG_r" in state else None
     if tempo.refresh:
         if next_gg_left is not None:
-            left = _inverse_fourth_root(next_gg_left, tempo.hyper.eps)
+            left_vectors, left_roots = _eigh_scaled_gram_decomposition(
+                next_gg_left,
+                next_scale_left,
+                tempo.hyper.eps,
+                -0.25,
+            )
+            left_spectral = _root_requires_spectral_application(left_roots, left.dtype)
+            left_direct = (
+                (left_vectors * left_roots.unsqueeze(-2)) @ left_vectors.mT
+            ).to(left.dtype)
+            left_factored = (
+                left_vectors * left_roots.sqrt().unsqueeze(-2)
+            ).to(left.dtype)
+            left = torch.where(
+                broadcast_leaf(left_spectral, left_direct),
+                left_factored,
+                left_direct,
+            )
         if next_gg_right is not None:
-            right = _inverse_fourth_root(next_gg_right, tempo.hyper.eps)
-    if left is None:
-        preconditioned = update if right is None else update @ right
-    else:
-        preconditioned = left @ update if right is None else left @ update @ right
+            right_vectors, right_roots = _eigh_scaled_gram_decomposition(
+                next_gg_right,
+                next_scale_right,
+                tempo.hyper.eps,
+                -0.25,
+            )
+            right_spectral = _root_requires_spectral_application(right_roots, right.dtype)
+            right_direct = (
+                (right_vectors * right_roots.unsqueeze(-2)) @ right_vectors.mT
+            ).to(right.dtype)
+            right_factored = (
+                right_vectors * right_roots.sqrt().unsqueeze(-2)
+            ).to(right.dtype)
+            right = torch.where(
+                broadcast_leaf(right_spectral, right_direct),
+                right_factored,
+                right_direct,
+            )
+    preconditioned = update
+    if left is not None:
+        direct = left @ preconditioned
+        factored = left @ (left.mT @ preconditioned)
+        preconditioned = torch.where(
+            broadcast_leaf(left_spectral, direct), factored, direct
+        )
+    if right is not None:
+        direct = preconditioned @ right
+        factored = (preconditioned @ right) @ right.mT
+        preconditioned = torch.where(
+            broadcast_leaf(right_spectral, direct), factored, direct
+        )
     next_state = {"GG_l": next_gg_left} if next_gg_left is not None else {}
     if next_gg_right is not None:
         next_state["GG_r"] = next_gg_right
     if next_gg_left is not None:
+        next_state["GG_l_scale"] = torch.where(
+            left_spectral, -next_scale_left, next_scale_left
+        )
         next_state["L"] = left
     if next_gg_right is not None:
+        next_state["GG_r_scale"] = torch.where(
+            right_spectral, -next_scale_right, next_scale_right
+        )
         next_state["R"] = right
     return preconditioned, next_state, tempo.live
 

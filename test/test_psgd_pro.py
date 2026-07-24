@@ -1,7 +1,5 @@
 """Proofs for the slab-native PSGD-PRO and QSGD ports."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess

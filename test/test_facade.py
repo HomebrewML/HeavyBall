@@ -146,7 +146,7 @@ def test_facade_zero_grad():
     optimizer.zero_grad()
     assert param.grad is grad
     assert torch.count_nonzero(param.grad) == 0
-    with pytest.raises(ValueError, match="must remain bound"):
+    with pytest.raises(ValueError, match="persistent gradient buffers"):
         optimizer.zero_grad(set_to_none=True)
 
 
@@ -157,6 +157,7 @@ def test_facade_zero_grad():
         heavyball.Shampoo,
         heavyball.KLSOAP,
         heavyball.KLShampoo,
+        heavyball.PSGD,
         heavyball.PSGDKron,
         heavyball.PSGDPro,
         heavyball.QSGD,
@@ -202,13 +203,47 @@ def test_soap_facade_matches_raw_recipe_at_defaults_for_matrix_param():
     assert torch.equal(initial - routed_param, initial - raw_param)
 
 
-@pytest.mark.parametrize("facade", (heavyball.Muon, heavyball.Scion, heavyball.WhitenAdamW))
+@pytest.mark.parametrize("facade", (heavyball.Muon, heavyball.Scion, heavyball.Whitening))
 def test_existing_mixed_shape_facades_still_build(facade):
     model = nn.Linear(4, 3)
 
     optimizer = facade(model.parameters())
 
     assert isinstance(optimizer, torch.optim.Optimizer)
+
+
+def test_psgd_routes_mixed_matrix_and_vector_params_and_steps():
+    matrix = nn.Parameter(torch.eye(2))
+    vector = nn.Parameter(torch.ones(3))
+    optimizer = heavyball.PSGD([matrix, vector], max_size_triangular=2)
+    groups = {tuple(group.params[0].shape): group for group in optimizer._engine.groups}
+
+    assert groups[(2, 2)].recipe is heavyball.kron
+    assert groups[(3,)].recipe is heavyball.psgd_nfactor
+    assert groups[(3,)].states[0]["Q_0"].ndim == 2  # slab axis plus a diagonal vector factor
+
+    matrix.grad.copy_(torch.tensor(((1.0, -0.5), (0.25, 2.0))))
+    vector.grad.copy_(torch.tensor((0.5, -1.0, 2.0)))
+    optimizer.step()
+
+    assert torch.isfinite(matrix).all()
+    assert torch.isfinite(vector).all()
+
+
+@pytest.mark.parametrize(
+    ("alias", "replacement"),
+    (
+        (heavyball.ScheduleFree, heavyball.SFAdamW),
+        (heavyball.WhitenAdamW, heavyball.Whitening),
+    ),
+)
+def test_deprecated_facade_aliases_warn_on_construction(alias, replacement):
+    parameter = nn.Parameter(torch.ones(2))
+
+    with pytest.warns(DeprecationWarning, match=rf"use {replacement.__name__} instead"):
+        optimizer = alias([parameter])
+
+    assert isinstance(optimizer, replacement)
 
 
 def test_route_defaults_prefer_primary_branch():

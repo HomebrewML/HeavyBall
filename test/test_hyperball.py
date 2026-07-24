@@ -1,7 +1,5 @@
 """Parity and constraint proofs for the slab-native HyperBall port."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess

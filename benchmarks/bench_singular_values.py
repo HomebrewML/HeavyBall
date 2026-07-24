@@ -1,9 +1,15 @@
-import argparse
+from typing import Annotated
 
 import torch
+import typer
 from torch._dynamo import config as dynamo_config
 
-from heavyball.utils import max_singular_value_power_iter
+from heavyball.kron import _max_singular_value_power_iter
+
+app = typer.Typer(
+    add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 
 dynamo_config.cache_size_limit = 2**20
 dynamo_config.accumulated_cache_size_limit = 2**20
@@ -39,7 +45,7 @@ def bench_max_sv(rows):
                     A = make_matrix(shape, cond=cond, dtype=dtype)
                     exact = torch.linalg.svdvals(A.double()).max()
                     try:
-                        approx = max_singular_value_power_iter(A, iterations=pi)
+                        approx = _max_singular_value_power_iter(A.unsqueeze(0), power_iterations=pi)
                         rerr = abs((approx.double() - exact) / exact).item()
                         status = "ok"
                     except Exception as e:
@@ -70,26 +76,28 @@ def print_pareto(rows):
             print(f"{key[0]:<8} {key[1]:<5} {key[2]:>3}  {'-':>10}  {'-':>10}  {errs:>6}  {len(items):>5}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", help="Write results to CSV file")
-    args = parser.parse_args()
-
+@app.command()
+def main(
+    csv_path: Annotated[
+        str | None,
+        typer.Option("--csv", help="Write results to CSV file"),
+    ] = None,
+) -> None:
     rows = []
     bench_max_sv(rows)
 
     print_pareto(rows)
 
-    if args.csv:
+    if csv_path:
         import csv
 
-        with open(args.csv, "w", newline="") as f:
+        with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["func", "dtype", "power_iter", "shape", "cond", "rel_error", "status"])
             for r in rows:
                 w.writerow(r)
-        print(f"\nWrote {len(rows)} rows to {args.csv}")
+        print(f"\nWrote {len(rows)} rows to {csv_path}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

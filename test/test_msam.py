@@ -1,7 +1,5 @@
 """Parity, accuracy, and lifecycle proofs for the slab-native MSAMLaProp port."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess

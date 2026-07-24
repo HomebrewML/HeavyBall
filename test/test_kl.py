@@ -1,7 +1,5 @@
 """Proofs for the slab-native KL-SOAP and KL-Shampoo ports."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess
@@ -43,17 +41,27 @@ def test_kl_soap_matches_authors_raw_ema_and_seed_step():
             state[key].copy_(torch.eye(2, dtype=torch.float64))
         for key in ("GG_l", "GG_r"):
             state[key].copy_(0.1 * torch.eye(2, dtype=torch.float64))
-        state["eigenvalues_l"].fill_(0.1)
-        state["eigenvalues_r"].fill_(0.1)
+        state["eigenvalues_l"].fill_(0.1**0.5)
+        state["eigenvalues_r"].fill_(0.1**0.5)
         state["exp_avg"].zero_()
         state["exp_avg_sq"].zero_()
         optimizer.groups[0].age.fill_(2)  # authors' first real update (their step 2 == age 2 after seed)
         param.grad.copy_(g)
         optimizer.step(step_type="normal")
     raw_eigenvalue = 0.8 * 0.1 + (1 - 0.8) * 5.0  # opposite-factor-whitened estimate is 5; RAW EMA
-    torch.testing.assert_close(state["eigenvalues_l"][0, 0], torch.tensor(raw_eigenvalue, dtype=torch.float64), rtol=0, atol=1e-12)
+    torch.testing.assert_close(
+        state["eigenvalues_l"][0, 0].square(),
+        torch.tensor(raw_eigenvalue, dtype=torch.float64),
+        rtol=0,
+        atol=1e-12,
+    )
     torch.testing.assert_close(state["exp_avg"][0, 0, 0], torch.tensor((1 - 0.9) * 1.0, dtype=torch.float64), rtol=0, atol=1e-12)
-    torch.testing.assert_close(state["exp_avg_sq"][0, 0, 0], torch.tensor((1 - 0.8) * 1.0, dtype=torch.float64), rtol=0, atol=1e-12)
+    torch.testing.assert_close(
+        state["exp_avg_sq"][0, 0, 0].square(),
+        torch.tensor((1 - 0.8) * 1.0, dtype=torch.float64),
+        rtol=0,
+        atol=1e-12,
+    )
 
 
 def test_kl_shampoo_seed_step_skips_param():
@@ -93,11 +101,15 @@ def test_kl_soap_transports_second_moment():
     # Hadamard-square transport, derived inline: each variance rotates by the squared basis change.
     left_change = (old_left.mT @ new_left).square()
     right_change = (old_right.mT @ new_right).square()
-    rebased_prior = torch.einsum("nab,nac,nbd->ncd", prior, left_change, right_change)
+    rebased_prior = torch.einsum(
+        "nab,nac,nbd->ncd", prior.square(), left_change, right_change
+    )
     projected = _project(gradients[-1].reshape(1, 4, 3), new_left, new_right, back=False)
     beta2 = hyper["beta2"]  # KL uses a RAW second-moment EMA (Lin et al.), not a debiased beta
     expected = beta2 * rebased_prior + (1 - beta2) * projected.square()
-    torch.testing.assert_close(state["exp_avg_sq"], expected, rtol=0, atol=1e-12)
+    torch.testing.assert_close(
+        state["exp_avg_sq"].square(), expected, rtol=0, atol=1e-12
+    )
 
 
 def test_kl_init_factor_initializes_eigenvalues():
@@ -106,8 +118,14 @@ def test_kl_init_factor_initializes_eigenvalues():
     for recipe in (kl_soap_recipe, kl_shampoo_recipe):
         parameter = torch.nn.Parameter(torch.zeros(3, 4))
         state = Engine([parameter], recipe, init_factor=0.25).groups[0].states[0]
-        torch.testing.assert_close(state["eigenvalues_l"], torch.full_like(state["eigenvalues_l"], 0.25))
-        torch.testing.assert_close(state["eigenvalues_r"], torch.full_like(state["eigenvalues_r"], 0.25))
+        torch.testing.assert_close(
+            state["eigenvalues_l"].square(),
+            torch.full_like(state["eigenvalues_l"], 0.25),
+        )
+        torch.testing.assert_close(
+            state["eigenvalues_r"].square(),
+            torch.full_like(state["eigenvalues_r"], 0.25),
+        )
     with pytest.raises(ValueError, match="finite and positive"):
         Engine([torch.nn.Parameter(torch.zeros(3, 4))], kl_soap_recipe, init_factor=0.0)
 

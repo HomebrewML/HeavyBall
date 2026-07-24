@@ -84,3 +84,6 @@ preview = false
 [tool.setuptools.packages.find]
 include = ["heavyball", "heavyball.*"]
 exclude = ["heavyball_legacy*"]
+
+[tool.setuptools.package-data]
+heavyball = ["py.typed"]

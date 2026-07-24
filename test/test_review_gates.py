@@ -43,10 +43,8 @@ def test_compile_identity_survives_parameter_order_permutations():
         torch._dynamo.reset()
 
 
-@pytest.mark.xfail(strict=True, reason="numerical policy: unscaled squares/sums overflow avoidable "
-                                        "intermediates, so representable finite fp64 inputs produce inf/NaN")
-def test_matrix_transforms_finite_on_large_finite_input():
-    from heavyball.transforms import Tempo, normuon_normalize, normuon_normalize_init, polargrad_direction
+def test_polargrad_finite_on_large_finite_input():
+    from heavyball.transforms import Tempo, polargrad_direction
 
     def tempo(dt):
         return Tempo(torch.tensor(1), torch.ones(1, dtype=torch.long), torch.ones(1, dtype=torch.bool),
@@ -55,12 +53,27 @@ def test_matrix_transforms_finite_on_large_finite_input():
     with patch("heavyball.core.torch.compile", lambda f, **k: f):
         import heavyball  # noqa: F401
         torch.manual_seed(0)
-        polar_in = torch.randn(1, 8, 4, dtype=torch.float64) * 9e307
+        polar_in = torch.randn(1, 8, 4, dtype=torch.float64) * 1e307
+        assert torch.isfinite(polar_in).all()
         polar_out = polargrad_direction(polar_in.clone(), None, None, {}, tempo(torch.float64))[0]
+    assert torch.isfinite(polar_out).all()
+
+
+def test_normuon_finite_on_large_finite_input():
+    from heavyball.transforms import Tempo, normuon_normalize, normuon_normalize_init
+
+    def tempo(dt):
+        return Tempo(torch.tensor(1), torch.ones(1, dtype=torch.long), torch.ones(1, dtype=torch.bool),
+                     SimpleNamespace(beta2=torch.tensor(0.95, dtype=dt), eps=torch.tensor(1e-7, dtype=dt)), False)
+
+    with patch("heavyball.core.torch.compile", lambda f, **k: f):
+        import heavyball  # noqa: F401
+        torch.manual_seed(0)
         normuon_in = torch.randn(1, 8, 4, dtype=torch.float64) * 1e154
+        assert torch.isfinite(normuon_in).all()
         state = {"moment2": normuon_normalize_init(normuon_in)["moment2"]}
         normuon_out = normuon_normalize(normuon_in.clone(), None, None, state, tempo(torch.float64))[0]
-    assert torch.isfinite(polar_out).all() and torch.isfinite(normuon_out).all()
+    assert torch.isfinite(normuon_out).all()
 
 
 def test_lifecycle_swap_bumps_version():

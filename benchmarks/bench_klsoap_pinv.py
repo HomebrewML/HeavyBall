@@ -1,9 +1,15 @@
-import argparse
 import csv
 from collections import defaultdict
 from itertools import product
+from typing import Annotated
 
 import torch
+import typer
+
+app = typer.Typer(
+    add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 
 SHAPES = [(64, 64), (128, 32), (32, 128), (256, 16), (16, 256)]
 WARMUP_K = [0, 1, 2, 4, 8, 16]
@@ -74,25 +80,27 @@ def summarize(rows):
         print(f"{shape:<10} {dt:<5} {k:>3} {eps:>9.0e}  {rank}/{d:<5}  {vals}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", help="Write all rows to CSV file")
-    parser.add_argument("--seeds", type=int, default=3)
-    args = parser.parse_args()
-
+@app.command()
+def main(
+    csv_path: Annotated[
+        str | None,
+        typer.Option("--csv", help="Write all rows to CSV file"),
+    ] = None,
+    seeds: Annotated[int, typer.Option()] = 3,
+) -> None:
     rows = [
         run_case(shape, k, eps, dtype, seed)
-        for shape, k, eps, dtype, seed in product(SHAPES, WARMUP_K, EPS_VALS, DTYPES, range(args.seeds))
+        for shape, k, eps, dtype, seed in product(SHAPES, WARMUP_K, EPS_VALS, DTYPES, range(seeds))
     ]
     summarize(rows)
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
+    if csv_path:
+        with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f"\nWrote {len(rows)} rows to {args.csv}")
+        print(f"\nWrote {len(rows)} rows to {csv_path}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

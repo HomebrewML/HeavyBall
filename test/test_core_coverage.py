@@ -212,6 +212,9 @@ def test_storage_dtype_string_allocates_bfloat16_state():
 
     assert engine.storage_dtype is torch.bfloat16
     assert {value.dtype for value in floating_slots} == {torch.bfloat16}
+    state = engine.groups[0].states[0]
+    assert state["exp_avg"].dtype is torch.bfloat16
+    assert state["exp_avg_sq"].dtype is torch.bfloat16
 
 
 def test_constructor_rollback_removes_new_observation_bindings():

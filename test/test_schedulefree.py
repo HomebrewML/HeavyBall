@@ -1,7 +1,5 @@
 """Parity, lifecycle, and compile proofs for the slab-native SFAdamW port."""
 
-from __future__ import annotations
-
 import copy
 import os
 import re

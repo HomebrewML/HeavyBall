@@ -1,7 +1,5 @@
 """Direct legacy parity and numerical proofs for the slab-native SUDS port."""
 
-from __future__ import annotations
-
 import os
 import re
 import subprocess

@@ -43,12 +43,36 @@ def _refresh_lra(
     d: Tensor,
     tempo: Tempo,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Run one batched Lie-group update of the LRA preconditioner."""
+    """Run one scale-normalized fp32 Lie-group refresh."""
 
     U, V = _balance_lra(U, V)
     vector = tempo.randn_like(update_flat)
     eps = torch.finfo(update_flat.dtype).eps
-    hessian_vector = update_flat + (tempo.hyper.dampening + eps * update_flat.abs()) * vector
+    dimensions = tuple(range(1, update_flat.ndim))
+    maximum = torch.maximum(
+        update_flat.abs().amax(dim=dimensions),
+        vector.abs().amax(dim=dimensions),
+    )
+    limit = (torch.finfo(update_flat.dtype).max / max(1, update_flat.shape[-1])) ** 0.5
+    needs_scale = maximum > limit
+    scale = torch.where(needs_scale, maximum, torch.ones_like(maximum))
+    broadcast_scale = broadcast_leaf(scale, update_flat)
+    direct_hessian_vector = update_flat + (
+        tempo.hyper.dampening + eps * update_flat.abs()
+    ) * vector
+    scaled_hessian_vector = (
+        update_flat / broadcast_scale
+        + tempo.hyper.dampening * (vector / broadcast_scale)
+        + eps * (update_flat.abs() / broadcast_scale) * vector
+    )
+    hessian_vector = torch.where(
+        broadcast_leaf(needs_scale, update_flat),
+        scaled_hessian_vector,
+        direct_hessian_vector,
+    )
+    vector = torch.where(
+        broadcast_leaf(needs_scale, vector), vector / broadcast_scale, vector
+    )
 
     qh = _lra_low_rank_mm(U, V, d * hessian_vector)
     ph = d * _lra_low_rank_mm(V, U, qh)
@@ -83,9 +107,9 @@ def _refresh_lra(
     b1 = hessian_vector
     score = torch.hypot(a0, a1).log2() + torch.hypot(b0, b1).log2()
     index = score.argmax(dim=-1, keepdim=True)
-    a = a0.gather(-1, index).square() + a1.gather(-1, index).square()
-    b = b0.gather(-1, index).square() + b1.gather(-1, index).square()
-    divisor = (a * b).sqrt().clamp_min(eps).squeeze(-1)
+    a = torch.hypot(a0.gather(-1, index), a1.gather(-1, index))
+    b = torch.hypot(b0.gather(-1, index), b1.gather(-1, index))
+    divisor = (a * b).clamp_min(eps).squeeze(-1)
     d = d - broadcast_leaf(tempo.hyper.precond_lr / divisor, d) * nabla_d
 
     at_u = _mv(U.mT, qh)
@@ -117,15 +141,28 @@ def _refresh_lra(
     return U, V, d
 
 
-def psgd_lra_init(ref_leaf: Tensor, *, rank: Tensor | int = 10) -> dict[str, Tensor]:
+def psgd_lra_init(
+    ref_leaf: Tensor,
+    *,
+    rank: Tensor | int = 10,
+    seed: int | None = None,
+) -> dict[str, Tensor]:
     """Allocate diagonal and low-rank state in flattened leaf coordinates."""
 
     rank = int(rank)
     ref = _wide(ref_leaf).reshape(-1)
     scale = (ref.numel() * (rank + 10)) ** -0.5
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=ref.device)
+        generator.manual_seed(seed)
     return {
-        "U": torch.randn(ref.numel(), rank, dtype=ref.dtype, device=ref.device) * scale,
-        "V": torch.randn(ref.numel(), rank, dtype=ref.dtype, device=ref.device) * scale,
+        "U": torch.randn(
+            ref.numel(), rank, dtype=ref.dtype, device=ref.device, generator=generator
+        ) * scale,
+        "V": torch.randn(
+            ref.numel(), rank, dtype=ref.dtype, device=ref.device, generator=generator
+        ) * scale,
         "d": torch.ones(ref.numel(), dtype=ref.dtype, device=ref.device),
     }
 
@@ -136,8 +173,13 @@ def make_psgd_lra(rank: int = 10):
     if type(rank) is not int:
         raise TypeError("rank must be a Python int")
 
-    def lra_init(ref_leaf: Tensor, *, rank: Tensor | int = rank) -> dict[str, Tensor]:
-        return psgd_lra_init(ref_leaf, rank=rank)
+    def lra_init(
+        ref_leaf: Tensor,
+        *,
+        rank: Tensor | int = rank,
+        seed: int | None = None,
+    ) -> dict[str, Tensor]:
+        return psgd_lra_init(ref_leaf, rank=rank, seed=seed)
 
     def psgd_lra(update: Tensor, obs, param: Tensor, state: dict[str, Tensor], tempo: Tempo):
         del obs, param
@@ -153,6 +195,7 @@ def make_psgd_lra(rank: int = 10):
 
     psgd_lra.init = lra_init
     psgd_lra.state_init_hyper = ("rank",)
+    psgd_lra.state_init_seeded = True
     psgd_lra.config = {"rank": rank}
     return psgd_lra
 

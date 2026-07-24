@@ -14,13 +14,20 @@ Reports per method vs analytical truth (= hadamard by construction):
   dvar  (sum(method) - sum(v))/sum(v) (hadamard preserves; linear does not)
 """
 
-import argparse
 import csv
 import math
 from collections import defaultdict
 from itertools import product
+from typing import Annotated
 
 import torch
+import typer
+
+app = typer.Typer(
+    add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=__doc__,
+)
 
 ANGLES = [0.0, 1e-3, 1e-2, 0.1, 0.5, 1.0, math.pi / 2]
 SHAPES = [(16,), (256,), (16, 16), (32, 8), (8, 32), (64, 64)]
@@ -60,11 +67,11 @@ def transport(method, v, Q_old, Q_new):
     n = len(Q_old)
     in_, out, mid = "abcd"[:n], "efgh"[:n], "ABCD"[:n]
     if method == "linear":
-        from_ = ",".join(m + i for m, i in zip(mid, in_))
-        to_ = ",".join(m + o for m, o in zip(mid, out))
+        from_ = ",".join(m + i for m, i in zip(mid, in_, strict=True))
+        to_ = ",".join(m + o for m, o in zip(mid, out, strict=True))
         return torch.einsum(f"{in_},{from_},{to_}->{out}", v, *Q_old, *Q_new)
-    Rs_sq = [(Qo.T @ Qn).pow(2) for Qo, Qn in zip(Q_old, Q_new)]
-    sides = ",".join(i + o for i, o in zip(in_, out))
+    Rs_sq = [(Qo.T @ Qn).pow(2) for Qo, Qn in zip(Q_old, Q_new, strict=True)]
+    sides = ",".join(i + o for i, o in zip(in_, out, strict=True))
     return torch.einsum(f"{in_},{sides}->{out}", v, *Rs_sq)
 
 
@@ -106,25 +113,27 @@ def summarize(rows):
         print(f"{n}d   {dt:<5} {theta:>8.4f}  {vals}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", help="Write all rows to CSV file")
-    parser.add_argument("--seeds", type=int, default=3)
-    args = parser.parse_args()
-
+@app.command(help=__doc__)
+def main(
+    csv_path: Annotated[
+        str | None,
+        typer.Option("--csv", help="Write all rows to CSV file"),
+    ] = None,
+    seeds: Annotated[int, typer.Option()] = 3,
+) -> None:
     rows = [
         run_case(shape, theta, kind, dtype, seed)
-        for shape, theta, kind, dtype, seed in product(SHAPES, ANGLES, V_KINDS, DTYPES, range(args.seeds))
+        for shape, theta, kind, dtype, seed in product(SHAPES, ANGLES, V_KINDS, DTYPES, range(seeds))
     ]
     summarize(rows)
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
+    if csv_path:
+        with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f"\nWrote {len(rows)} rows to {args.csv}")
+        print(f"\nWrote {len(rows)} rows to {csv_path}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

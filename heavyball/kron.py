@@ -122,6 +122,37 @@ def _calc_mixed_a_and_conjb(
     return a, probe
 
 
+def _scaled_quadratic_inputs(a: Tensor, conjb: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Normalize two quadratic components by one per-leaf scale."""
+
+    dimensions = tuple(range(1, a.ndim))
+    scale = torch.maximum(
+        a.abs().amax(dim=dimensions),
+        conjb.abs().amax(dim=dimensions),
+    )
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    broadcast_scale = broadcast_leaf(safe_scale, a)
+    return a / broadcast_scale, conjb / broadcast_scale, scale.double().square()
+
+
+def _scaled_lower_bound(
+    normalized_ell: Tensor,
+    scale_sq: Tensor,
+    lower_bound: Tensor,
+    beta: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Update a physical fp64 lower bound and return it in normalized quadratic coordinates."""
+
+    physical_ell = normalized_ell.double() * scale_sq
+    physical, next_bound = _next_lower_bound(physical_ell, lower_bound, beta)
+    normalized = torch.where(
+        scale_sq != 0,
+        physical / scale_sq,
+        physical,
+    )
+    return normalized.to(normalized_ell.dtype), next_bound
+
+
 def _refresh_q(
     update: Tensor,
     q0: Tensor,
@@ -139,18 +170,25 @@ def _refresh_q(
 
     q0, q1 = _balance_q(q0, q1)
     a, conjb = _calc_a_and_conjb(hessian_vector, q0, q1, vector)
+    a, conjb, scale_sq = _scaled_quadratic_inputs(a, conjb)
     term1_0 = torch.einsum("nab,ncb->nac", a, a)
     term2_0 = torch.einsum("nab,ncb->nac", conjb, conjb)
-    ell0, lower0 = _next_lower_bound(
-        _max_singular_value_power_iter(term1_0 + term2_0, power_iterations), lower0, tempo.hyper.lower_bound_beta
+    ell0, lower0 = _scaled_lower_bound(
+        _max_singular_value_power_iter(term1_0 + term2_0, power_iterations),
+        scale_sq,
+        lower0,
+        tempo.hyper.lower_bound_beta,
     )
     q0_update = (term1_0 - term2_0).triu() @ q0
     q0 = q0 - q0_update / broadcast_leaf(ell0, q0_update) * tempo.hyper.precond_lr
 
     term1_1 = torch.einsum("nab,nac->nbc", a, a)
     term2_1 = torch.einsum("nab,nac->nbc", conjb, conjb)
-    ell1, lower1 = _next_lower_bound(
-        _max_singular_value_power_iter(term1_1 + term2_1, power_iterations), lower1, tempo.hyper.lower_bound_beta
+    ell1, lower1 = _scaled_lower_bound(
+        _max_singular_value_power_iter(term1_1 + term2_1, power_iterations),
+        scale_sq,
+        lower1,
+        tempo.hyper.lower_bound_beta,
     )
     q1_update = (term1_1 - term2_1).triu() @ q1
     q1 = q1 - q1_update / broadcast_leaf(ell1, q1_update) * tempo.hyper.precond_lr
@@ -174,16 +212,23 @@ def _refresh_mixed_q(
 
     q0, q1 = _balance_mixed_q(q0, q1)
     a, conjb = _calc_mixed_a_and_conjb(hessian_vector, q0, q1, vector)
+    a, conjb, scale_sq = _scaled_quadratic_inputs(a, conjb)
     if q0.ndim == 2:
         term1_0 = torch.einsum("...ab,...ab->...a", a, a)
         term2_0 = torch.einsum("...ab,...ab->...a", conjb, conjb)
-        ell0, lower0 = _next_lower_bound((term1_0 + term2_0).amax(dim=-1), lower0, tempo.hyper.lower_bound_beta)
+        ell0, lower0 = _scaled_lower_bound(
+            (term1_0 + term2_0).amax(dim=-1),
+            scale_sq,
+            lower0,
+            tempo.hyper.lower_bound_beta,
+        )
         q0_update = q0 * (term1_0 - term2_0)
     else:
         term1_0 = torch.einsum("nab,ncb->nac", a, a)
         term2_0 = torch.einsum("nab,ncb->nac", conjb, conjb)
-        ell0, lower0 = _next_lower_bound(
+        ell0, lower0 = _scaled_lower_bound(
             _max_singular_value_power_iter(term1_0 + term2_0, power_iterations),
+            scale_sq,
             lower0,
             tempo.hyper.lower_bound_beta,
         )
@@ -193,13 +238,19 @@ def _refresh_mixed_q(
     if q1.ndim == 2:
         term1_1 = torch.einsum("...ab,...ab->...b", a, a)
         term2_1 = torch.einsum("...ab,...ab->...b", conjb, conjb)
-        ell1, lower1 = _next_lower_bound((term1_1 + term2_1).amax(dim=-1), lower1, tempo.hyper.lower_bound_beta)
+        ell1, lower1 = _scaled_lower_bound(
+            (term1_1 + term2_1).amax(dim=-1),
+            scale_sq,
+            lower1,
+            tempo.hyper.lower_bound_beta,
+        )
         q1_update = q1 * (term1_1 - term2_1)
     else:
         term1_1 = torch.einsum("nab,nac->nbc", a, a)
         term2_1 = torch.einsum("nab,nac->nbc", conjb, conjb)
-        ell1, lower1 = _next_lower_bound(
+        ell1, lower1 = _scaled_lower_bound(
             _max_singular_value_power_iter(term1_1 + term2_1, power_iterations),
+            scale_sq,
             lower1,
             tempo.hyper.lower_bound_beta,
         )

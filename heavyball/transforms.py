@@ -8,7 +8,13 @@ import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from .numerics import _caution, _wide, broadcast_leaf, stochastic_round_bfloat16
+from .numerics import (
+    _caution,
+    _wide,
+    broadcast_leaf,
+    stable_l2_normalize,
+    stochastic_round_bfloat16,
+)
 
 
 @dataclass(frozen=True)
@@ -160,14 +166,88 @@ class Tempo(NamedTuple):
         return gaussian.to(value.dtype)
 
 
-def _matrix_inv_sqrt(gram: Tensor, eps: Tensor) -> Tensor:
-    """Symmetric inverse square root via eigendecomposition (batched over leading dims)."""
+def _eigh_regularized_decomposition(
+    gram: Tensor, eps: Tensor, exponent: float
+) -> tuple[Tensor, Tensor]:
+    """Return eigenvectors and a regularized root with relative null-space classification."""
 
     regularized = gram * 0.5 + gram.mH * 0.5 + eps * torch.eye(  # halve before adding: no overflow near fp32 max
         gram.shape[-1], dtype=gram.dtype, device=gram.device
     )
     values, vectors = torch.linalg.eigh(regularized)
-    return (vectors * values.clamp_min(eps).rsqrt().unsqueeze(-2)) @ vectors.mT
+    signal = (values - eps).clamp_min(0)
+    maximum = signal.amax(dim=-1, keepdim=True)
+    roundoff = gram.shape[-1] * torch.finfo(gram.dtype).eps * maximum
+    rooted = values.clamp_min(eps).pow(exponent)
+    null_root = torch.as_tensor(eps, dtype=values.dtype, device=values.device).pow(exponent)
+    rooted = torch.where(signal <= roundoff, null_root, rooted)
+    return vectors, rooted
+
+
+def _eigh_scaled_gram_decomposition(
+    gram: Tensor, scale: Tensor, eps: Tensor, exponent: float
+) -> tuple[Tensor, Tensor]:
+    """Decompose ``gram * scale**2`` without materializing its large entries.
+
+    ``scale == 1`` follows the original fp32 refresh exactly.  At large scales the
+    absolute regularizer may underflow in normalized coordinates, so null modes are
+    classified relatively and receive the physical ``eps**exponent`` root directly.
+    """
+
+    scale = scale.abs().to(gram.dtype)
+    broadcast_scale = broadcast_leaf(scale, gram)
+    epsilon = torch.as_tensor(eps, dtype=gram.dtype, device=gram.device)
+    normalized_epsilon = (
+        epsilon.double() / broadcast_scale.double().square()
+    ).to(gram.dtype)
+    regularized = gram * 0.5 + gram.mH * 0.5 + normalized_epsilon * torch.eye(
+        gram.shape[-1], dtype=gram.dtype, device=gram.device
+    )
+    values, vectors = torch.linalg.eigh(regularized)
+    normalized_epsilon = normalized_epsilon[..., 0, 0].unsqueeze(-1)
+    signal = (values - normalized_epsilon).clamp_min(0)
+    maximum = signal.amax(dim=-1, keepdim=True)
+    roundoff = gram.shape[-1] * torch.finfo(gram.dtype).eps * maximum
+    physical_scale = scale.unsqueeze(-1).pow(2 * exponent)
+    rooted = values.clamp_min(torch.finfo(values.dtype).tiny).pow(exponent) * physical_scale
+    null_root = epsilon.pow(exponent)
+    rooted = torch.where(signal <= roundoff, null_root, rooted)
+    return vectors, rooted
+
+
+def _eigh_regularized_root(gram: Tensor, eps: Tensor, exponent: float) -> Tensor:
+    """Materialize a symmetric regularized matrix root."""
+
+    vectors, rooted = _eigh_regularized_decomposition(gram, eps, exponent)
+    return (vectors * rooted.unsqueeze(-2)) @ vectors.mT
+
+
+def _spectral_root_application(
+    value: Tensor,
+    vectors: Tensor,
+    rooted: Tensor,
+    *,
+    left: bool,
+) -> Tensor:
+    """Apply a matrix root in spectral coordinates without materializing ill-conditioned sums."""
+
+    value = value.to(vectors.dtype)
+    if left:
+        return vectors @ (rooted.unsqueeze(-1) * (vectors.mT @ value))
+    return ((value @ vectors) * rooted.unsqueeze(-2)) @ vectors.mT
+
+
+def _root_requires_spectral_application(rooted: Tensor, dtype: torch.dtype) -> Tensor:
+    """Identify roots whose mode ratio cannot survive materialization in ``dtype``."""
+
+    ratio = rooted.amax(dim=-1) / rooted.amin(dim=-1).clamp_min(torch.finfo(rooted.dtype).tiny)
+    return ratio * torch.finfo(dtype).eps > 0.25
+
+
+def _matrix_inv_sqrt(gram: Tensor, eps: Tensor) -> Tensor:
+    """Symmetric inverse square root via eigendecomposition (batched over leading dims)."""
+
+    return _eigh_regularized_root(gram, eps, -0.5)
 
 
 def beta_debias(beta: Tensor, age: Tensor) -> Tensor:
@@ -177,6 +257,43 @@ def beta_debias(beta: Tensor, age: Tensor) -> Tensor:
     value = torch.where(beta == 0, torch.zeros_like(value), value)
     value = torch.where(beta == 1, (age - 1) / age.clamp_min(1), value)
     return torch.where(age <= 1, torch.zeros_like(value), value)
+
+
+def _second_moment(previous: Tensor, observation: Tensor, beta: Tensor) -> Tensor:
+    """Update a stored RMS without forming the observation's square.
+
+    ``previous`` stores ``sqrt(v)`` even though the public state slot retains its
+    historical ``exp_avg_sq`` name.  ``hypot`` evaluates the exact real recurrence
+    ``sqrt(beta * v + (1 - beta) * observation**2)`` without overflowing for a
+    finite observation whose square is not representable in the storage dtype.
+    """
+
+    previous = _wide(previous)
+    observation = _wide(observation)
+    beta = beta.to(previous.dtype).clamp(0, 1)
+    return torch.hypot(previous * beta.sqrt(), observation * (1 - beta).sqrt())
+
+
+def _second_moment_from_squared(
+    previous: Tensor, squared_observation: Tensor, beta: Tensor
+) -> Tensor:
+    """Update a stored RMS when a producer already supplies a squared observation."""
+
+    squared_observation = _wide(squared_observation).clamp_min(0)
+    return _second_moment(previous, squared_observation.sqrt(), beta)
+
+
+def _second_moment_denom(moment: Tensor, eps: Tensor, dtype: torch.dtype) -> Tensor:
+    """Return ``sqrt(clamp(v, eps))`` from the stored ``sqrt(v)`` state.
+
+    The square root on ``eps`` is intentional: the corresponding inverse form is
+    ``v.clamp_min(eps).rsqrt()``.  Applying ``rsqrt`` to the RMS itself would instead
+    compute a fourth root and change the optimizer.
+    """
+
+    moment = _wide(moment)
+    epsilon = torch.as_tensor(eps, dtype=moment.dtype, device=moment.device).sqrt()
+    return moment.clamp_min(epsilon).to(dtype)
 
 
 def first_moment_init(ref_leaf: Tensor) -> dict[str, Tensor]:
@@ -198,7 +315,10 @@ first_moment.init = first_moment_init
 
 def adam_init(ref_leaf: Tensor) -> dict[str, Tensor]:
     ref = _wide(ref_leaf)
-    return {"exp_avg": torch.zeros_like(ref), "exp_avg_sq": torch.zeros_like(ref)}
+    return {
+        "exp_avg": torch.zeros_like(ref),
+        "exp_avg_sq": torch.zeros_like(ref),
+    }
 
 
 def adam(update, obs, param, state, tempo):
@@ -209,8 +329,8 @@ def adam(update, obs, param, state, tempo):
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
     exp_avg = _wide(state["exp_avg"]) * beta1 + update * (1 - beta1)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update * update * (1 - beta2)
-    update = exp_avg / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    update = exp_avg / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     return update, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}, tempo.live
 
 
@@ -227,8 +347,8 @@ def rmsprop(update, obs, param, state, tempo):
     del obs, param
     update = _wide(update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update.square() * (1 - beta2)
-    update = update / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    update = update / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     return update, {"exp_avg_sq": exp_avg_sq}, tempo.live
 
 
@@ -264,8 +384,8 @@ def laprop(update, obs, param, state, tempo):
     update = _wide(update)
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update.square() * (1 - beta2)
-    normalized = update / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    normalized = update / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     exp_avg = _wide(state["exp_avg"]) * beta1 + normalized * (1 - beta1)
     return exp_avg, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}, tempo.live
 
@@ -289,8 +409,8 @@ def nadam(update, obs, param, state, tempo):
     update = _wide(update)
     exp_avg = _wide(state["exp_avg"]) * tempo.hyper.beta1 + update * (1 - tempo.hyper.beta1)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update.square() * (1 - beta2)
-    denom = exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    denom = _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
 
     age = tempo.age.to(tempo.hyper.beta1.dtype)
     base = torch.ones_like(tempo.hyper.beta1) * 0.96
@@ -350,8 +470,10 @@ def ademamix(update, obs, param, state, tempo):
     alpha = broadcast_leaf(alpha, update)
     exp_avg_fast = _wide(state["exp_avg_fast"]) * beta1 + update * (1 - beta1)
     exp_avg_slow = _wide(state["exp_avg_slow"]) * beta3 + update * (1 - beta3)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update.square() * (1 - beta2)
-    update = (exp_avg_fast + exp_avg_slow * alpha) / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    update = (exp_avg_fast + exp_avg_slow * alpha) / _second_moment_denom(
+        exp_avg_sq, tempo.hyper.eps, update.dtype
+    )
     return update, {
         "exp_avg_fast": exp_avg_fast,
         "exp_avg_slow": exp_avg_slow,
@@ -373,8 +495,8 @@ def unscaled_adam(update, obs, param, state, tempo):
     update = _wide(update)
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + update.square() * (1 - beta2)
-    denom = exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, beta2)
+    denom = _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     normalized = update / denom
     exp_avg = _wide(state["exp_avg"]) * beta1 + normalized * (1 - beta1)
     return exp_avg * denom, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}, tempo.live
@@ -409,7 +531,7 @@ def mars(update, obs, param, state, tempo):
     update = _wide(update)
     old_grad = _wide(state["mars_old_grad"])
     a = -tempo.hyper.mars_gamma * tempo.hyper.beta1 / (1 - tempo.hyper.beta1)
-    corrected = update * (1 - a) + old_grad * a
+    corrected = update + a * (old_grad - update)
     if corrected.numel():
         # MARS (Algorithm 2) clips the corrected gradient to unit L2 norm per leaf before both moments.
         flat, scale, norm = _slab_l2_components(corrected)
@@ -536,8 +658,10 @@ def truegrad_adam(update, obs, param, state, tempo):
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
     exp_avg = _wide(state["exp_avg"]) * beta1 + update * (1 - beta1)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + _wide(obs.sum_grad_squared) * (1 - beta2)
-    update = exp_avg / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment_from_squared(
+        state["exp_avg_sq"], obs.sum_grad_squared, beta2
+    )
+    update = exp_avg / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     return update, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}, tempo.live
 
 
@@ -548,8 +672,10 @@ def truegrad_rmsprop(update, obs, param, state, tempo):
     del param
     update = _wide(update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + _wide(obs.sum_grad_squared) * (1 - beta2)
-    update = update / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment_from_squared(
+        state["exp_avg_sq"], obs.sum_grad_squared, beta2
+    )
+    update = update / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     return update, {"exp_avg_sq": exp_avg_sq}, tempo.live
 
 
@@ -561,8 +687,10 @@ def truegrad_laprop(update, obs, param, state, tempo):
     update = _wide(update)
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + _wide(obs.sum_grad_squared) * (1 - beta2)
-    normalized = update / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment_from_squared(
+        state["exp_avg_sq"], obs.sum_grad_squared, beta2
+    )
+    normalized = update / _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
     exp_avg = _wide(state["exp_avg"]) * beta1 + normalized * (1 - beta1)
     return exp_avg, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}, tempo.live
 
@@ -575,8 +703,10 @@ def truegrad_nadam(update, obs, param, state, tempo):
     update = _wide(update)
     exp_avg = _wide(state["exp_avg"]) * tempo.hyper.beta1 + update * (1 - tempo.hyper.beta1)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    exp_avg_sq = _wide(state["exp_avg_sq"]) * beta2 + _wide(obs.sum_grad_squared) * (1 - beta2)
-    denom = exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps)
+    exp_avg_sq = _second_moment_from_squared(
+        state["exp_avg_sq"], obs.sum_grad_squared, beta2
+    )
+    denom = _second_moment_denom(exp_avg_sq, tempo.hyper.eps, update.dtype)
 
     age = tempo.age.to(tempo.hyper.beta1.dtype)
     base = torch.ones_like(tempo.hyper.beta1) * 0.96
@@ -615,11 +745,16 @@ def adopt(update, obs, param, state, tempo):
     beta2 = tempo.hyper.beta2
     exp_avg = _wide(state["exp_avg"])
     exp_avg_sq = _wide(state["exp_avg_sq"])
-    next_avg = exp_avg * beta1 + update / exp_avg_sq.sqrt().clamp_min(tempo.hyper.eps) * (1 - beta1)
-    next_avg_sq = exp_avg_sq * beta2 + update * update * (1 - beta2)
+    next_avg = exp_avg * beta1 + update / _second_moment_denom(
+        exp_avg_sq, tempo.hyper.eps, update.dtype
+    ) * (1 - beta1)
+    next_avg_sq = _second_moment(exp_avg_sq, update, beta2)
+    seeded_avg_sq = update.abs()
     candidate = {
         "exp_avg": torch.where(broadcast_leaf(first, next_avg), exp_avg, next_avg),
-        "exp_avg_sq": torch.where(broadcast_leaf(first, next_avg_sq), update * update, next_avg_sq),
+        "exp_avg_sq": torch.where(
+            broadcast_leaf(first, next_avg_sq), seeded_avg_sq, next_avg_sq
+        ),
         "seen": torch.ones_like(seen),
     }
     return next_avg, candidate, tempo.live & seen
@@ -688,9 +823,8 @@ def orthogonalize(update, obs, param, state, tempo):
         (2.8366, -3.0525, 1.2012),
     ):
         s = x @ x.mT
-        y = c * s
-        y.diagonal(dim1=-2, dim2=-1).add_(b)
-        y = y @ s
+        # Evaluate b*S + c*S^2 directly so baddbmm can keep the coefficients in the GEMM epilogue.
+        y = torch.baddbmm(s, s, s, beta=b, alpha=c)
         y.diagonal(dim1=-2, dim2=-1).add_(a)
         x = y @ x
     if transposed:
@@ -708,8 +842,13 @@ def oblique_tangent_projection(update, obs, param, state, tempo):
     del obs, state
     wide = _wide(update)
     w = _wide(param)
-    inner = (w * wide).sum(dim=-1, keepdim=True)
-    return wide - w * inner, {}, tempo.live
+    if wide.numel() == 0:
+        return wide, {}, tempo.live
+    scale = wide.abs().amax(dim=-1, keepdim=True)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    scaled = wide / safe_scale
+    inner = (w * scaled).sum(dim=-1, keepdim=True)
+    return (scaled - w * inner) * safe_scale, {}, tempo.live
 
 
 oblique_tangent_projection.init = orthogonalize_init
@@ -718,9 +857,13 @@ oblique_tangent_projection.init = orthogonalize_init
 def polargrad_direction(update, obs, param, state, tempo):
     """Scale the polar direction by the momentum's nuclear norm."""
 
+    if update.numel() == 0:
+        return _wide(update), {}, tempo.live
     orth = orthogonalize(update, obs, param, state, tempo)[0]
-    scale = (orth * update).sum(dim=(-2, -1), keepdim=True)
-    return orth * scale, {}, tempo.live
+    update_scale = update.abs().amax(dim=(-2, -1), keepdim=True)
+    safe_scale = torch.where(update_scale != 0, update_scale, torch.ones_like(update_scale))
+    scale = (orth * (update / safe_scale)).sum(dim=(-2, -1), keepdim=True)
+    return orth * scale * safe_scale, {}, tempo.live
 
 
 polargrad_direction.init = orthogonalize_init
@@ -739,16 +882,41 @@ def normuon_normalize(update, obs, param, state, tempo):
 
     del obs, param
     update = _wide(update)
+    if update.numel() == 0:
+        # Zero-element matrices (e.g. shape (0, n)) are routed here as 2-D leaves; the reductions
+        # below would reduce over an empty axis. Pass them through unchanged.
+        return update, {"moment2": _wide(state["moment2"])}, tempo.live
     # Reduce over the input axis -> a per-output-neuron (row) second moment, applied to tall and wide
     # matrices alike, per NorMuon (arXiv:2510.05491) Alg. 1. (Was shorter-axis, wrong for wide leaves.)
-    v_mean = update.square().mean(dim=-1, keepdim=True)
-    beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    moment2 = _wide(state["moment2"]) * beta2 + v_mean * (1 - beta2)
-    normalized = update * moment2.clamp_min(tempo.hyper.eps).rsqrt()
-    scale = update.norm(dim=(-2, -1), keepdim=True) / normalized.norm(dim=(-2, -1), keepdim=True).clamp_min(
-        tempo.hyper.eps
+    row_max = update.abs().amax(dim=-1, keepdim=True)
+    safe_row_max = torch.where(row_max != 0, row_max, torch.ones_like(row_max))
+    observation_rms = (
+        (update / safe_row_max).square().mean(dim=-1, keepdim=True).sqrt()
+        * safe_row_max
     )
-    return normalized * scale, {"moment2": moment2}, tempo.live
+    beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
+    moment2 = _second_moment(state["moment2"], observation_rms, beta2)
+    normalized = update / _second_moment_denom(
+        moment2, tempo.hyper.eps, update.dtype
+    )
+
+    matrix_max = update.abs().amax(dim=(-2, -1), keepdim=True)
+    matrix_limit = math.sqrt(
+        torch.finfo(update.dtype).max / (update.shape[-2] * update.shape[-1])
+    )
+    safe_matrix_max = torch.where(matrix_max != 0, matrix_max, torch.ones_like(matrix_max))
+    stable_scale = (update / safe_matrix_max).norm(
+        dim=(-2, -1), keepdim=True
+    ) / normalized.norm(
+        dim=(-2, -1), keepdim=True
+    ).clamp_min(tempo.hyper.eps)
+    stable_output = normalized * stable_scale * safe_matrix_max
+    direct_scale = update.norm(dim=(-2, -1), keepdim=True) / normalized.norm(
+        dim=(-2, -1), keepdim=True
+    ).clamp_min(tempo.hyper.eps)
+    direct_output = normalized * direct_scale
+    output = torch.where(matrix_max <= matrix_limit, direct_output, stable_output)
+    return output, {"moment2": moment2}, tempo.live
 
 
 normuon_normalize.init = normuon_normalize_init
@@ -762,8 +930,18 @@ def rms_align(update, obs, param, state, tempo):
 
     del obs, param, state
     update = _wide(update)
-    rms = update.norm(dim=(-2, -1), keepdim=True) / (update.shape[-2] * update.shape[-1]) ** 0.5
-    return update * (0.2 / rms.clamp_min(tempo.hyper.eps)), {}, tempo.live
+    if update.numel() == 0:
+        return update, {}, tempo.live
+    count = update.shape[-2] * update.shape[-1]
+    flat, scale, norm = _slab_l2_components(update)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    safe_norm = torch.where(norm != 0, norm, torch.ones_like(norm))
+    target_norm = 0.2 * math.sqrt(count)
+    aligned = flat / safe_scale / safe_norm * target_norm
+    epsilon = torch.as_tensor(tempo.hyper.eps, dtype=update.dtype, device=update.device)
+    direct = flat * (0.2 / epsilon)
+    rms = scale * (norm / math.sqrt(count))
+    return torch.where(rms >= epsilon, aligned, direct).reshape_as(update), {}, tempo.live
 
 
 rms_align.init = orthogonalize_init
@@ -779,13 +957,12 @@ def balanced_orthogonalize(update, obs, param, state, tempo):
     transposed = update.shape[-2] < update.shape[-1]
     tall = update.mT if transposed else update
     target_row_sq = tall.shape[-1] / tall.shape[-2]
-    row_norm = torch.linalg.vector_norm(tall, dim=-1, keepdim=True).clamp_min(1e-7)
-    diagonal = row_norm.reciprocal()
+    balanced = stable_l2_normalize(tall, dim=-1, eps=1e-7)
     for round_index in range(2):
-        direction = orthogonalize(diagonal * tall, obs, param, state, tempo)[0]
+        direction = orthogonalize(balanced, obs, param, state, tempo)[0]
         if round_index < 1:
             row_sum_sq = direction.square().sum(dim=-1, keepdim=True).clamp_min(1e-7 * 1e-7)
-            diagonal = diagonal * (target_row_sq / row_sum_sq).pow(0.5)
+            balanced = balanced * (target_row_sq / row_sum_sq).sqrt()
     if transposed:
         direction = direction.mT
     return direction, {}, tempo.live
@@ -804,20 +981,63 @@ def whiten_init(ref_leaf: Tensor) -> dict[str, Tensor]:
     return {
         "Q": torch.eye(ref.shape[0], dtype=ref.dtype, device=ref.device),
         "GG": torch.zeros_like(ref),
+        "GG_scale": torch.ones((), dtype=ref.dtype, device=ref.device),
     }
 
 
 def whiten(update, obs, param, state, tempo):
-    """Left-whiten square 2D slabs; ``Q`` is rebuilt only in a refresh variant."""
+    """Left-whiten square 2D slabs; ``Q`` is rebuilt only in a refresh variant.
+
+    As in Shampoo, a negative Gram scale marks ``Q`` as a factored spectral
+    root; a positive scale marks the ordinary materialized-root representation.
+    """
 
     del param
     update = _wide(update)
     grad = _wide(obs.grad)
-    gg = _wide(state["GG"]) + grad @ grad.mT
+    dimensions = tuple(range(1, grad.ndim))
+    maximum = grad.abs().amax(dim=dimensions)
+    limit = math.sqrt(torch.finfo(grad.dtype).max / max(1, grad.shape[-1]))
+    needs_scale = maximum > limit
+    outer_scale = torch.where(needs_scale, maximum, torch.ones_like(maximum))
+    scaled_grad = grad / broadcast_leaf(outer_scale, grad)
+    direct_outer = grad @ grad.mT
+    normalized_outer = scaled_grad @ scaled_grad.mT
+    outer = torch.where(
+        broadcast_leaf(needs_scale, direct_outer), normalized_outer, direct_outer
+    )
+    stored_scale = _wide(state["GG_scale"])
+    spectral = stored_scale < 0
+    old_scale = stored_scale.abs()
+    gg_scale = torch.maximum(old_scale, outer_scale)
+    safe_scale = torch.where(gg_scale != 0, gg_scale, torch.ones_like(gg_scale))
+    old_ratio = broadcast_leaf(old_scale / safe_scale, state["GG"])
+    new_ratio = broadcast_leaf(outer_scale / safe_scale, state["GG"])
+    gg = (
+        _wide(state["GG"]) * old_ratio.square()
+        + outer.to(update.dtype) * new_ratio.square()
+    )
     q = _wide(state["Q"])
     if tempo.refresh:
-        q = _matrix_inv_sqrt(gg, tempo.hyper.eps)
-    return q @ update, {"Q": q, "GG": gg}, tempo.live
+        vectors, roots = _eigh_scaled_gram_decomposition(
+            gg, gg_scale, tempo.hyper.eps, -0.5
+        )
+        spectral = _root_requires_spectral_application(roots, q.dtype)
+        direct_root = ((vectors * roots.unsqueeze(-2)) @ vectors.mT).to(q.dtype)
+        factored_root = (vectors * roots.sqrt().unsqueeze(-2)).to(q.dtype)
+        q = torch.where(
+            broadcast_leaf(spectral, direct_root), factored_root, direct_root
+        )
+    direct = q @ update
+    factored = q @ (q.mT @ update)
+    preconditioned = torch.where(
+        broadcast_leaf(spectral, direct), factored, direct
+    )
+    return preconditioned, {
+        "Q": q,
+        "GG": gg,
+        "GG_scale": torch.where(spectral, -gg_scale, gg_scale),
+    }, tempo.live
 
 
 whiten.init = whiten_init
@@ -835,7 +1055,7 @@ def sgd_commit(param, update, state, tempo):
     del state
     wide = _wide(param)
     wd = tempo.hyper.weight_decay
-    return wide - tempo.hyper.lr * (update + wd * wide), {}
+    return wide * (1 - tempo.hyper.lr * wd) - tempo.hyper.lr * update, {}
 
 
 sgd_commit.init = _empty_commit_init
@@ -844,8 +1064,13 @@ sgd_commit.init = _empty_commit_init
 def adamc_commit(param, update, state, tempo):
     del state
     wide = _wide(param)
-    decay = tempo.hyper.weight_decay * tempo.hyper.lr / tempo.hyper.max_lr
-    return wide - tempo.hyper.lr * (update + decay * wide), {}
+    max_lr = tempo.hyper.lr if tempo.hyper.max_lr is None else tempo.hyper.max_lr
+    # When construction ``lr`` (and thus inherited ``max_lr``) is 0, ``lr / max_lr`` is 0/0 and would
+    # NaN-poison the update even though the step is a no-op. Substitute 1.0 there (the ratio is unused
+    # because ``lr`` zeroes the whole update); nonzero ``max_lr`` keeps the exact ``lr / max_lr`` ratio.
+    safe_max_lr = torch.where(max_lr != 0, max_lr, torch.ones_like(max_lr))
+    decay = tempo.hyper.weight_decay * tempo.hyper.lr / safe_max_lr
+    return wide * (1 - tempo.hyper.lr * decay) - tempo.hyper.lr * update, {}
 
 
 adamc_commit.init = _empty_commit_init
@@ -869,7 +1094,9 @@ def stiefel_projection(param, tempo):
     transposed = param.shape[-2] < param.shape[-1]
     x = param.mT if transposed else param
     q, r = torch.linalg.qr(x)
-    q = q * r.diagonal(dim1=-2, dim2=-1).sign().unsqueeze(-2)
+    signs = r.diagonal(dim1=-2, dim2=-1).sign()
+    signs = torch.where(signs != 0, signs, torch.ones_like(signs))
+    q = q * signs.unsqueeze(-2)
     return q.mT if transposed else q
 
 
@@ -879,7 +1106,14 @@ stiefel_projection.distributed_scope = WHOLE
 def oblique_normalization(param, tempo):
     del tempo
     wide = _wide(param)
-    return wide / wide.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    if wide.numel() == 0:
+        return wide
+    normalized = stable_l2_normalize(wide, dim=-1, eps=1e-8)
+    zero = wide.abs().amax(dim=-1, keepdim=True) == 0
+    fallback = torch.zeros_like(wide)
+    if wide.shape[-1]:
+        fallback[..., 0] = 1
+    return torch.where(zero, fallback, normalized)
 
 
 def make_retraction_commit(base_commit, projection, *, name):
