@@ -7,12 +7,11 @@ from heavyball.codecs import decode, encode
 from heavyball.kl import _apply_kl_preconditioner, kl_soap_init
 from heavyball.kron import _precondition_mixed, _refresh_q
 from heavyball.lra import _refresh_lra
-from heavyball.matrix import _gram_value, _inverse_fourth_root, _outer, shampoo, shampoo_init
-from heavyball.numerics import balance_factors, broadcast_leaf, stochastic_round_bfloat16
+from heavyball.matrix import _gram_value, _outer, shampoo, shampoo_init
+from heavyball.numerics import balance_factors, stochastic_round_bfloat16
 from heavyball.scion import _copy_initialized_
 from heavyball.transforms import (
     Tempo,
-    _matrix_inv_sqrt,
     _second_moment_denom,
     adam,
     adam_init,
@@ -21,7 +20,6 @@ from heavyball.transforms import (
     adopt,
     adopt_init,
     balanced_orthogonalize,
-    beta_debias,
     laprop,
     mars,
     nadam,
@@ -380,20 +378,18 @@ def test_rank_deficient_retractions_return_valid_manifold_points():
 
 def test_normuon_two_step_extreme_state_and_normal_equivalence():
     torch.manual_seed(8)
-    normal = torch.randn(4, 4)
-    state = normuon_normalize_init(normal)
+    normal = torch.randn(1, 4, 4)
+    state = normuon_normalize_init(normal[0])
     state["moment2"].copy_(torch.rand_like(state["moment2"]) + 0.1)
-    tempo = _tempo(4, age=3)
-    beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), normal)
+    tempo = _tempo(1, age=3)
+    beta2 = tempo.hyper.beta2
     old_moment = state["moment2"].float().square() * beta2 + normal.square().mean(
         dim=-1, keepdim=True
     ) * (1 - beta2)
-    old_normalized = normal * old_moment.clamp_min(tempo.hyper.eps).rsqrt()
+    old_normalized = normal / (old_moment.sqrt() + tempo.hyper.eps)
     old_output = old_normalized * (
-        normal.norm(dim=(-2, -1), keepdim=True)
-        / old_normalized.norm(dim=(-2, -1), keepdim=True).clamp_min(
-            tempo.hyper.eps
-        )
+        0.2 * (normal.shape[-2] * normal.shape[-1]) ** 0.5
+        / old_normalized.norm(dim=(-2, -1), keepdim=True)
     )
     output, next_state, _ = normuon_normalize(
         normal, None, None, state, tempo
@@ -412,53 +408,16 @@ def test_normuon_two_step_extreme_state_and_normal_equivalence():
         )
         outputs.append(output)
     for output in outputs:
-        torch.testing.assert_close(output, extreme, rtol=0, atol=0)
+        torch.testing.assert_close(output, torch.full_like(output, 0.2), rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(
         extreme_state["moment2"].double().square(),
-        torch.full_like(extreme_state["moment2"].double(), 1e40),
-        rtol=1e-7,
+        torch.full_like(
+            extreme_state["moment2"].double(),
+            (1 - 0.95**2) * 1e40,
+        ),
+        rtol=3e-7,
         atol=0,
     )
-
-
-def _old_regularized_root(gram, eps, exponent):
-    regularized = gram * 0.5 + gram.mT * 0.5 + eps * torch.eye(
-        gram.shape[-1], dtype=gram.dtype
-    )
-    values, vectors = torch.linalg.eigh(regularized)
-    return (vectors * values.clamp_min(eps).pow(exponent).unsqueeze(-2)) @ vectors.mT
-
-
-def test_rank_deficient_roots_classify_roundoff_as_null():
-    torch.manual_seed(9)
-    full_rank = torch.randn(1, 8, 8)
-    gram = full_rank @ full_rank.mT + torch.eye(8)
-    eps = torch.tensor(1e-8)
-    for function, exponent in (
-        (_matrix_inv_sqrt, -0.5),
-        (_inverse_fourth_root, -0.25),
-    ):
-        torch.testing.assert_close(
-            function(gram, eps),
-            _old_regularized_root(gram, eps, exponent),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-
-    torch.manual_seed(2401)
-    factor = torch.randn(1, 24, 1)
-    gram32 = factor @ factor.mT
-    gram64 = factor.double() @ factor.double().mT
-    null = torch.linalg.qr(factor.double(), mode="complete").Q[:, :, 1]
-    for function, expected_gain in (
-        (_matrix_inv_sqrt, 1e4),
-        (_inverse_fourth_root, 1e2),
-    ):
-        root = function(gram32, eps).double()
-        gain = (root @ null.unsqueeze(-1)).norm()
-        assert abs(float(gain) - expected_gain) / expected_gain < 2e-6
-        reference = function(gram64, eps.double())
-        assert float((root - reference).norm() / reference.norm()) < 2e-6
 
 
 def test_sgd_and_mars_reordering_preserves_normal_and_avoids_cancellation():

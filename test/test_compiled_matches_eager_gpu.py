@@ -1,9 +1,9 @@
 """GPU compiled-vs-eager oracle across every optimizer facade.
 
-The CPU test covers only five recipes. The 34 tight facades use a 1e-4 bound
-(versus their real ~1e-7 level) so compiled regressions fail; the nine
-``_DIVERGENT`` facades use only a gross-breakage bound because they diverge by
-design.
+The ordinary facades use a 1e-4 bound (versus their measured ~1e-7 level).
+``_DIVERGENT`` is limited to iterative matmul/eigendecomposition recipes whose
+compiled and eager reduction orders produce distinct, valid training
+trajectories; those use 1e-1 only as a gross-breakage bound.
 """
 
 import inspect
@@ -26,11 +26,12 @@ OPTIMIZERS = sorted(
 )
 assert len(OPTIMIZERS) >= 43, f"optimizer feature matrix unexpectedly shrank: {len(OPTIMIZERS)} < 43"
 
-# the orthogonalization/polar/spectral optimizers whose Newton-Schulz/eigendecomposition iterations amplify the
-# compiled-vs-eager matmul-reduction-order difference, so compiled and eager diverge like different seeds (both
-# converge -- not a bug). Measured rel at 12 steps on RTX 5060 Ti: SpEL 3.4e-2, PolarGrad 9.2e-3, AdaMuon 4.8e-3,
-# Aurora 3.7e-3, NorMuon 3.4e-3, Muon 2.8e-3, KLSOAP 2.6e-3, MuonLaProp 1.1e-3, Scion 1.6e-4. The other 34 facades
-# are ~1e-7.
+# These orthogonalization/polar/spectral optimizers amplify compiled-vs-eager matmul reduction-order differences
+# through Newton-Schulz/eigendecomposition iterations, so the trajectories separate like different seeds while
+# both converge. Measured rel at 12 steps on RTX 5060 Ti: SpEL 3.4e-2, PolarGrad 9.2e-3, AdaMuon 4.8e-3,
+# Aurora 3.7e-3, NorMuon 3.4e-3, Muon 2.8e-3, KLSOAP 2.6e-3, MuonLaProp 1.1e-3, Scion 1.6e-4. Thus a 1e-2
+# threshold is already known to reject a valid fp32 SpEL run; 1e-1 leaves platform headroom without being used
+# for ordinary facades.
 _DIVERGENT = {"AdaMuon", "Aurora", "HeavyKLSOAP", "KLSOAP", "Muon", "MuonLaProp", "NorMuon", "PolarGrad", "Scion", "SpEL"}
 
 

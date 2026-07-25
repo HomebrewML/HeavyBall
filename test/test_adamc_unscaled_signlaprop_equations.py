@@ -25,36 +25,37 @@ def _eager():
 
 
 _INITIAL = (
-    np.array([1.25, -0.75, 0.125], dtype=np.float64),
+    np.array([1.25, -0.75, 0.125, -0.5], dtype=np.float64),
     np.array([[0.6, -1.1], [2.0, -0.3]], dtype=np.float64),
 )
 
-# The small second coordinate in each leaf keeps sqrt(v_hat) below eps, distinguishing the endorsed
-# clamp floor from an additive epsilon while the other coordinates exercise the ordinary RMS branch.
+# The small coordinates keep v_hat below eps while sqrt(v_hat) remains above eps. They distinguish
+# sqrt(clamp(v_hat, eps)) from the incorrect clamp(sqrt(v_hat), eps); the other coordinates exercise
+# the ordinary RMS branch.
 _GRADIENTS = (
     (
-        np.array([0.4, 2.0e-8, -0.7], dtype=np.float64),
-        np.array([[0.3, -3.0e-8], [0.9, -0.2]], dtype=np.float64),
+        np.array([0.4, 2.0e-3, -0.7, -1.0e-3], dtype=np.float64),
+        np.array([[0.3, -3.0e-3], [0.9, -0.2]], dtype=np.float64),
     ),
     (
-        np.array([-0.25, -5.0e-8, 0.15], dtype=np.float64),
-        np.array([[-0.4, 6.0e-8], [0.2, 0.5]], dtype=np.float64),
+        np.array([-0.25, -5.0e-3, 0.15, 2.0e-3], dtype=np.float64),
+        np.array([[-0.4, 6.0e-3], [0.2, 0.5]], dtype=np.float64),
     ),
     (
-        np.array([0.8, 4.0e-8, -0.35], dtype=np.float64),
-        np.array([[0.7, -2.0e-8], [-0.6, 0.25]], dtype=np.float64),
+        np.array([0.8, 4.0e-3, -0.35, -3.0e-3], dtype=np.float64),
+        np.array([[0.7, -2.0e-3], [-0.6, 0.25]], dtype=np.float64),
     ),
     (
-        np.array([-0.1, -7.0e-8, 0.55], dtype=np.float64),
-        np.array([[0.15, 9.0e-8], [0.45, -0.8]], dtype=np.float64),
+        np.array([-0.1, -7.0e-3, 0.55, 4.0e-3], dtype=np.float64),
+        np.array([[0.15, 9.0e-3], [0.45, -0.8]], dtype=np.float64),
     ),
     (
-        np.array([0.3, 3.0e-8, -0.6], dtype=np.float64),
-        np.array([[-0.5, -4.0e-8], [0.35, 0.1]], dtype=np.float64),
+        np.array([0.3, 3.0e-3, -0.6, -5.0e-3], dtype=np.float64),
+        np.array([[-0.5, -4.0e-3], [0.35, 0.1]], dtype=np.float64),
     ),
     (
-        np.array([-0.45, 8.0e-8, 0.2], dtype=np.float64),
-        np.array([[0.55, 5.0e-8], [-0.25, 0.65]], dtype=np.float64),
+        np.array([-0.45, 8.0e-3, 0.2, 6.0e-3], dtype=np.float64),
+        np.array([[0.55, 5.0e-3], [-0.25, 0.65]], dtype=np.float64),
     ),
 )
 
@@ -73,7 +74,7 @@ def _adamc_from_equations(parameters, gradients, states, step, *, lr, beta1, bet
 
         first_hat = first / (1.0 - beta1**step)
         second_hat = second / (1.0 - beta2**step)
-        adam_direction = first_hat / np.maximum(np.sqrt(second_hat), eps)
+        adam_direction = first_hat / np.sqrt(np.maximum(second_hat, eps))
 
         corrected_decay = weight_decay * (lr / max_lr)
         updated.append(parameter - lr * adam_direction - lr * corrected_decay * parameter)
@@ -91,7 +92,7 @@ def _unscaled_adamw_from_equations(
         second = beta2 * second + (1.0 - beta2) * np.square(gradient)
         states[index]["raw_second"] = second
         second_hat = second / (1.0 - beta2**step)
-        current_scale = np.maximum(np.sqrt(second_hat), eps)
+        current_scale = np.sqrt(np.maximum(second_hat, eps))
 
         normalized_gradient = gradient / current_scale
         normalized_momentum = states[index].get("raw_normalized_momentum", np.zeros_like(parameter))
@@ -115,7 +116,7 @@ def _sign_laprop_from_equations(
         second = beta2 * second + (1.0 - beta2) * np.square(gradient)
         states[index]["raw_second"] = second
         second_hat = second / (1.0 - beta2**step)
-        denominator = np.maximum(np.sqrt(second_hat), eps)
+        denominator = np.sqrt(np.maximum(second_hat, eps))
 
         normalized_gradient = gradient / denominator
         first = states[index].get("raw_first", np.zeros_like(parameter))

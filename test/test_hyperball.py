@@ -1,10 +1,5 @@
 """Parity and constraint proofs for the slab-native HyperBall port."""
 
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -58,6 +53,9 @@ def test_hyperball_matches_pure_reference(dtype, rtol, atol, caution):
     )
     initial = [torch.randn(3, 2, dtype=dtype), torch.randn(3, 2, dtype=dtype)]
     gradients = [[torch.randn_like(value) for value in initial] for _ in range(9)]
+    for step, step_gradients in enumerate(gradients, start=1):
+        for gradient in step_gradients:
+            gradient[0, 0] = (-1) ** step * step * 1e-6
     params = [torch.nn.Parameter(value.clone()) for value in initial]
     history = [[] for _ in initial]
     try:
@@ -216,33 +214,32 @@ def test_hyperball_constrains_norm():
         torch._dynamo.reset()
 
 
-def test_hyperball_fullgraph_clean(tmp_path):
-    """The compiled HyperBall step is scalar-free and uses no dynamic-control-flow helpers."""
+def test_hyperball_executes_one_stable_fullgraph_and_preserves_radius():
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
+        radii = [torch.linalg.vector_norm(param.detach()) for param in params]
+        optimizer = Engine(
+            params,
+            hyperball_adamw,
+            caution=True,
+            weight_decay=0.03,
+            cautious_weight_decay=True,
+        )
+        for step in range(3):
+            for index, param in enumerate(params):
+                param.grad.copy_(
+                    torch.linspace(-1, 1, param.numel()).reshape_as(param) * (step + index + 1)
+                )
+            optimizer.step()
+            if step == 0:
+                graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
-    source = """
-import torch
-from heavyball import Engine, hyperball_adamw
-
-params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
-optimizer = Engine(params, hyperball_adamw, caution=True, weight_decay=0.03, cautious_weight_decay=True)
-for _ in range(3):
-    for param in params:
-        param.grad.normal_()
-    optimizer.step()
-"""
-    env = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = {Path(value) for value in re.findall(r"Output code written to: (.*\.py)", output)}
-    assert paths, output
-    for path in paths:
-        code = path.read_text()
-        for forbidden in (".item(", "while_loop", "cond", "stack", "_local_scalar_dense"):
-            assert forbidden not in code, f"{forbidden} in {path}"
+        assert graphs == 1
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+        for param, radius in zip(params, radii, strict=True):
+            torch.testing.assert_close(torch.linalg.vector_norm(param), radius, rtol=1e-5, atol=1e-6)
+    finally:
+        torch._dynamo.reset()

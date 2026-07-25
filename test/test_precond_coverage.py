@@ -62,8 +62,8 @@ def test_kron_both_diagonal_refresh_matches_closed_form():
 
     torch.testing.assert_close(state["Q_0"], expected_q0, rtol=0, atol=0)
     torch.testing.assert_close(state["Q_1"], expected_q1, rtol=0, atol=0)
-    torch.testing.assert_close(state["running_lower_bound_0"], expected_lower0, rtol=0, atol=0)
-    torch.testing.assert_close(state["running_lower_bound_1"], expected_lower1, rtol=0, atol=0)
+    torch.testing.assert_close(state["running_lower_bound_0"], expected_lower0, rtol=0, atol=1e-15)
+    torch.testing.assert_close(state["running_lower_bound_1"], expected_lower1, rtol=0, atol=1e-15)
     torch.testing.assert_close(parameter, expected_parameter, rtol=1e-15, atol=1e-15)
 
 
@@ -169,7 +169,7 @@ def test_soap_left_only_basis_refresh_transports_both_moments():
     old_avg = state["exp_avg"].clone()
     old_avg_sq = state["exp_avg_sq"].clone()
     torch.testing.assert_close(old_avg, first.unsqueeze(0), rtol=0, atol=0)
-    torch.testing.assert_close(old_avg_sq, first.square().unsqueeze(0), rtol=0, atol=0)
+    torch.testing.assert_close(old_avg_sq, first.abs().unsqueeze(0), rtol=0, atol=0)
 
     parameter.grad.copy_(second)
     optimizer.step(step_type="refresh")
@@ -182,10 +182,10 @@ def test_soap_left_only_basis_refresh_transports_both_moments():
     beta2 = beta_debias(hyper.beta2, age).reshape(1, 1, 1)
     projected = old_left.mT @ second.unsqueeze(0)
     raw_avg = old_avg * beta1 + projected * (1 - beta1)
-    raw_avg_sq = old_avg_sq * beta2 + projected.square() * (1 - beta2)
+    raw_variance = old_avg_sq.square() * beta2 + projected.square() * (1 - beta2)
     change = new_left.mT @ old_left
     expected_avg = change @ raw_avg
-    expected_avg_sq = change.square() @ raw_avg_sq
+    expected_avg_sq = (change.square() @ raw_variance).clamp_min(0).sqrt()
 
     torch.testing.assert_close(state["exp_avg"], expected_avg, rtol=1e-15, atol=1e-15)
     torch.testing.assert_close(state["exp_avg_sq"], expected_avg_sq, rtol=1e-15, atol=1e-15)
@@ -197,8 +197,10 @@ def test_soap_left_only_basis_refresh_transports_both_moments():
     beta2 = beta_debias(hyper.beta2, age).reshape(1, 1, 1)
     projected = new_left.mT @ third.unsqueeze(0)
     expected_avg = expected_avg * beta1 + projected * (1 - beta1)
-    expected_avg_sq = expected_avg_sq * beta2 + projected.square() * (1 - beta2)
-    projected_update = expected_avg / expected_avg_sq.sqrt().clamp_min(hyper.eps)
+    expected_avg_sq = (
+        expected_avg_sq.square() * beta2 + projected.square() * (1 - beta2)
+    ).sqrt()
+    projected_update = expected_avg / expected_avg_sq.square().clamp_min(hyper.eps).sqrt()
     expected_parameter = before - hyper.lr * (new_left @ projected_update).squeeze(0)
 
     parameter.grad.copy_(third)

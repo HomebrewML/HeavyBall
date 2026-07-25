@@ -15,49 +15,62 @@ from heavyball.kl import (
 
 def test_heavy_factor_inverse_is_thresholded_moore_penrose():
     eps_value = 1e-6
-    eigenvalue_values = (1e-12, eps_value, 4.0, 9.0)
-    eigenvalues = torch.tensor(eigenvalue_values, dtype=torch.float64)
+    stored_rms_values = (1e-6, math.sqrt(eps_value), 4.0, 9.0)
+    stored_rms = torch.tensor(stored_rms_values, dtype=torch.float64)
     eps = torch.tensor(eps_value, dtype=torch.float64)
+    threshold = math.sqrt(eps_value)
 
     expected_pseudoinverse = torch.tensor(
-        [0.0 if value <= eps_value else 1.0 / math.sqrt(value) for value in eigenvalue_values],
+        [0.0 if value <= threshold else 1.0 / value for value in stored_rms_values],
         dtype=torch.float64,
     )
     expected_clamp = torch.tensor(
-        [1.0 / math.sqrt(max(value, eps_value)) for value in eigenvalue_values],
+        [1.0 / max(value, threshold) for value in stored_rms_values],
         dtype=torch.float64,
     )
 
-    heavy_inverse = _heavy_factor_inverse(eigenvalues, eps)
-    standard_inverse = _factor_inverse(eigenvalues, eps)
+    heavy_inverse = _heavy_factor_inverse(stored_rms, eps)
+    standard_inverse = _factor_inverse(stored_rms, eps)
 
     torch.testing.assert_close(heavy_inverse, expected_pseudoinverse, rtol=0, atol=1e-12)
     torch.testing.assert_close(standard_inverse, expected_clamp, rtol=0, atol=1e-12)
-    assert torch.equal(heavy_inverse.ne(standard_inverse), eigenvalues <= eps)
+    assert heavy_inverse[2].item() == 0.25
+    assert torch.equal(heavy_inverse.ne(standard_inverse), stored_rms <= threshold)
 
 
-def test_heavy_kl_qr_basis_sorts_descending_rayleigh_quotients():
+def test_heavy_kl_qr_basis_uses_source_order_and_preserves_subspace():
     generator = torch.Generator().manual_seed(0)
     raw_gram = torch.randn(1, 5, 5, generator=generator, dtype=torch.float64)
     gram = raw_gram @ raw_gram.mT + 0.5 * torch.eye(5, dtype=torch.float64).unsqueeze(0)
-    raw_basis = torch.randn(1, 5, 5, generator=generator, dtype=torch.float64)
+    raw_basis = torch.randn(1, 5, 3, generator=generator, dtype=torch.float64)
     basis = torch.linalg.qr(raw_basis).Q
 
     work = gram @ basis
     rayleigh_quotients = torch.einsum("nij,nij->nj", basis, work)
     expected_order = torch.argsort(rayleigh_quotients, dim=-1, descending=True)
-    expected_sorted_basis = torch.linalg.qr(work.index_select(-1, expected_order[0])).Q
-    expected_unsorted_basis = torch.linalg.qr(work).Q
+    ordered_work = work.gather(-1, expected_order.unsqueeze(-2).expand_as(work))
 
     sorted_basis, order = _heavy_kl_qr_basis(gram, basis)
     standard_basis = _kl_qr_basis(gram, basis)
 
     assert torch.equal(order, expected_order)
-    torch.testing.assert_close(sorted_basis, expected_sorted_basis, rtol=0, atol=1e-12)
-    sorted_rayleigh_quotients = torch.einsum("nij,nij->nj", sorted_basis, gram @ sorted_basis)
-    assert torch.all(sorted_rayleigh_quotients[:, :-1] >= sorted_rayleigh_quotients[:, 1:])
-    torch.testing.assert_close(standard_basis, expected_unsorted_basis, rtol=0, atol=1e-12)
-    assert not torch.allclose(sorted_basis, standard_basis, rtol=0, atol=1e-12)
+    identity = torch.eye(3, dtype=torch.float64).unsqueeze(0)
+    torch.testing.assert_close(sorted_basis.mT @ sorted_basis, identity, rtol=0, atol=1e-12)
+    torch.testing.assert_close(standard_basis.mT @ standard_basis, identity, rtol=0, atol=1e-12)
+    expected_sorted = torch.linalg.qr(ordered_work).Q
+    expected_standard = torch.linalg.qr(work).Q
+    torch.testing.assert_close(
+        sorted_basis @ sorted_basis.mT,
+        expected_sorted @ expected_sorted.mT,
+        rtol=0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        standard_basis @ standard_basis.mT,
+        expected_standard @ expected_standard.mT,
+        rtol=0,
+        atol=1e-12,
+    )
 
 
 def _facade_trajectory(optimizer_class, initial, gradients, *, soap):

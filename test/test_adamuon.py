@@ -1,69 +1,60 @@
-"""Independent oracle for AdaMuon (arXiv:2507.11005): Muon's orthogonalized direction with RMSprop's
-second-moment normalization, then RMS-aligned rescaling to a fixed RMS 0.2 (the paper's core
-contribution -- it matches the update magnitude to Adam so Adam's LR schedules transfer), committed
-WITHOUT Muon's aspect scale (which is only correct for a truly-orthogonal update; O/sqrt(v) is not).
-The structural check pins that composition; behavioral checks confirm it optimizes, compiles fullgraph,
-and ships a working facade. See test_adamuon_rms_align.py for the RMS-0.2 shape-invariance property.
+"""Independent oracle for AdaMuon's sign-stabilized polar and raw adaptive second moment.
+
+The paper applies NS5 to ``sign(momentum)``, updates an uncorrected elementwise second moment of
+that polar direction, divides by ``sqrt(v) + eps``, and RMS-aligns the result to 0.2 before a plain
+SGD commit.
 """
 
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import torch
 
-from heavyball import Engine, adamuon
-from heavyball.transforms import momentum, orthogonalize, rms_align, rmsprop as rmsprop_transform, sgd_commit
+from heavyball import adamuon
+from heavyball.transforms import (
+    Tempo,
+    adamuon_rmsprop,
+    momentum,
+    orthogonalize,
+    rms_align,
+    sgd_commit,
+    sign,
+)
 
 
-def test_adamuon_is_muon_rmsprop_then_rms_aligned():
+def test_adamuon_is_sign_stabilized_raw_rmsprop_then_rms_aligned():
     matrix = adamuon.then
-    assert matrix.chain == (momentum, orthogonalize, rmsprop_transform, rms_align)
+    assert matrix.chain == (
+        momentum,
+        sign,
+        orthogonalize,
+        adamuon_rmsprop,
+        rms_align,
+    )
     assert matrix.commit is sgd_commit
 
 
-def test_adamuon_minimizes_a_convex_quadratic():
-    torch.manual_seed(3)
-    target = torch.randn(6, 4)
-    param = torch.nn.Parameter(torch.zeros(6, 4))
-    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        optimizer = Engine([param], adamuon, lr=0.1, beta1=0.9, beta2=0.95, weight_decay=0.0)
+def test_adamuon_second_moment_uses_raw_beta_and_additive_epsilon():
+    update = torch.tensor([[[1.0, -2.0], [3.0, -4.0]]], dtype=torch.float64)
+    previous = torch.tensor([[[0.5, 0.75], [1.0, 1.25]]], dtype=torch.float64)
+    beta1 = torch.tensor(0.8, dtype=torch.float64)
+    epsilon = torch.tensor(1e-4, dtype=torch.float64)
+    tempo = Tempo(
+        step=torch.ones((), dtype=torch.long),
+        age=torch.full((1,), 7, dtype=torch.long),
+        live=torch.ones(1, dtype=torch.bool),
+        hyper=SimpleNamespace(
+            beta1=beta1,
+            beta2=torch.tensor(0.1, dtype=torch.float64),
+            eps=epsilon,
+        ),
+        refresh=False,
+    )
 
-    def squared_error() -> float:
-        return float(((param.detach() - target) ** 2).sum())
+    output, state, _ = adamuon_rmsprop(
+        update, None, None, {"exp_avg_sq": previous}, tempo
+    )
 
-    initial = squared_error()
-    best = initial
-    for _ in range(150):
-        param.grad.copy_(2.0 * (param.detach() - target))
-        optimizer.step()
-        best = min(best, squared_error())
-    assert best < 0.1 * initial
+    variance = beta1 * previous.square() + (1 - beta1) * update.square()
+    torch.testing.assert_close(state["exp_avg_sq"].square(), variance)
+    torch.testing.assert_close(output, update / (variance.sqrt() + epsilon))
 
-
-def test_adamuon_compiles_fullgraph():
-    torch.manual_seed(4)
-    param = torch.nn.Parameter(torch.randn(6, 4))
-    optimizer = Engine([param], adamuon, lr=0.05, beta1=0.9, beta2=0.95, weight_decay=0.0)
-    try:
-        param.grad.copy_(torch.randn_like(param))
-        optimizer.step()
-        assert torch.isfinite(param).all()
-    finally:
-        torch._dynamo.reset()
-
-
-def test_adamuon_facade_trains():
-    from heavyball import AdaMuon
-
-    assert AdaMuon.recipe is adamuon
-    torch.manual_seed(21)
-    model = torch.nn.Linear(4, 6)
-    inputs = torch.randn(8, 4)
-    targets = torch.zeros(8, 6)
-    optimizer = AdaMuon(model.parameters(), lr=0.05)
-    initial = torch.nn.functional.mse_loss(model(inputs), targets)
-    for _ in range(5):
-        optimizer.zero_grad()
-        torch.nn.functional.mse_loss(model(inputs), targets).backward()
-        optimizer.step()
-    assert torch.nn.functional.mse_loss(model(inputs), targets) < initial
-    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())

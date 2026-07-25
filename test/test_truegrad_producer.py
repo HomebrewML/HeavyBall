@@ -1,5 +1,6 @@
 """Regression tests for slab-backed TrueGrad observations."""
 
+import copy
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,77 @@ def _per_sample_loss(weight, bias, sample):
 
 def _batch_loss(output):
     return (output.sin() + 0.1 * output.square()).sum()
+
+
+def _per_sample_sum_grad_squared(module, inputs, output_grad):
+    named_parameters = tuple(module.named_parameters())
+    totals = {
+        name: torch.zeros_like(
+            parameter,
+            dtype=torch.float32 if parameter.dtype in (torch.float16, torch.bfloat16) else parameter.dtype,
+        )
+        for name, parameter in named_parameters
+    }
+    parameters = tuple(parameter for _, parameter in named_parameters)
+    output = module(inputs)
+    for sample_index, sample_output_grad in enumerate(output_grad):
+        sample_grad_output = torch.zeros_like(output)
+        sample_grad_output[sample_index] = sample_output_grad
+        sample_grads = torch.autograd.grad(
+            output,
+            parameters,
+            sample_grad_output,
+            retain_graph=sample_index + 1 < len(output_grad),
+        )
+        for (name, _), sample_grad in zip(named_parameters, sample_grads, strict=True):
+            totals[name].add_(sample_grad.to(totals[name].dtype).square())
+    return totals
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["linear", "conv1d", "conv2d", "conv3d", "embedding", "layernorm", "groupnorm", "groupnorm_flat", "rmsnorm"],
+)
+def test_supported_truegrad_producers_match_per_sample_autograd(case):
+    torch.manual_seed(20260725)
+    if case == "linear":
+        module, inputs = nn.Linear(4, 3), torch.randn(3, 2, 4)
+    elif case == "conv1d":
+        module, inputs = nn.Conv1d(2, 3, 3, padding=1), torch.randn(2, 2, 5)
+    elif case == "conv2d":
+        module = nn.Conv2d(4, 6, 3, padding=1, groups=2, padding_mode="reflect")
+        inputs = torch.randn(2, 4, 4, 5)
+    elif case == "conv3d":
+        module, inputs = nn.Conv3d(2, 3, 3, padding=1), torch.randn(2, 2, 3, 4, 3)
+    elif case == "embedding":
+        module = nn.Embedding(7, 4, padding_idx=0, scale_grad_by_freq=True)
+        inputs = torch.tensor([[0, 1, 1, 2], [1, 3, 0, 3], [4, 1, 4, 5]])
+    elif case == "layernorm":
+        module, inputs = nn.LayerNorm((2, 3)), torch.randn(3, 4, 2, 3)
+    elif case == "groupnorm":
+        module, inputs = nn.GroupNorm(2, 4), torch.randn(3, 4, 2, 3)
+    elif case == "groupnorm_flat":
+        module, inputs = nn.GroupNorm(2, 4), torch.randn(3, 4)
+    else:
+        if not hasattr(nn, "RMSNorm"):
+            pytest.skip("RMSNorm is unavailable")
+        module, inputs = nn.RMSNorm(4), torch.randn(3, 2, 4)
+
+    reference = copy.deepcopy(module)
+    with patch("heavyball.core.torch.compile", _eager_compile):
+        heavyball.Engine(module.parameters(), heavyball.truegrad_adam)
+    handles = heavyball.register_truegrad(module)
+    try:
+        output = module(inputs)
+        output_grad = torch.randn_like(output)
+        output.backward(output_grad)
+        expected = _per_sample_sum_grad_squared(reference, inputs, output_grad)
+
+        for name, parameter in module.named_parameters():
+            torch.testing.assert_close(parameter.sum_grad_squared, expected[name], rtol=1e-5, atol=1e-6)
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def test_truegrad_step_fails_when_observation_was_not_produced():
@@ -79,99 +151,6 @@ def test_linear_truegrad_producer_matches_vmap_reference_and_changes_update():
         handle.remove()
 
 
-def test_linear_truegrad_producer_preserves_observation_slab_binding():
-    torch.manual_seed(43)
-    linear = nn.Linear(4, 3)
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        optimizer = heavyball.Engine(linear.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(linear)
-    slab_views = {
-        param: group.observations.sum_grad_squared[index]
-        for group in optimizer.groups
-        for index, param in enumerate(group.params)
-    }
-
-    optimizer.zero_grad()
-    linear(torch.randn(5, 4)).square().sum().backward()
-
-    for param in linear.parameters():
-        assert param.sum_grad_squared.data_ptr() == slab_views[param].data_ptr()
-        assert torch.count_nonzero(slab_views[param]) > 0
-    for handle in handles:
-        handle.remove()
-
-
-def test_conv2d_truegrad_producer_matches_unfold_reference():
-    torch.manual_seed(44)
-    conv = nn.Conv2d(3, 5, 3, padding=1)
-    inputs = torch.randn(4, 3, 6, 7)
-    output_grads = []
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        heavyball.HeavyBallOptimizer(conv.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(conv)
-
-    output = conv(inputs)
-    output.register_hook(lambda grad: output_grads.append(grad.detach()))
-    _batch_loss(output).backward()
-
-    output_grad = output_grads.pop()
-    unfolded_input = F.unfold(
-        inputs.square(),
-        conv.kernel_size,
-        dilation=conv.dilation,
-        padding=conv.padding,
-        stride=conv.stride,
-    )
-    flat_output_grad = output_grad.square().reshape(inputs.shape[0], conv.out_channels, -1)
-    weight_reference = torch.einsum("bol,bkl->ok", flat_output_grad, unfolded_input).reshape(conv.weight.shape)
-    bias_reference = output_grad.square().sum(dim=(0, 2, 3))
-    torch.testing.assert_close(conv.weight.sum_grad_squared, weight_reference, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(conv.bias.sum_grad_squared, bias_reference, rtol=1e-6, atol=1e-6)
-    for handle in handles:
-        handle.remove()
-
-
-def test_truegrad_step_runs_on_conv2d_and_changes_parameters():
-    torch.manual_seed(45)
-    conv = nn.Conv2d(3, 5, 3, padding=1)
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        optimizer = heavyball.HeavyBallOptimizer([conv.weight, conv.bias], heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(conv)
-    initial_params = [param.detach().clone() for param in conv.parameters()]
-
-    optimizer.zero_grad()
-    _batch_loss(conv(torch.randn(4, 3, 6, 7))).backward()
-    optimizer.step()
-
-    for param, initial_param in zip(conv.parameters(), initial_params, strict=True):
-        assert not torch.equal(param, initial_param)
-    for handle in handles:
-        handle.remove()
-
-
-def test_embedding_truegrad_producer_matches_vmap_reference():
-    torch.manual_seed(46)
-    embedding = nn.Embedding(10, 8)
-    inputs = torch.randint(0, 10, (6, 4))
-    output_grads = []
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        heavyball.HeavyBallOptimizer(embedding.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(embedding)
-
-    output = embedding(inputs)
-    output.register_hook(lambda grad: output_grads.append(grad.detach()))
-    _batch_loss(output).backward()
-
-    output_grad = output_grads.pop()
-    weight_reference = torch.zeros_like(embedding.weight)
-    for sample_input, sample_output_grad in zip(inputs, output_grad, strict=True):
-        for index, grad in zip(sample_input, sample_output_grad, strict=True):
-            weight_reference[index] += grad.square()
-    torch.testing.assert_close(embedding.weight.sum_grad_squared, weight_reference, rtol=1e-5, atol=1e-6)
-    for handle in handles:
-        handle.remove()
-
-
 def test_tied_parameter_raises():
     torch.manual_seed(47)
     embedding = nn.Embedding(10, 8)
@@ -185,69 +164,3 @@ def test_tied_parameter_raises():
     ):
         heavyball.register_truegrad(model)
 
-
-def test_embedding_step_runs_and_updates():
-    torch.manual_seed(48)
-    embedding = nn.Embedding(10, 8)
-    inputs = torch.randint(0, 10, (6, 4))
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        optimizer = heavyball.HeavyBallOptimizer(embedding.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(embedding)
-    initial_weight = embedding.weight.detach().clone()
-
-    optimizer.zero_grad()
-    _batch_loss(embedding(inputs)).backward()
-    optimizer.step()
-
-    assert not torch.equal(embedding.weight, initial_weight)
-    for handle in handles:
-        handle.remove()
-
-
-def test_groupnorm_truegrad_producer_matches_reference():
-    torch.manual_seed(49)
-    gn = nn.GroupNorm(4, 16)
-    x = torch.randn(8, 16, 3, 3)
-
-    output_grads = []
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        heavyball.HeavyBallOptimizer(gn.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(gn)
-
-    output = gn(x)
-    output.register_hook(lambda grad: output_grads.append(grad.detach()))
-    _batch_loss(output).backward()
-    output_grad = output_grads.pop()
-
-    B, C, H, W = x.shape
-    G = gn.num_groups
-    x_grouped = x.detach().reshape(B, G, C // G, H, W)
-    norm_dims = (2, 3, 4)
-    mean = x_grouped.mean(norm_dims, keepdim=True)
-    var = x_grouped.var(norm_dims, correction=0, keepdim=True)
-    x_norm = ((x_grouped - mean) / (var + gn.eps).sqrt()).reshape(B, C, H, W)
-    weight_ref = (output_grad * x_norm).square().sum(dim=(0, 2, 3))
-    bias_ref = output_grad.square().sum(dim=(0, 2, 3))
-
-    torch.testing.assert_close(gn.weight.sum_grad_squared, weight_ref, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(gn.bias.sum_grad_squared, bias_ref, rtol=1e-5, atol=1e-6)
-    for handle in handles:
-        handle.remove()
-
-
-def test_groupnorm_step_runs_and_updates():
-    torch.manual_seed(50)
-    gn = nn.GroupNorm(4, 16)
-    x = torch.randn(4, 16, 5, 5)
-    with patch("heavyball.core.torch.compile", _eager_compile):
-        optimizer = heavyball.HeavyBallOptimizer(gn.parameters(), heavyball.truegrad_adam)
-    handles = heavyball.register_truegrad(gn)
-    initial_weight = gn.weight.detach().clone()
-
-    optimizer.zero_grad()
-    _batch_loss(gn(x)).backward()
-    optimizer.step()
-
-    assert not torch.equal(gn.weight, initial_weight)
-    for handle in handles:
-        handle.remove()

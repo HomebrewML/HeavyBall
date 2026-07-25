@@ -17,12 +17,14 @@ int8 residual, near-fp16 precision at 0.75x fp32). See ``heavyball.HeavyBallOpti
 
 The bfloat16, ECC, and PSGD stochastic paths draw from a stateless counter-based stream keyed by the
 per-optimizer seed, each parameter's leaf index, and its step count -- all carried in ``state_dict()`` --
-so a run resumes bit-for-bit from the checkpoint alone, without restoring ``torch.get_rng_state()``.
+so a run resumes from the same RNG stream without restoring ``torch.get_rng_state()``. Bit-for-bit
+identical results additionally require a warm or persistent Inductor cache (cold-cache compiles may
+select different kernels via max-autotune, causing floating-point divergence independent of the RNG).
 """
 
 import math
 
-from .core import Engine, Group, ParamInfo, Recipe, RefreshCadence, Route, build, produce
+from .core import Engine, Group, ParamInfo, Recipe, RefreshCadence, Route, build, clear_cache, produce
 from .hyperball import hyperball_commit
 from .kl import (
     heavy_kl_shampoo_init,
@@ -35,8 +37,8 @@ from .kl import (
     kl_soap_recipe,
 )
 from .kron import kron, make_psgd_kron, psgd_kron, psgd_kron_init
-from .lra import lra, make_psgd_lra, psgd_lra, psgd_lra_init
 from .lather import lather, lather_init, lather_transform, make_lather
+from .lra import lra, make_psgd_lra as _make_psgd_lra, psgd_lra, psgd_lra_init
 from .matrix import (
     matrix_route,
     nfactor_route,
@@ -66,13 +68,16 @@ from .schedulefree import schedule_free_commit
 from .scion import scion, scion_lmo, scion_lmo_init, scion_param_init, scion_route
 from .suds import suds, suds_adamw
 from .transforms import (
+    WHOLE,
     adam,
     adamc_commit,
+    adamuon_rmsprop,
     ademamix as ademamix_transform,
     adopt as adopt_transform,
     balanced_orthogonalize,
     beta_debias,
     caution,
+    first_moment,
     laprop as laprop_transform,
     lion as lion_transform,
     make_retraction_commit,
@@ -94,6 +99,7 @@ from .transforms import (
     sign,
     sign_graft,
     stiefel_projection,
+    stiefel_tangent_projection,
     truegrad_adam as truegrad_adam_transform,
     truegrad_laprop as truegrad_laprop_transform,
     truegrad_nadam as truegrad_nadam_transform,
@@ -104,6 +110,16 @@ from .transforms import (
 )
 from .truegrad import register_truegrad
 from .utils import set_torch
+
+# PSGD-LRA state and updates require the complete logical parameter under FSDP2.
+psgd_lra.distributed_scope = WHOLE
+
+
+def make_psgd_lra(rank: int = 10):
+    transform = _make_psgd_lra(rank)
+    transform.distributed_scope = WHOLE
+    return transform
+
 
 KronCadence = RefreshCadence
 whiten.__doc__ = (
@@ -289,14 +305,10 @@ heavy_kl_shampoo = heavy_kl_shampoo_recipe
 _muon_matrix = Recipe(
     chain=(momentum, orthogonalize),
     commit=muon_commit,
-    # lr 0.02 (README's Muon value; SOAP likewise defaults to its 3e-3). The aspect-scaled orthogonal update
-    # under-steps at 0.0025, so Muon converges slowly -- below AdamW for the first ~200 steps on a real MNIST
-    # autoencoder, above it after -- while 0.02 converges ~2x faster and stays ahead at every horizon tested
-    # (still ~1.15x at 600 steps). AdaMuon's RMS-align makes it lr-robust; plain orthogonalize+muon_commit not.
     defaults=dict(lr=0.02, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0),
 )
 _spel_matrix = Recipe(
-    chain=(momentum, orthogonalize),
+    chain=(first_moment, stiefel_tangent_projection, orthogonalize),
     commit=make_retraction_commit(sgd_commit, stiefel_projection, name="stiefel"),
     defaults=dict(lr=0.02, beta1=0.9, weight_decay=0.0),
 )
@@ -311,24 +323,19 @@ _polargrad_matrix = Recipe(
     defaults=dict(lr=0.02, beta1=0.95, weight_decay=0.0),
 )
 _normuon_matrix = Recipe(
-    chain=(momentum, orthogonalize, normuon_normalize),
-    commit=muon_commit,
+    chain=(first_moment, orthogonalize, normuon_normalize),
+    commit=sgd_commit,
     defaults=dict(lr=0.02, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0),
 )
 _adamuon_matrix = Recipe(
-    # RMS-align the second-moment-normalized orthogonal direction to RMS 0.2 and commit without Muon's
-    # aspect scale (sgd_commit) -- this is AdaMuon's (arXiv:2507.11005) core RMS-aligned rescaling; the
-    # aspect scale is only correct for a truly-orthogonal update, which O/sqrt(v) is not.
-    chain=(momentum, orthogonalize, rmsprop_transform, rms_align),
+    chain=(momentum, sign, orthogonalize, adamuon_rmsprop, rms_align),
     commit=sgd_commit,
-    # lr 0.02 (Muon-family), not 0.0025: the RMS-align fixes the update to RMS 0.2 (~10x smaller than the
-    # old buggy RMS~2 that 0.0025 was tuned to), so a Muon-scale lr restores a well-trained effective step.
-    defaults=dict(lr=0.02, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0),
+    defaults=dict(lr=0.02, beta1=0.95, beta2=0.95, eps=1e-8, weight_decay=0.0),
 )
 _aurora_matrix = Recipe(
     chain=(momentum, balanced_orthogonalize),
     commit=muon_commit,
-    defaults=dict(lr=0.02, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0),
+    defaults=dict(lr=0.02, beta1=0.9, beta2=0.5, eps=1e-8, weight_decay=0.0),
 )
 _muon_laprop_matrix = Recipe(
     chain=(laprop_transform, orthogonalize),
@@ -369,7 +376,11 @@ psgd_nfactor_adamw = Route(nfactor_route, psgd_nfactor, Route(matrix_route, psgd
 psgd_pro_adamw = Route(matrix_route, psgd_pro, adamw)
 qsgd_adamw = Route(matrix_route, qsgd, adamw)
 psgd_lra_adamw = Route(lambda info: info.ndim >= 1 and math.prod(info.shape) > 1, lra, adamw)
-aurora = Route(lambda info: info.ndim == 2, _aurora_matrix, adamw)
+aurora = Route(
+    lambda info: info.ndim == 2 and info.shape[0] > info.shape[1],
+    _aurora_matrix,
+    Route(lambda info: info.ndim == 2, _muon_matrix, adamw),
+)
 muon = Route(lambda info: info.ndim == 2, _muon_matrix, adamw)
 spel = Route(lambda info: info.ndim == 2, _spel_matrix, adamw)
 oblique = Route(lambda info: info.ndim == 2, _oblique_matrix, adamw)
@@ -378,27 +389,26 @@ polargrad = Route(lambda info: info.ndim == 2, _polargrad_matrix, adamw)
 normuon = Route(lambda info: info.ndim == 2, _normuon_matrix, adamw)
 adamuon = Route(lambda info: info.ndim == 2, _adamuon_matrix, adamw)
 
-from .optim import (  # noqa: E402
+from .optim import (
     ADOPT,
     KLSOAP,
     LATHER,
     MSAM,
+    PSGD,
+    PSGDLRA,
     QSGD,
     SGD,
     SOAP,
-    SOAPAdEMAMix,
-    SOAPNAdam,
     SOLP,
-    SpEL,
-    AdaMuon,
     AdamC,
+    AdaMuon,
     AdamW,
     AdEMAMix,
     Aurora,
     CautiousAdamW,
     HeavyBallOptimizer,
-    HeavyKLSOAP,
     HeavyKLShampoo,
+    HeavyKLSOAP,
     HeavySOAP,
     HeavySOAPAdEMAMix,
     HeavySOAPNAdam,
@@ -416,19 +426,20 @@ from .optim import (  # noqa: E402
     Oblique,
     OrthoGradAdamW,
     OrthoLaProp,
-    PSGD,
+    PolarGrad,
     PSGDKron,
-    PSGDLRA,
     PSGDNfactor,
     PSGDPro,
-    PolarGrad,
     RMSprop,
-    SFAdamW,
     ScheduleFree,
     Scion,
+    SFAdamW,
     Shampoo,
     SignLaProp,
     SignSGD,
+    SOAPAdEMAMix,
+    SOAPNAdam,
+    SpEL,
     SplitOpt,
     SUDSAdamW,
     TrueGradAdam,
@@ -439,7 +450,7 @@ from .optim import (  # noqa: E402
     WhitenAdamW,
     Whitening,
 )
-from .registry import describe, estimate_state_bytes, list_optimizers  # noqa: E402
+from .registry import describe, estimate_state_bytes, list_optimizers
 
 __all__ = [
     "ADOPT", "AdEMAMix", "AdaMuon", "AdamC", "AdamW", "Aurora", "CautiousAdamW", "HeavyBallOptimizer", "HeavyKLSOAP", "HeavyKLShampoo", "HeavySOAP", "HeavySOAPAdEMAMix", "HeavySOAPNAdam", "HeavySOLP", "HyperBallAdamW", "KLSOAP",
@@ -448,7 +459,7 @@ __all__ = [
     "SUDSAdamW", "SFAdamW", "ScheduleFree", "Scion", "Shampoo", "SignLaProp", "SignSGD", "SplitOpt", "TrueGradAdam", "TrueGradLaProp", "TrueGradNAdam", "TrueGradRMSprop", "UnscaledAdamW",
     "WhitenAdamW", "Whitening", "describe", "estimate_state_bytes", "list_optimizers",
     "Engine", "Group", "ParamInfo", "Program", "Recipe", "RefreshCadence", "Route", "SAM", "adam", "adamc", "adamc_commit", "adamw", "ademamix",
-    "adamuon", "ademamix_transform", "adopt", "adopt_transform", "aurora", "balanced_orthogonalize", "beta_debias", "build", "caution", "cautious_adamw",
+    "adamuon", "adamuon_rmsprop", "ademamix_transform", "adopt", "adopt_transform", "aurora", "balanced_orthogonalize", "beta_debias", "build", "caution", "cautious_adamw", "clear_cache",
     "KronCadence", "kron", "kron_adamw", "lather", "lather_adamw", "lather_init", "lather_transform", "laprop", "laprop_ortho", "laprop_transform", "lion", "lion_transform", "make_lather", "make_psgd_kron", "make_retraction_commit",
     "heavy_kl_shampoo", "heavy_kl_shampoo_adamw", "heavy_kl_shampoo_init", "heavy_kl_shampoo_recipe", "heavy_kl_soap", "heavy_kl_soap_adamw", "heavy_kl_soap_init", "heavy_kl_soap_recipe",
     "kl_shampoo", "kl_shampoo_adamw", "kl_shampoo_init", "kl_shampoo_recipe", "kl_soap", "kl_soap_adamw",
@@ -460,7 +471,7 @@ __all__ = [
     "produce", "psgd_pro_transform", "qsgd", "qsgd_adamw", "qsgd_transform", "register_truegrad",
     "ortho_laprop", "orthograd_adamw", "rms_align", "rmsprop", "rmsprop_transform", "sgd", "sgd_commit", "shampoo",
     "schedule_free_commit", "sf_adamw",
-    "scion", "scion_lmo", "scion_lmo_init", "scion_param_init", "scion_route", "shampoo_adamw", "sign_laprop", "spel", "stiefel_projection",
+    "scion", "scion_lmo", "scion_lmo_init", "scion_param_init", "scion_route", "shampoo_adamw", "sign_laprop", "spel", "stiefel_projection", "stiefel_tangent_projection",
     "shampoo_init", "shampoo_recipe", "sign", "sign_graft", "signsgd", "soap", "soap_adamw",
     "soap_ademamix", "soap_ademamix_adamw", "soap_ademamix_recipe", "soap_init", "soap_nadam", "soap_nadam_adamw", "soap_nadam_recipe", "soap_recipe", "solp", "solp_adamw", "solp_recipe", "truegrad_adam",
     "set_torch", "suds", "suds_adamw",

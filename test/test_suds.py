@@ -1,16 +1,11 @@
 """Direct legacy parity and numerical proofs for the slab-native SUDS port."""
 
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from heavyball import Engine, suds, suds_adamw
+from heavyball import Engine, suds_adamw
 from heavyball.suds import eigvecs_product_rank1, oja_update, stable_l2_normalize
 
 
@@ -147,45 +142,28 @@ def test_suds_householder_rotation():
     torch.testing.assert_close(first_column, expected_direction, rtol=1e-12, atol=1e-12)
 
 
-def _compiled_code(tmp_path: Path) -> str:
-    source = """
-import torch
-from heavyball import Engine, suds_adamw
+def test_suds_executes_one_stable_fullgraph():
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
+        optimizer = Engine(params, suds_adamw, lr=0.01, precond_lr=0.05, weight_decay=0.0)
+        gradients = [
+            torch.arange(1, 25, dtype=torch.float32).reshape(2, 3, 4) * scale
+            for scale in (1.0, -0.5, 0.25)
+        ]
+        for index, gradient in enumerate(gradients):
+            optimizer.groups[0].grad_slab.copy_(gradient)
+            optimizer.step()
+            if index == 0:
+                graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
-params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
-optimizer = Engine(params, suds_adamw, lr=0.01, precond_lr=0.05, weight_decay=0.0)
-for _ in range(3):
-    for parameter in params:
-        parameter.grad.normal_()
-    optimizer.step()
-"""
-    environment = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = [Path(value) for value in re.findall(r"Output code written to: (.*\.py)", output)]
-    assert paths, output
-    return paths[-1].read_text()
-
-
-def test_suds_fullgraph_clean(tmp_path):
-    """SUDS compiles as a scalar-free full graph."""
-
-    artifact = _compiled_code(tmp_path).lower()
-    for forbidden in (".item(", "while_loop", "torch.cond", "cond", "torch.stack", "stack", "_local_scalar_dense"):
-        assert forbidden not in artifact
-
-    source = Path(suds.__module__.replace(".", "/") + ".py")
-    if not source.exists():
-        source = Path(__file__).parents[1] / "heavyball" / "suds.py"
-    text = source.read_text()
-    assert not re.search(r"_foreach|vmap|torch\.cond|while_loop|dynamic=True|torch\.stack|\.item\(|autocast", text)
+        assert graphs == 1
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+        assert all(torch.isfinite(param).all() for param in params)
+    finally:
+        torch._dynamo.reset()
 
 
 def test_suds_oja_update_converges_to_the_top_eigenvector():

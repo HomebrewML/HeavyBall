@@ -1,12 +1,7 @@
 """Parity, lifecycle, and compile proofs for the slab-native SFAdamW port."""
 
 import copy
-import os
-import re
-import subprocess
-import sys
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -39,6 +34,9 @@ def test_sf_matches_pure_reference(dtype, rtol, atol):
     values = dict(lr=0.017, beta1=0.87, beta2=0.97, eps=1e-8, weight_decay=0.031, weight_lr_power=2.0, r=0.5)
     initial = [torch.randn(3, 2, dtype=dtype), torch.randn(3, 2, dtype=dtype)]
     gradients = [[torch.randn_like(value) for value in initial] for _ in range(9)]
+    for step, step_gradients in enumerate(gradients, start=1):
+        for gradient in step_gradients:
+            gradient[0, 0] = (-1) ** step * step * 1e-6
     params = [torch.nn.Parameter(value.clone()) for value in initial]
     history = [[] for _ in initial]
     try:
@@ -349,35 +347,35 @@ def test_non_schedulefree_lifecycle_is_parameter_noop():
     torch.testing.assert_close(param, before, rtol=0, atol=0)
 
 
-def test_sf_lifecycle_fullgraph_clean(tmp_path):
-    """The two compiled representation swaps remain scalar-free fullgraph artifacts."""
+def test_sf_step_and_lifecycle_swaps_are_stable_fullgraphs():
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
+        optimizer = Engine(params, sf_adamw)
+        for step in range(3):
+            for index, param in enumerate(params):
+                param.grad.copy_(
+                    torch.linspace(-1, 1, param.numel()).reshape_as(param) * (step + index + 1)
+                )
+            optimizer.step()
+            if step == 0:
+                step_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        assert step_graphs == 1
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == step_graphs
 
-    source = """
-import torch
-from heavyball import Engine, sf_adamw
+        training = [param.detach().clone() for param in params]
+        optimizer.eval()
+        evaluation = [param.detach().clone() for param in params]
+        optimizer.train()
+        for param, expected in zip(params, training, strict=True):
+            torch.testing.assert_close(param, expected, rtol=0, atol=0)
+        assert any(not torch.equal(train, eval_) for train, eval_ in zip(training, evaluation, strict=True))
+        lifecycle_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
-params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
-optimizer = Engine(params, sf_adamw)
-for _ in range(3):
-    for param in params:
-        param.grad.normal_()
-    optimizer.step()
-optimizer.eval()
-optimizer.train()
-"""
-    env = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = {Path(value) for value in re.findall(r"Output code written to: (.*\.py)", output)}
-    assert len(paths) >= 3, output
-    for path in paths:
-        code = path.read_text()
-        for forbidden in (".item(", "while_loop", "cond", "stack", "_local_scalar_dense"):
-            assert forbidden not in code, f"{forbidden} in {path}"
+        optimizer.eval()
+        optimizer.train()
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == lifecycle_graphs == 3
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()

@@ -112,15 +112,18 @@ def stochastic_round_bfloat16(value: Tensor, random: Tensor) -> Tensor:
 
 
 def stochastic_copy_(target: Tensor, source: Tensor, tempo, shared_noise=None) -> None:
-    if target.dtype == torch.bfloat16 and source.dtype in (torch.float16, torch.float32, torch.float64):
-        # Only reuse the parameter's noise when it is element-for-element aligned with the source:
-        # same shape AND same sharding (DTensor placements match; None==None for plain tensors). An
-        # owner-whole DTensor state whose global shape coincides with the param must NOT borrow the
-        # param's batch-sharded noise -- it draws its own, correctly keyed per owner-whole leaf.
-        aligned = (shared_noise is not None and shared_noise.shape == source.shape
-                   and getattr(shared_noise, "placements", None) == getattr(source, "placements", None))
-        noise = shared_noise if aligned else tempo.random_like(source)
-        source = stochastic_round_bfloat16(source, noise)
+    if target.dtype is not torch.bfloat16 or source.dtype not in (
+        torch.float16,
+        torch.float32,
+        torch.float64,
+    ):
+        target.copy_(source)
+        return
+    # Owner-whole state must not reuse identically shaped batch-sharded parameter noise.
+    aligned = (shared_noise is not None and shared_noise.shape == source.shape
+               and getattr(shared_noise, "placements", None) == getattr(source, "placements", None))
+    noise = shared_noise if aligned else tempo.random_like(source)
+    source = stochastic_round_bfloat16(source, noise)
     target.copy_(source)
 
 

@@ -4,10 +4,8 @@ from unittest.mock import patch
 import torch
 
 from heavyball import NorMuon
-from heavyball.numerics import broadcast_leaf
 from heavyball.transforms import (
     Tempo,
-    beta_debias,
     normuon_normalize,
     normuon_normalize_init,
 )
@@ -26,39 +24,44 @@ def _tempo(count: int, age: int = 1) -> Tempo:
     )
 
 
-def _old_normuon_formula(
+def _paper_normuon_formula(
     update: torch.Tensor,
     state: dict[str, torch.Tensor],
     tempo: Tempo,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     v_mean = update.square().mean(dim=-1, keepdim=True)
-    beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
+    beta2 = tempo.hyper.beta2
     moment2 = state["moment2"].square() * beta2 + v_mean * (1 - beta2)
-    normalized = update * moment2.clamp_min(tempo.hyper.eps).rsqrt()
-    scale = update.norm(dim=(-2, -1), keepdim=True) / normalized.norm(
-        dim=(-2, -1), keepdim=True
-    ).clamp_min(tempo.hyper.eps)
-    return normalized * scale, moment2
+    normalized = update / (moment2.sqrt() + tempo.hyper.eps)
+    target_norm = 0.2 * (update.shape[-2] * update.shape[-1]) ** 0.5
+    return normalized * (
+        target_norm / normalized.norm(dim=(-2, -1), keepdim=True)
+    ), moment2
 
 
 def test_normuon_normalize_large_finite_fp64_stays_finite():
-    update = torch.full((4, 4), 1e154, dtype=torch.float64)
-    state = normuon_normalize_init(update)
+    update = torch.full((1, 4, 4), 1e154, dtype=torch.float64)
+    state = normuon_normalize_init(update[0])
 
-    output, next_state, _ = normuon_normalize(update, None, None, state, _tempo(4))
+    output, next_state, _ = normuon_normalize(update, None, None, state, _tempo(1))
 
     assert torch.isfinite(output).all()
-    assert torch.equal(output, update)
+    torch.testing.assert_close(
+        output.square().mean().sqrt(),
+        torch.tensor(0.2, dtype=output.dtype),
+        rtol=1e-14,
+        atol=0,
+    )
     assert torch.isfinite(next_state["moment2"]).all()
 
 
-def test_normuon_normalize_matches_old_formula_at_normal_range():
+def test_normuon_normalize_matches_paper_formula_at_normal_range():
     torch.manual_seed(123)
-    update = torch.randn(4, 4, dtype=torch.float64)
-    state = normuon_normalize_init(update)
+    update = torch.randn(1, 4, 4, dtype=torch.float64)
+    state = normuon_normalize_init(update[0])
     state["moment2"].copy_(torch.rand_like(state["moment2"]) + 0.1)
-    tempo = _tempo(4, age=3)
-    expected, expected_moment2 = _old_normuon_formula(update, state, tempo)
+    tempo = _tempo(1, age=3)
+    expected, expected_moment2 = _paper_normuon_formula(update, state, tempo)
 
     output, next_state, _ = normuon_normalize(update, None, None, state, tempo)
 

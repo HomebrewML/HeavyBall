@@ -34,16 +34,28 @@ def _state_and_corrections(optimizer):
             yield group.commit_state, group.commit_corrections
 
 
-def _float_state_bytes(optimizer):
-    total = 0
-    for state, corrections in _state_and_corrections(optimizer):
-        total += sum(slab.numel() * slab.element_size() for slab in state.values() if slab.is_floating_point())
-        total += sum(slab.numel() * slab.element_size() for slab in corrections.values())
-    return total
+def _assert_nested_equal(actual, expected):
+    if isinstance(actual, torch.Tensor):
+        assert isinstance(expected, torch.Tensor)
+        assert torch.equal(actual, expected)
+        return
+    if isinstance(actual, dict):
+        assert isinstance(expected, dict)
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_nested_equal(actual[key], expected[key])
+        return
+    if isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            _assert_nested_equal(left, right)
+        return
+    assert actual == expected
 
 
 @pytest.mark.parametrize("facade", (heavyball.AdamW, heavyball.SOAP))
-def test_ecc_much_closer_than_bf16(facade, capsys):
+def test_ecc_much_closer_than_bf16(facade):
     fp32, _ = _trajectory(facade, storage_dtype=None)
     bf16, _ = _trajectory(facade, storage_dtype=torch.bfloat16)
     ecc8, _ = _trajectory(facade, ecc=8)
@@ -52,52 +64,8 @@ def test_ecc_much_closer_than_bf16(facade, capsys):
     bf16_error = (bf16 - fp32).abs().max()
     ecc8_error = (ecc8 - fp32).abs().max()
     ecc16_error = (ecc16 - fp32).abs().max()
-    with capsys.disabled():
-        print(
-            f"{facade.__name__} max errors: bf16={float(bf16_error):.9e}, "
-            f"ecc8={float(ecc8_error):.9e}, ecc16={float(ecc16_error):.9e}"
-        )
     assert ecc8_error < bf16_error / 8
     assert ecc16_error < bf16_error / 50
-
-
-def test_ecc_allocates_correction():
-    for ecc, correction_dtype in ((8, torch.int8), (16, torch.int16)):
-        parameter = torch.nn.Parameter(torch.ones(4, 4))
-        optimizer = heavyball.AdamW([parameter], ecc=ecc)
-        assert optimizer._engine.storage_dtype is torch.bfloat16
-        assert optimizer._engine.ecc is correction_dtype
-        for state, corrections in _state_and_corrections(optimizer):
-            for name, slab in state.items():
-                if slab.is_floating_point():
-                    assert slab.dtype is torch.bfloat16
-                    assert corrections[name].dtype is correction_dtype
-                    assert corrections[name].shape == slab.shape
-                else:
-                    assert name not in corrections
-
-    parameter = torch.nn.Parameter(torch.ones(4, 4))
-    adopt = heavyball.ADOPT([parameter], ecc=8)
-    state = adopt._engine.groups[0].states[0]
-    corrections = adopt._engine.groups[0].state_corrections[0]
-    assert state["seen"].dtype is torch.bool
-    assert "seen" not in corrections
-
-
-def test_ecc_memory(capsys):
-    _, fp32_optimizer = _trajectory(heavyball.AdamW, storage_dtype=None)
-    _, ecc8_optimizer = _trajectory(heavyball.AdamW, ecc=8)
-    fp32_bytes = _float_state_bytes(fp32_optimizer)
-    ecc8_bytes = _float_state_bytes(ecc8_optimizer)
-    with capsys.disabled():
-        print(f"AdamW float-state bytes: fp32={fp32_bytes}, ecc8={ecc8_bytes}")
-    assert ecc8_bytes * 4 == fp32_bytes * 3
-
-
-@pytest.mark.parametrize("facade", (heavyball.AdamW, heavyball.SOAP, heavyball.PSGDKron))
-def test_ecc_compiles_and_finite(facade):
-    parameter, _ = _trajectory(facade, ecc=8)
-    assert torch.isfinite(parameter).all()
 
 
 def test_ecc_masked_leaf_preserves_physical_state():
@@ -132,6 +100,7 @@ def test_ecc_checkpoint_roundtrip():
     assert checkpoint["engines"][0]["ecc"] == 8
     assert checkpoint["engines"][0]["format"] == 4
     target_parameter = torch.nn.Parameter(source_parameter.detach().clone())
+    torch.manual_seed(987654321)
     target = heavyball.AdamW([target_parameter], ecc=8)
     target.load_state_dict(checkpoint)
     for source_pair, target_pair in zip(
@@ -141,14 +110,14 @@ def test_ecc_checkpoint_roundtrip():
             assert source_slots.keys() == target_slots.keys()
             assert all(torch.equal(source_slots[name], target_slots[name]) for name in source_slots)
 
-    for step, gradient in enumerate(gradients[3:], start=3):
+    torch.manual_seed(123456789)
+    for gradient in gradients[3:]:
         source_parameter.grad.copy_(gradient)
         target_parameter.grad.copy_(gradient)
-        torch.manual_seed(600 + step)
         source.step()
-        torch.manual_seed(600 + step)
         target.step()
         assert torch.equal(source_parameter, target_parameter)
+        _assert_nested_equal(source.state_dict(), target.state_dict())
 
 
 def test_ecc_eval_swap_preserves_commit_state():

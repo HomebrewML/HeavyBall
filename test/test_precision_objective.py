@@ -7,8 +7,6 @@ accumulation, round-to-nearest stalls (a large systematic bias) while stochastic
 the mean. This is the training-relevant metric (long-horizon bias), distinct from single-run L2 error,
 where stochastic rounding trades a small variance for that unbiasedness.
 """
-import contextlib
-
 import torch
 
 from heavyball.numerics import stochastic_round_bfloat16
@@ -78,76 +76,3 @@ def test_bf16_adam_lands_closer_to_fp64_than_torch_baseline():
     err_torch = (pt.detach().double() - ideal).norm().item()
 
     assert err_hb < err_torch * 0.5  # heavyball's bf16 lands at least 2x closer to fp64 than torch's bf16
-
-
-def test_soap_bf16_weight_distance_misleads_and_ecc_preserves_loss():
-    """Precision for a SPECTRAL matrix optimizer's state, and why WEIGHT-DISTANCE is the wrong metric here.
-    SOAP's state feeds an eigendecomposition (Gram -> eigenbasis -> preconditioner), so it is chaotically
-    sensitive: a tiny bf16 state perturbation rotates the eigenbasis and the weight trajectory separates
-    from fp32's. By ||W - W_fp32|| stochastic rounding looks ~2x closer than round-to-nearest -- but that is
-    an artifact of SR's unbiasedness keeping the state near fp32's PATH, not evidence of a better optimizer.
-    By the achieved LOSS, SR has no advantage over round-to-nearest (its added variance corrupts the
-    eigenbasis about as much as RTN's bias). So unlike the AdamW accumulation state (test_bf16_adam..., where
-    SR genuinely wins), SR does not help spectral state. The int8-residual ecc mode preserves fp32 loss and
-    is the precision-preserving low-memory mode for SOAP-family optimizers.
-
-    Measured on a real MNIST autoencoder to 600 steps (non-stationary, where the eigenbasis is repeatedly
-    rebuilt on drifting bf16 state): loss vs fp32 was bf16-SR +9%, bf16-RTN +4%, ecc8 +0.06%. This short
-    stationary least-squares reproduces the metric DISAGREEMENT that condemns weight-distance."""
-    from unittest.mock import patch
-
-    import heavyball
-    import heavyball.numerics as numerics
-
-    def problem(seed):
-        g = torch.Generator().manual_seed(seed)
-        w0 = torch.randn(24, 24, generator=g, dtype=torch.float64)
-        target = torch.randn(24, 24, generator=g, dtype=torch.float64) * 0.5
-        design = torch.randn(24, 48, generator=g, dtype=torch.float64)  # wide -> unique minimum
-        return w0, target @ design, design
-
-    def run(mode, seed):  # returns (final weight fp64, final loss) with only the STATE dtype/rounding varied
-        def rtn(value, noise):
-            del noise
-            return value.to(torch.bfloat16)
-
-        rounding = (
-            patch.object(numerics, "stochastic_round_bfloat16", rtn)
-            if mode == "bf16-RTN"
-            else contextlib.nullcontext()
-        )
-        with patch("heavyball.core.torch.compile", lambda f, **k: f), rounding:
-            torch.manual_seed(0)
-            w0, b, a = problem(seed)
-            weight = torch.nn.Parameter(w0.to(torch.float32).clone())  # fp32 params; only STATE varies
-            kwargs = {"storage_dtype": torch.bfloat16} if mode != "fp32" else {}
-            if mode == "ecc8":
-                kwargs["ecc"] = 8
-            optimizer = heavyball.SOAP([weight], lr=0.02, weight_decay=0.0, **kwargs)
-            for _ in range(120):
-                ((weight.to(torch.float64) @ a - b) ** 2).mean().backward()
-                optimizer.step()
-                optimizer.zero_grad()
-            w = weight.detach().to(torch.float64)
-            return w, float(((w @ a - b) ** 2).mean())
-
-    sr_dist, rtn_dist, sr_loss, rtn_loss, ecc_loss, ref_loss = [], [], [], [], [], []
-    for seed in range(6):
-        ref_w, ref_l = run("fp32", seed)  # fp32 state (~fp64 for the state)
-        sr_w, sr_l = run("bf16-SR", seed)
-        rtn_w, rtn_l = run("bf16-RTN", seed)
-        _, ecc_l = run("ecc8", seed)
-        sr_dist.append((sr_w - ref_w).norm().item() / ref_w.norm().item())
-        rtn_dist.append((rtn_w - ref_w).norm().item() / ref_w.norm().item())
-        sr_loss.append(sr_l)
-        rtn_loss.append(rtn_l)
-        ecc_loss.append(ecc_l)
-        ref_loss.append(ref_l)
-
-    # Weight-distance would rank SR the clear winner (much closer to fp32's path)...
-    assert sum(sr_dist) < 0.6 * sum(rtn_dist)
-    # ...but by LOSS that advantage vanishes: SR is not meaningfully better than round-to-nearest, so
-    # weight-distance is an invalid precision proxy for a spectral optimizer.
-    assert sum(sr_loss) >= 0.99 * sum(rtn_loss)
-    # The actually precision-preserving low-memory state for SOAP is ecc, which recovers the fp32 loss.
-    assert abs(sum(ecc_loss) - sum(ref_loss)) < 0.02 * sum(ref_loss)

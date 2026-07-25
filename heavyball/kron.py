@@ -52,25 +52,10 @@ def _next_lower_bound(ell: Tensor, lower_bound: Tensor, beta: Tensor) -> tuple[T
     return next_bound.to(dtype), next_bound
 
 
-def _balance_q(q0: Tensor, q1: Tensor) -> tuple[Tensor, Tensor]:
-    """Balance the two factor maxima exactly as PSGD's full-Q path does."""
-
-    q0, q1 = balance_factors([q0, q1])
-    return q0, q1
-
-
-def _balance_mixed_q(q0: Tensor, q1: Tensor) -> tuple[Tensor, Tensor]:
-    """Balance factors whose state shapes encode diagonal/triangular topology."""
-
-    q0, q1 = balance_factors([q0, q1])
-    return q0, q1
-
-
 def _calc_a_and_conjb(hessian_vector: Tensor, q0: Tensor, q1: Tensor, vector: Tensor) -> tuple[Tensor, Tensor]:
     """Form legacy PSGD's ``A`` and inverse-triangular whitened probe."""
 
-    # Pairwise contraction (a, then b): the 3-operand einsum makes inductor materialize the
-    # [n,i,a,j,b] outer product (O(n^4) -> OOM at >=256x256); pairwise keeps every step O(n^2).
+    # Pairwise contraction avoids Inductor's O(n⁴) three-operand intermediate.
     projected = torch.einsum("nia,nab->nib", q0, hessian_vector)
     a = torch.einsum("nib,njb->nij", projected, q1).contiguous()
     probe = vector
@@ -168,7 +153,7 @@ def _refresh_q(
     damping = tempo.hyper.dampening + torch.finfo(update.dtype).eps * update.abs()
     hessian_vector = update + damping * vector
 
-    q0, q1 = _balance_q(q0, q1)
+    q0, q1 = balance_factors([q0, q1])
     a, conjb = _calc_a_and_conjb(hessian_vector, q0, q1, vector)
     a, conjb, scale_sq = _scaled_quadratic_inputs(a, conjb)
     term1_0 = torch.einsum("nab,ncb->nac", a, a)
@@ -210,7 +195,7 @@ def _refresh_mixed_q(
     damping = tempo.hyper.dampening + torch.finfo(update.dtype).eps * update.abs()
     hessian_vector = update + damping * vector
 
-    q0, q1 = _balance_mixed_q(q0, q1)
+    q0, q1 = balance_factors([q0, q1])
     a, conjb = _calc_mixed_a_and_conjb(hessian_vector, q0, q1, vector)
     a, conjb, scale_sq = _scaled_quadratic_inputs(a, conjb)
     if q0.ndim == 2:
@@ -262,8 +247,7 @@ def _refresh_mixed_q(
 def _precondition(update: Tensor, q0: Tensor, q1: Tensor) -> Tensor:
     """Apply every Kronecker factor twice, i.e. ``P = QᵀQ``."""
 
-    # Pairwise: the 5-operand einsum makes torch/inductor materialize an O(n^4) intermediate
-    # (OOM at >=256x256). Contract P0 = Q0^T Q0 and P1 = Q1^T Q1, then P0 @ update @ P1 -- all O(n^2).
+    # Pairwise contraction avoids an O(n⁴) five-operand intermediate.
     p0 = torch.einsum("nri,nra->nia", q0, q0)
     p1 = torch.einsum("nsj,nsb->njb", q1, q1)
     projected = torch.einsum("nia,nab->nib", p0, update)

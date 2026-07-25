@@ -8,10 +8,10 @@ naive same-math baseline (optimizer state kept at that dtype) that the shipped f
 Each function runs the full trajectory over ``grads`` from ``init`` and returns the final parameter.
 The bias correction is the textbook ``m_hat = m / (1 - beta**t)``. Two shipped numerical floors are
 formulation choices these references do not independently re-derive: the denominator uses
-``max(sqrt(v), eps)`` (matched here), and the norm grafts (OrthoGrad/sign) keep the paper's exact
+``sqrt(max(v, eps))`` (matched here), and the norm grafts (OrthoGrad/sign) keep the paper's exact
 norm-preservation while the shipped stable-L2 graft caps amplification for orthogonal/sign norms below
 ~1e-6 (so rounding noise is not blown up to the full update norm). The references are therefore exact
-away from ``v ~ eps^2`` and orthogonal/sign norms ``~ 1e-6``.
+away from ``v ~ eps`` and orthogonal/sign norms ``~ 1e-6``.
 """
 
 import torch
@@ -33,7 +33,7 @@ def adam(init, grads, *, lr, beta1, beta2, eps, weight_decay):
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
         m_hat = s["m"] / (1 - beta1**t)
         v_hat = s["v"] / (1 - beta2**t)
-        update = m_hat / v_hat.sqrt().clamp_min(eps)
+        update = m_hat / v_hat.clamp_min(eps).sqrt()
         return p - lr * (update + weight_decay * p)
 
     return _run(init, grads, step)
@@ -43,7 +43,7 @@ def rmsprop(init, grads, *, lr, beta2, eps, weight_decay):
     def step(p, g, t, s):
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
         v_hat = s["v"] / (1 - beta2**t)
-        update = g / v_hat.sqrt().clamp_min(eps)
+        update = g / v_hat.clamp_min(eps).sqrt()
         return p - lr * (update + weight_decay * p)
 
     return _run(init, grads, step)
@@ -53,7 +53,7 @@ def laprop(init, grads, *, lr, beta1, beta2, eps, weight_decay):
     def step(p, g, t, s):
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
         v_hat = s["v"] / (1 - beta2**t)
-        normalized = g / v_hat.sqrt().clamp_min(eps)
+        normalized = g / v_hat.clamp_min(eps).sqrt()
         s["m"] = beta1 * s.get("m", 0.0) + (1 - beta1) * normalized
         m_hat = s["m"] / (1 - beta1**t)
         return p - lr * (m_hat + weight_decay * p)
@@ -89,7 +89,7 @@ def unscaled_adam(init, grads, *, lr, beta1, beta2, eps, weight_decay):
     # Adam whose first moment accumulates the variance-normalized gradient, then rescales by denom.
     def step(p, g, t, s):
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
-        denom = (s["v"] / (1 - beta2**t)).sqrt().clamp_min(eps)
+        denom = (s["v"] / (1 - beta2**t)).clamp_min(eps).sqrt()
         s["m"] = beta1 * s.get("m", 0.0) + (1 - beta1) * (g / denom)
         m_hat = s["m"] / (1 - beta1**t)
         return p - lr * (m_hat * denom + weight_decay * p)
@@ -104,7 +104,7 @@ def cautious_adam(init, grads, *, lr, beta1, beta2, eps, weight_decay):
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
         m_hat = s["m"] / (1 - beta1**t)
         v_hat = s["v"] / (1 - beta2**t)
-        update = m_hat / v_hat.sqrt().clamp_min(eps)
+        update = m_hat / v_hat.clamp_min(eps).sqrt()
         aligned = ((g > 0) & (update > 0)) | ((g < 0) & (update < 0))
         scale = update.numel() / aligned.sum().clamp_min(1).to(p.dtype)
         update = torch.where(aligned, update, torch.zeros_like(update)) * scale
@@ -121,7 +121,7 @@ def ademamix(init, grads, *, lr, beta1, beta2, beta3, alpha, eps, weight_decay):
         fast_hat = s["fast"] / (1 - beta1**t)
         v_hat = s["v"] / (1 - beta2**t)
         # AdEMAMix leaves the slow EMA un-debiased, so it must not be corrected here.
-        update = (fast_hat + alpha * s["slow"]) / v_hat.sqrt().clamp_min(eps)
+        update = (fast_hat + alpha * s["slow"]) / v_hat.clamp_min(eps).sqrt()
         return p - lr * (update + weight_decay * p)
 
     return _run(init, grads, step)
@@ -148,7 +148,7 @@ def _sign_graft(update):
 
 def _laprop_direction(g, t, s, *, beta1, beta2, eps):
     s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
-    normalized = g / (s["v"] / (1 - beta2**t)).sqrt().clamp_min(eps)
+    normalized = g / (s["v"] / (1 - beta2**t)).clamp_min(eps).sqrt()
     s["m"] = beta1 * s.get("m", 0.0) + (1 - beta1) * normalized
     return s["m"] / (1 - beta1**t)
 
@@ -156,7 +156,7 @@ def _laprop_direction(g, t, s, *, beta1, beta2, eps):
 def _adam_direction(g, t, s, *, beta1, beta2, eps):
     s["m"] = beta1 * s.get("m", 0.0) + (1 - beta1) * g
     s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
-    return (s["m"] / (1 - beta1**t)) / (s["v"] / (1 - beta2**t)).sqrt().clamp_min(eps)
+    return (s["m"] / (1 - beta1**t)) / (s["v"] / (1 - beta2**t)).clamp_min(eps).sqrt()
 
 
 def adopt(init, grads, *, lr, beta1, beta2, eps, weight_decay):
@@ -166,7 +166,7 @@ def adopt(init, grads, *, lr, beta1, beta2, eps, weight_decay):
         if t == 1:
             s["m"], s["v"] = torch.zeros_like(g), g * g
             return p
-        normalized = g / s["v"].sqrt().clamp_min(eps)
+        normalized = g / s["v"].clamp_min(eps).sqrt()
         s["m"] = s["m"] * beta1 + normalized * (1 - beta1)
         s["v"] = s["v"] * beta2 + g * g * (1 - beta2)
         return p - lr * (s["m"] + weight_decay * p)
@@ -231,7 +231,7 @@ def schedule_free_adamw(init, grads, *, lr, beta1, beta2, eps, weight_decay, wei
     for t, g in enumerate(grads, start=1):
         g = g.to(p.dtype)
         v = beta2 * v + (1 - beta2) * g * g
-        normalized = g / (v / (1 - beta2**t)).sqrt().clamp_min(eps)
+        normalized = g / (v / (1 - beta2**t)).clamp_min(eps).sqrt()
         if weight_decay != 0:
             normalized = normalized + p * weight_decay
         weight = abs(lr) ** weight_lr_power * t**r
@@ -262,7 +262,7 @@ def hyperball(init, grads, *, lr, beta1, beta2, eps, weight_decay=0.0, caution=F
     for t, g in enumerate(grads, start=1):
         g = g.to(p.dtype)
         v = beta2 * v + (1 - beta2) * g * g
-        u = g / (v / (1 - beta2**t)).sqrt().clamp_min(eps)
+        u = g / (v / (1 - beta2**t)).clamp_min(eps).sqrt()
         trial = p - lr * radius * (u / u.norm())
         p = radius * trial / trial.norm()
     return p
@@ -272,7 +272,7 @@ def nadam(init, grads, *, lr, beta1, beta2, eps, weight_decay, momentum_decay):
     def step(p, g, t, s):
         s["m"] = beta1 * s.get("m", 0.0) + (1 - beta1) * g  # first moment uses the raw beta1
         s["v"] = beta2 * s.get("v", 0.0) + (1 - beta2) * g * g
-        denom = (s["v"] / (1 - beta2**t)).sqrt().clamp_min(eps)
+        denom = (s["v"] / (1 - beta2**t)).clamp_min(eps).sqrt()
         mu = beta1 * (1 - 0.5 * 0.96 ** (t * momentum_decay))
         mu_next = beta1 * (1 - 0.5 * 0.96 ** ((t + 1) * momentum_decay))
         s["mu_product"] = s.get("mu_product", 1.0) * mu

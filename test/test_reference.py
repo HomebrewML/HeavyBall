@@ -54,6 +54,9 @@ def test_shipped_matches_pure_fp64_reference(name, recipe, ref_fn, hyper):
     torch.manual_seed(0)
     init = torch.randn(16, dtype=torch.float64)
     grads = [torch.randn(16, dtype=torch.float64) for _ in range(10)]
+    if "eps" in hyper:
+        for step, grad in enumerate(grads, start=1):
+            grad[0] = (-1) ** step * step * 1e-6
     shipped = _run_shipped(recipe, init, grads, **hyper)
     expected = ref_fn(init, grads, **hyper)
     torch.testing.assert_close(shipped, expected, rtol=0, atol=1e-12)

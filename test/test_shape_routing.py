@@ -26,6 +26,9 @@ def test_leading_singleton_shape_routing(name, shape):
     opt = getattr(heavyball, name)([p], lr=lr)
     before = p.detach().clone()
 
+    assert len(opt._engine.groups) == 1
+    assert opt._engine.groups[0].recipe is heavyball.adamw
+
     for _ in range(4):
         g = torch.randn(shape, device="cuda") * 0.1
         (p * g).sum().backward()

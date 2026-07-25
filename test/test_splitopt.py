@@ -50,6 +50,26 @@ def _train(model, optimizer, inputs, targets, steps):
         optimizer.zero_grad(set_to_none=False)
 
 
+def _assert_nested_equal(actual, expected):
+    if isinstance(actual, torch.Tensor):
+        assert isinstance(expected, torch.Tensor)
+        assert torch.equal(actual, expected)
+        return
+    if isinstance(actual, dict):
+        assert isinstance(expected, dict)
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_nested_equal(actual[key], expected[key])
+        return
+    if isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            _assert_nested_equal(left, right)
+        return
+    assert actual == expected
+
+
 def test_delegates_each_parameter_family_to_its_assigned_optimizer():
     torch.manual_seed(0)
     split_model = _model()
@@ -70,9 +90,7 @@ def test_delegates_each_parameter_family_to_its_assigned_optimizer():
             split_parameter.grad.copy_(gradient)
             standalone_parameter.grad.copy_(gradient)
 
-        rng_state = torch.get_rng_state()
         split.step()
-        torch.set_rng_state(rng_state)
         standalone_muon.step()
         standalone_adamw.step()
 
@@ -106,15 +124,15 @@ def test_checkpoint_resume_is_bit_identical():
         name: value.clone() for name, value in uninterrupted.state_dict().items()
     }
     optimizer_checkpoint = copy.deepcopy(uninterrupted_optimizer.state_dict())
-    rng_checkpoint = torch.get_rng_state().clone()
 
     _train(uninterrupted, uninterrupted_optimizer, inputs, targets, 3)
 
+    torch.manual_seed(987654321)
     resumed = _model()
     resumed_optimizer, _, _ = _split_optimizer(resumed)
     resumed.load_state_dict(model_checkpoint)
     resumed_optimizer.load_state_dict(optimizer_checkpoint)
-    torch.set_rng_state(rng_checkpoint)
+    torch.manual_seed(123456789)
     _train(resumed, resumed_optimizer, inputs, targets, 3)
 
     for uninterrupted_parameter, resumed_parameter in zip(
@@ -123,6 +141,10 @@ def test_checkpoint_resume_is_bit_identical():
         torch.testing.assert_close(
             uninterrupted_parameter, resumed_parameter, rtol=0, atol=0
         )
+    _assert_nested_equal(
+        uninterrupted_optimizer.state_dict(),
+        resumed_optimizer.state_dict(),
+    )
 
 
 def test_load_state_dict_rejects_optimizer_class_mismatch():

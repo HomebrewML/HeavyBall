@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor
 import heavyball
 
 patch("heavyball.core.torch.compile", lambda f, **k: f).start()
@@ -41,8 +42,8 @@ class Par(nn.Module):
         return sum(layer(x[:, i * self.cin:(i + 1) * self.cin]) for i, layer in enumerate(self.ls))
 
 
-def build(Opt, device):
-    torch.manual_seed(0)
+def build(Opt, device, seed):
+    torch.manual_seed(seed)
     m = Par(4, 5).double().to(device)
     for layer in m.ls:
         fully_shard(layer)
@@ -59,15 +60,37 @@ def train(m, opt, lo, hi, device):
         opt.step(); opt.zero_grad()
 
 
+def assert_nested_equal(actual, expected):
+    if isinstance(actual, DTensor):
+        assert isinstance(expected, DTensor)
+        assert torch.equal(actual.full_tensor(), expected.full_tensor())
+    elif isinstance(actual, torch.Tensor):
+        assert isinstance(expected, torch.Tensor)
+        assert torch.equal(actual, expected)
+    elif isinstance(actual, dict):
+        assert isinstance(expected, dict)
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            assert_nested_equal(actual[key], expected[key])
+    elif isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            assert_nested_equal(left, right)
+    else:
+        assert actual == expected
+
+
 def roundtrip(Opt, device):
-    base, base_opt = build(Opt, device); train(base, base_opt, 0, 12, device)
-    inter, inter_opt = build(Opt, device); train(inter, inter_opt, 0, 8, device)
+    base, base_opt = build(Opt, device, 0); train(base, base_opt, 0, 12, device)
+    inter, inter_opt = build(Opt, device, 0); train(inter, inter_opt, 0, 8, device)
     model_ck = {k: v.clone() for k, v in inter.state_dict().items()}
     opt_ck = inter_opt.state_dict()
-    rng_ck = torch.get_rng_state()
-    res, res_opt = build(Opt, device)
-    res.load_state_dict(model_ck); res_opt.load_state_dict(opt_ck); torch.set_rng_state(rng_ck)
+    res, res_opt = build(Opt, device, 987654321)
+    res.load_state_dict(model_ck); res_opt.load_state_dict(opt_ck)
+    torch.manual_seed(123456789 + dist.get_rank())
     train(res, res_opt, 8, 12, device)
+    assert_nested_equal(base_opt.state_dict(), res_opt.state_dict())
     return max((b.full_tensor() - r.full_tensor()).abs().max().item()
                for b, r in zip(base.parameters(), res.parameters()))
 

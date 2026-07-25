@@ -25,14 +25,6 @@ def _from_local(local: torch.Tensor, reference: DTensor) -> DTensor:
     )
 
 
-def _stochastic_keep(bits: torch.Tensor, keep_bits: int, random: torch.Tensor) -> torch.Tensor:
-    discarded = 32 - keep_bits
-    if discarded == 0:
-        return bits
-    noise = (random * (1 << discarded)).to(torch.int32)
-    return _stochastic_keep_finite(bits, noise, keep_bits)
-
-
 def encode(
     value: torch.Tensor,
     narrow_dtype: torch.dtype = torch.bfloat16,
@@ -48,9 +40,15 @@ def encode(
 
     w = _CORRECTION_BITS[correction_dtype]
     bits = value.float().contiguous().view(torch.int32)
-    if random is None:
-        random = torch.rand_like(value, dtype=torch.float32)
-    rounded = _stochastic_keep(bits, 16 + w, random)
+    keep_bits = 16 + w
+    if keep_bits == 32:
+        rounded = bits
+    else:
+        if random is None:
+            random = torch.rand_like(value, dtype=torch.float32)
+        discarded = 32 - keep_bits
+        noise = (random * (1 << discarded)).to(torch.int32)
+        rounded = _stochastic_keep_finite(bits, noise, keep_bits)
     narrow = (rounded >> 16).to(torch.int16).view(torch.bfloat16)
     correction = ((rounded >> (16 - w)) & ((1 << w) - 1)).to(correction_dtype)
     return narrow, correction

@@ -11,18 +11,12 @@ from .numerics import _stochastic_keep_finite, _wide, stable_l2_normalize
 from .transforms import WHOLE, Tempo, first_moment, orthogonalize, sgd_commit
 
 
-def _stable_l2_normalize(value: Tensor, *, dim: int, eps: Tensor) -> Tensor:
-    """Normalize through the shared stable-L2 primitive."""
-
-    return stable_l2_normalize(value, dim=dim, eps=eps)
-
-
 def _scion_bias_rms_direction(update: Tensor, eps: Tensor) -> Tensor:
     if update.ndim == 1:
         return update / update.abs().clamp(min=eps)
     dimension = update.shape[1]
     scale = math.sqrt(dimension)
-    return _stable_l2_normalize(update, dim=1, eps=eps * scale) * scale
+    return stable_l2_normalize(update, dim=1, eps=eps * scale) * scale
 
 
 def _orthogonal_direction(update: Tensor, tempo: Tempo) -> Tensor:

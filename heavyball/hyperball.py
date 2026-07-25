@@ -5,8 +5,6 @@ from torch import Tensor
 
 from .numerics import _caution, _wide, broadcast_leaf, stable_l2_normalize
 
-
-# Kept local: this caller needs the stable scale and normalized norm separately.
 def _stable_l2_components(value: Tensor) -> tuple[Tensor, Tensor]:
     """Return legacy stable-L2 scale and normalized norm for every slab row."""
 
@@ -19,12 +17,6 @@ def _stable_l2_components(value: Tensor) -> tuple[Tensor, Tensor]:
     safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
     norm = torch.linalg.vector_norm(flat / safe_scale.unsqueeze(1), dim=1)
     return scale, norm
-
-
-def _initial_norm(value: Tensor) -> Tensor:
-    scale, norm = _stable_l2_components(value)
-    return torch.cat((scale.unsqueeze(1), norm.unsqueeze(1)), dim=1)
-
 
 def _unpack_init_norm(init_norm: Tensor) -> tuple[Tensor, Tensor]:
     """Accept legacy's one- or two-scalar init-norm representations."""
@@ -53,13 +45,13 @@ def hyperball_commit(param: Tensor, update: Tensor, state: dict[str, Tensor], te
     stored_init_norm = _wide(state["init_norm"])
     seen = state["seen"]
     first = seen.logical_not()
-    first_init_norm = _initial_norm(param)
+    scale, norm = _stable_l2_components(param)
+    first_init_norm = torch.cat((scale.unsqueeze(1), norm.unsqueeze(1)), dim=1)
     init_norm = torch.where(broadcast_leaf(first, first_init_norm), first_init_norm, stored_init_norm)
 
     lr = _wide(tempo.hyper.lr)
     caution = _wide(tempo.hyper.caution)
 
-    # Hyperball (arXiv 2606.16899, Algorithm 1) replaces weight decay with the norm constraint, so no weight_decay term is folded here; hyperball_adamw's routed AdamW branch keeps decay for vectors.
     raw_grad = torch.zeros_like(update) if tempo.raw_grad is None else _wide(tempo.raw_grad)
     update = torch.where(caution != 0, _caution(raw_grad, update), update)
 

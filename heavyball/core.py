@@ -2,7 +2,7 @@
 
 import math
 import types
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 from contextlib import ExitStack
 from dataclasses import InitVar, dataclass, field
 from numbers import Real
@@ -22,16 +22,46 @@ Commit = Callable[[Tensor, Tensor, dict[str, Tensor], Tempo], tuple[Tensor, dict
 EvalSwap = Callable[[Tensor, dict[str, Tensor], SimpleNamespace, bool], tuple[Tensor, dict[str, Tensor]]]
 
 _HOST_ONLY_HYPERPARAMETERS = frozenset(("preconditioner_update_probability",))
-_STEP_CODE_CACHE: dict = {}
-_FSDP2_COMPILE_IDENTITIES: dict[tuple[object, ...], object] = {}
+_COMPILE_CACHE_MAX_SIZE = 128
+_STEP_CODE_CACHE: OrderedDict[object, object] = OrderedDict()
+_FSDP2_COMPILE_IDENTITIES: OrderedDict[tuple[object, ...], object] = OrderedDict()
+_STEP_CODE_SERIAL = 0
 _RNG_CHECKPOINT_KEY = ("heavyball_rng",)
 
 
+def _bounded_cache_get_or_create(cache, key, factory):
+    try:
+        value = cache[key]
+    except KeyError:
+        value = factory()
+        if len(cache) >= _COMPILE_CACHE_MAX_SIZE:
+            if isinstance(cache, OrderedDict):
+                cache.popitem(last=False)
+            else:
+                cache.pop(next(iter(cache)))
+        cache[key] = value
+    else:
+        if isinstance(cache, OrderedDict):
+            cache.move_to_end(key)
+    return value
+
+
+def clear_cache() -> None:
+    """Clear HeavyBall's process-local compile identity caches."""
+
+    _STEP_CODE_CACHE.clear()
+    _FSDP2_COMPILE_IDENTITIES.clear()
+
+
 def _keyed_compile_fn(fn, key):
-    code = _STEP_CODE_CACHE.get(key)
-    if code is None:
-        code = fn.__code__.replace(co_name=f"{fn.__code__.co_name}__hb{len(_STEP_CODE_CACHE)}")
-        _STEP_CODE_CACHE[key] = code
+    def create_code():
+        global _STEP_CODE_SERIAL
+
+        serial = _STEP_CODE_SERIAL
+        _STEP_CODE_SERIAL += 1
+        return fn.__code__.replace(co_name=f"{fn.__code__.co_name}__hb{serial}")
+
+    code = _bounded_cache_get_or_create(_STEP_CODE_CACHE, key, create_code)
     return types.FunctionType(code, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
 
 
@@ -374,6 +404,21 @@ def _storage_view_matches(actual: Tensor, expected: Tensor) -> bool:
     )
 
 
+def _storage_view_identity(value: object) -> tuple[object, ...] | None:
+    """Return the storage and view metadata whose change requires binding validation."""
+
+    if not isinstance(value, Tensor):
+        return None
+    return (
+        value.untyped_storage()._cdata,
+        tuple(value.shape),
+        value.stride(),
+        value.storage_offset(),
+        value.dtype,
+        value.device,
+    )
+
+
 def _dense_storage_span(value: Tensor) -> tuple[int, int] | None:
     if value.numel() == 0:
         start = value.storage_offset() * value.element_size()
@@ -440,13 +485,7 @@ class PlainBinding:
     def storage_shape(self) -> tuple[int, ...]:
         return tuple(self.param.shape)
 
-    def snapshot(self) -> tuple[Tensor, Tensor | None]:
-        return self.param.data, self.param.grad
-
-    def restore(self, snapshot: tuple[Tensor, Tensor | None]) -> None:
-        self.param.data, self.param.grad = snapshot
-
-    def bind_param(self, row: Tensor) -> None:
+    def validate_param(self) -> None:
         if not self.param.data.is_contiguous():
             raise ValueError(
                 f"parameter of shape {tuple(self.param.shape)} has non-contiguous strides "
@@ -454,6 +493,15 @@ class PlainBinding:
                 "before constructing the optimizer, e.g. "
                 "nn.Parameter(p.detach().contiguous(), requires_grad=p.requires_grad)."
             )
+
+    def snapshot(self) -> tuple[Tensor, Tensor | None]:
+        return self.param.data, self.param.grad
+
+    def restore(self, snapshot: tuple[Tensor, Tensor | None]) -> None:
+        self.param.data, self.param.grad = snapshot
+
+    def bind_param(self, row: Tensor) -> None:
+        self.validate_param()
         row.copy_(self.param.detach())
         self.param.data = row
 
@@ -463,6 +511,9 @@ class PlainBinding:
     def initializer_reference(self, row: Tensor) -> Tensor:
         del row
         return self.param
+
+    def storage_identity(self) -> tuple[object, ...]:
+        return _storage_view_identity(self.param), _storage_view_identity(self.param.grad)
 
     def validate(self, param_row: Tensor, grad_row: Tensor) -> None:
         if self.param.grad is None or not _plain_view_matches(self.param.grad, grad_row):
@@ -659,6 +710,22 @@ class FSDP2Binding:
 
     def initializer_reference(self, row: Tensor) -> Tensor:
         return row
+
+    def storage_identity(self) -> tuple[object, ...]:
+        grad = self.param.grad
+        return (
+            id(self.fsdp_param.sharded_state),
+            id(self.fsdp_param.sharded_param),
+            _storage_view_identity(self.fsdp_param._sharded_param_data),
+            _storage_view_identity(self.param._local_tensor),
+            type(grad),
+            id(getattr(grad, "device_mesh", None)),
+            tuple(
+                (type(placement), getattr(placement, "dim", None))
+                for placement in getattr(grad, "placements", ())
+            ),
+            _storage_view_identity(getattr(grad, "_local_tensor", None)),
+        )
 
     def validate(self, param_row: Tensor, grad_row: Tensor) -> None:
         valid_param = self._valid_view(param_row)
@@ -1215,7 +1282,11 @@ def _make_fsdp2_whole_segment_transform(
                         leaf_indices=owner_leaf_indices[owner_index : owner_index + 1],
                     )
                     if correction is not None:
-                        random = leaf_tempo.random_like(value.unsqueeze(0))[0]
+                        random = (
+                            None
+                            if correction_dtype is torch.int16
+                            else leaf_tempo.random_like(value.unsqueeze(0))[0]
+                        )
                         narrow, residual = encode(
                             value, torch.bfloat16, correction_dtype, random=random
                         )
@@ -1354,7 +1425,6 @@ def _specialize_fsdp2_recipe(
     )
 
 
-# Kept local: Engine accepts any one-element tensor, unlike Program's 0-d requirement.
 def _scalar(value, reference: Tensor) -> Tensor:
     dtype = torch.float64 if reference.dtype == torch.float64 else torch.float32
     if isinstance(value, Tensor):
@@ -1471,6 +1541,12 @@ class Engine:
                 raise ValueError("param_keys must contain one key for every supplied parameter")
             if any(not isinstance(key, str) for key in supplied_keys):
                 raise TypeError("param_keys must contain strings")
+        if any(not isinstance(param, Tensor) for param in supplied_params):
+            raise TypeError("Engine can optimize tensors only")
+        if any(not param.is_leaf for param in supplied_params):
+            raise ValueError("Engine can optimize leaf tensors only")
+        if len({id(param) for param in supplied_params}) != len(supplied_params):
+            raise ValueError("a parameter may appear only once in an Engine")
         keyed_params = tuple(
             (param, key) for param, key in zip(supplied_params, supplied_keys, strict=True) if param.requires_grad
         )
@@ -1480,8 +1556,6 @@ class Engine:
             raise ValueError("Engine requires at least one trainable parameter")
         if any(not param.is_floating_point() for param in self.params):
             raise TypeError("Engine supports floating-point parameters only")
-        if len({id(param) for param in self.params}) != len(self.params):
-            raise ValueError("a parameter may appear only once in an Engine")
         if len(set(self.param_keys)) != len(self.param_keys):
             raise ValueError("param_keys must be unique")
         if bindings is None:
@@ -1507,7 +1581,7 @@ class Engine:
                 )
         if not fsdp2_mode:
             storage_groups: dict[torch.UntypedStorage, list[Tensor]] = {}
-            for param in self.params:
+            for param in supplied_params:
                 storage_groups.setdefault(param.untyped_storage(), []).append(param)
             for storage_params in storage_groups.values():
                 if any(
@@ -1521,6 +1595,8 @@ class Engine:
                         "each parameter into its own slab row, which silently breaks the shared storage. "
                         "Use a single nn.Parameter for tied weights instead of separate ones."
                     )
+            for param in self.params:
+                binding_by_param_id[id(param)].validate_param()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             binding0 = binding_by_param_id[id(self.params[0])] if fsdp2_mode else None
             process_group = binding0.process_group if binding0 is not None else None
@@ -1537,17 +1613,12 @@ class Engine:
             else:
                 torch.distributed.broadcast(seed_words, group=process_group, group_src=0)
                 if replicate_group is not None:
-                    # HSDP: the shard-axis broadcast agrees only within one replicate row. Broadcast over
-                    # the replicate axis too so every replica shares one seed -- otherwise stochastic steps
-                    # (e.g. Muon's bf16 rounding) diverge silently across replicas that started from
-                    # different ambient seeds.
+                    # HSDP replicas must share the seed or stochastic steps silently diverge.
                     torch.distributed.broadcast(seed_words, group=replicate_group, group_src=0)
             self._rng_seed = int(seed_words[0]) | (int(seed_words[1]) << 32)
         self._bindings = binding_by_param_id
         self._param_keys = {id(param): key for param, key in keyed_params}
-        # Keep initialization seeds in supplied construction order, rather than
-        # slab-bucket order.  This includes frozen parameters, matching legacy's
-        # global per-parameter seed assignment when bucketing regroups leaves.
+        # Construction-order seeds preserve checkpoint compatibility across regrouping.
         param_init_seeds = {id(param): index for index, param in enumerate(supplied_params)}
         param_rng_indices = {
             id(param): index for param, index in zip(supplied_params, supplied_leaf_indices, strict=True)
@@ -1588,8 +1659,6 @@ class Engine:
             if "preconditioner_update_probability" in recipe.defaults
         ]
         if cadence_defaults:
-            # Refresh is a whole-step artifact, so routes use their higher
-            # branch probability when their defaults differ.
             probability = overrides.get("preconditioner_update_probability", max(cadence_defaults))
             self._cadence: RefreshCadence | None = RefreshCadence(probability)
         else:
@@ -1677,7 +1746,9 @@ class Engine:
                 for key, leaves in buckets.items()
             )
             compile_identity = (id(recipe_or_route), compile_buckets)
-            self.recipe = _FSDP2_COMPILE_IDENTITIES.setdefault(compile_identity, object())
+            self.recipe = _bounded_cache_get_or_create(
+                _FSDP2_COMPILE_IDENTITIES, compile_identity, object
+            )
 
         for key, leaves in buckets.items():
             reference_binding = binding_by_param_id[id(leaves[0])]
@@ -1749,10 +1820,6 @@ class Engine:
                         if name not in _HOST_ONLY_HYPERPARAMETERS
                     }
                     if "max_lr" in values and values["max_lr"] is None and "lr" in values:
-                        # AdamC's ``max_lr`` inherits the per-group ``lr``; resolve before ``_scalar``
-                        # (which rejects None). This is the shared choke point for facades and direct build().
-                        # Require the key to be present (None sentinel), not merely absent, so non-AdamC
-                        # recipes do not acquire a spurious max_lr cell (which would break old checkpoints).
                         values["max_lr"] = values["lr"]
                     hypers[hyper_key] = SimpleNamespace(
                         **{name: _scalar(value, reference) for name, value in values.items()}
@@ -1792,8 +1859,6 @@ class Engine:
                             **init_hyper,
                         )
                     elif init_fn is not None:
-                        # Hooks stay seed-only unless a transform explicitly
-                        # opts into named build-time hyperparameters.
                         for index, seed in enumerate(seeds):
                             init_fn(slab[index], seed=seed, **init_hyper)
                 grad_slab = torch.zeros_like(slab)
@@ -1895,9 +1960,13 @@ class Engine:
                                     leaf_indices=leaf_indices[index : index + 1],
                                 )
                                 if name in correction_slabs:
-                                    random = leaf_tempo._replace(
-                                        element_offset=rng_element_offset(state_slabs[name])
-                                    ).random_like(value.unsqueeze(0))[0]
+                                    random = (
+                                        None
+                                        if correction_dtype is torch.int16
+                                        else leaf_tempo._replace(
+                                            element_offset=rng_element_offset(state_slabs[name])
+                                        ).random_like(value.unsqueeze(0))[0]
+                                    )
                                     narrow, correction = encode(
                                         value, torch.bfloat16, correction_dtype, random=random
                                     )
@@ -1947,9 +2016,13 @@ class Engine:
                             leaf_indices=leaf_indices[index : index + 1],
                         )
                         if name in commit_corrections:
-                            random = leaf_tempo._replace(
-                                element_offset=rng_element_offset(commit_state[name])
-                            ).random_like(value.unsqueeze(0))[0]
+                            random = (
+                                None
+                                if correction_dtype is torch.int16
+                                else leaf_tempo._replace(
+                                    element_offset=rng_element_offset(commit_state[name])
+                                ).random_like(value.unsqueeze(0))[0]
+                            )
                             narrow, correction = encode(
                                 value, torch.bfloat16, correction_dtype, random=random
                             )
@@ -1999,6 +2072,10 @@ class Engine:
                 param_key: True
                 for initializer in deferred_param_initializers
                 for param_key in initializer[-1]
+            }
+            self._binding_identities = {
+                id(param): self._bindings[id(param)].storage_identity()
+                for param in self.params
             }
             self.hyper, self.step_count = self.groups[0].hyper, self._steps[0]
             from torch.distributed.tensor import DTensor
@@ -2086,13 +2163,38 @@ class Engine:
         return self._compile_step(refresh=True)
 
     def _compile_step(self, *, refresh: bool):
+        def shares_param_noise(group: Group, target: Tensor) -> bool:
+            return (
+                target.dtype is torch.bfloat16
+                and target.shape == group.param_slab.shape
+                and getattr(target, "placements", None)
+                == getattr(group.param_slab, "placements", None)
+            )
+
+        def needs_param_noise(group: Group) -> bool:
+            targets = [group.param_slab]
+            targets.extend(
+                value
+                for state, corrections in zip(
+                    group.states, group.state_corrections, strict=True
+                )
+                for name, value in state.items()
+                if name not in corrections
+            )
+            targets.extend(
+                value
+                for name, value in group.commit_state.items()
+                if name not in group.commit_corrections
+            )
+            return any(shares_param_noise(group, target) for target in targets)
+
         plans = tuple(
             (
                 group.param_slab, group.observations, group.observed, group.age,
                 group.base_seed, group.leaf_indices, group.element_offset, group.states, group.state_corrections,
                 group.state_element_offsets, group.commit_state, group.commit_corrections,
                 group.commit_element_offsets, group.hyper, group.step,
-                group.recipe.chain, group.recipe.commit,
+                group.recipe.chain, group.recipe.commit, needs_param_noise(group),
             )
             for group in self.groups
         )
@@ -2104,7 +2206,7 @@ class Engine:
             for (
                 param_slab, obs, observed, age, base_seed, leaf_indices, element_offset, states,
                 state_corrections, state_element_offsets, commit_state, commit_corrections,
-                commit_element_offsets, hyper, step, chain, commit,
+                commit_element_offsets, hyper, step, chain, commit, use_param_noise,
             ) in plans:
                 age_now = age + observed.to(torch.int64)
                 update = obs.grad
@@ -2139,6 +2241,7 @@ class Engine:
                         param_slab, obs.grad, update, observed, age, age_now, tempo, states,
                         state_corrections, state_element_offsets, decoded_states, candidates, live,
                         commit_state, commit_corrections, commit_element_offsets, hyper, step, commit,
+                        use_param_noise,
                     )
                 )
 
@@ -2165,6 +2268,7 @@ class Engine:
                 param_slab, raw_grad, update, _observed, age, age_now, tempo, states,
                 state_corrections, state_element_offsets, decoded_states, candidates, live,
                 commit_state, commit_corrections, commit_element_offsets, _hyper, _step, commit,
+                use_param_noise,
             ) in pending:
                 if clip_norm is not None:
                     update = update * scale
@@ -2188,7 +2292,7 @@ class Engine:
                         param_slab, new_param, age, age_now, states, state_corrections,
                         state_element_offsets, decoded_states, candidates, live, commit_state,
                         commit_corrections, commit_element_offsets, decoded_commit_state,
-                        candidate_commit_state, tempo,
+                        candidate_commit_state, tempo, use_param_noise,
                     )
                 )
 
@@ -2196,9 +2300,9 @@ class Engine:
                 param_slab, new_param, age, age_now, states, state_corrections,
                 state_element_offsets, decoded_states, candidates, live, commit_state,
                 commit_corrections, commit_element_offsets, decoded_commit_state,
-                candidate_commit_state, tempo,
+                candidate_commit_state, tempo, use_param_noise,
             ) in committed:
-                param_noise = tempo.random_like(param_slab)
+                param_noise = tempo.random_like(param_slab) if use_param_noise else None
                 for state, corrections, element_offsets, decoded_state, (candidate, inbound) in zip(
                     states, state_corrections, state_element_offsets, decoded_states, candidates, strict=True
                 ):
@@ -2213,7 +2317,11 @@ class Engine:
                                 new,
                                 torch.bfloat16,
                                 corrections[name].dtype,
-                                random=state_tempo.random_like(new),
+                                random=(
+                                    None
+                                    if corrections[name].dtype is torch.int16
+                                    else state_tempo.random_like(new)
+                                ),
                             )
                             state[name].copy_(torch.where(active, narrow, state[name]))
                             corrections[name].copy_(torch.where(active, correction, corrections[name]))
@@ -2232,7 +2340,11 @@ class Engine:
                             new,
                             torch.bfloat16,
                             commit_corrections[name].dtype,
-                            random=commit_tempo.random_like(new),
+                            random=(
+                                None
+                                if commit_corrections[name].dtype is torch.int16
+                                else commit_tempo.random_like(new)
+                            ),
                         )
                         commit_state[name].copy_(torch.where(active, narrow, commit_state[name]))
                         commit_corrections[name].copy_(torch.where(active, correction, commit_corrections[name]))
@@ -2254,9 +2366,6 @@ class Engine:
         compile_scope = id(self.recipe) if hasattr(self, "_fsdp2_manifest") else None
         plan_abi = _plan_abi(self.groups, clip_norm=clip_norm, compile_scope=compile_scope)
         whole_step = _keyed_compile_fn(whole_step, (plan_abi, "step", refresh))
-        # max_autotune is mandatory: it is what produces fast kernels. "Faster compile" must never come
-        # from disabling it (that only ships slower kernels). Passed as an option so it composes with
-        # the scalar-CSE pass; no cudagraphs (matches the prior max-autotune-no-cudagraphs behavior).
         return torch.compile(whole_step, fullgraph=True, dynamic=False, options=STEP_COMPILE_OPTIONS)
 
     def _compile_eval_swap(self, *, entering_train: bool):
@@ -2296,9 +2405,7 @@ class Engine:
                 unchanged_state = {
                     name: new_state[name] is decoded_commit_state[name] for name in commit_state
                 } if commit_corrections else {}
-                # An eval swap may exchange a state slot with param_slab.  Materialize
-                # every returned state value before writing param_slab so the swap is
-                # literal in eager mode as well as under compiled execution.
+                # Materialization preserves literal state/parameter swaps in eager and compiled modes.
                 new_state = {
                     name: new_state[name] * torch.ones_like(new_state[name]) for name in commit_state
                 }
@@ -2314,7 +2421,11 @@ class Engine:
                             new_state[name],
                             torch.bfloat16,
                             commit_corrections[name].dtype,
-                            random=commit_tempo.random_like(new_state[name]),
+                            random=(
+                                None
+                                if commit_corrections[name].dtype is torch.int16
+                                else commit_tempo.random_like(new_state[name])
+                            ),
                         )
                         commit_state[name].copy_(narrow)
                         commit_corrections[name].copy_(correction)
@@ -2364,6 +2475,13 @@ class Engine:
     def _run_deferred_param_init(self) -> bool:
         if not any(self._deferred_param_init_pending.values()):
             return False
+        import warnings
+        warnings.warn(
+            "Deferred parameter initialization is running (e.g., Scion reinitializes parameters to "
+            "seeded orthogonal frames on the first step). This overwrites the current parameter values.",
+            UserWarning,
+            stacklevel=2,
+        )
         initialized = []
         for group_init_fn, init_fn, slab, seeds, init_hyper, param_keys in self._deferred_param_initializers:
             pending = tuple(
@@ -2388,6 +2506,15 @@ class Engine:
             if group_init_fn is not None and len({pending[param_key] for param_key in param_keys}) > 1:
                 raise ValueError("checkpoint grouped deferred parameter initialization is inconsistent")
 
+    def _validate_bindings(self, *, force: bool) -> None:
+        for group in self.groups:
+            for index, param in enumerate(group.params):
+                binding = self._bindings[id(param)]
+                identity = binding.storage_identity()
+                if force or identity != self._binding_identities[id(param)]:
+                    binding.validate(group.param_slab[index], group.grad_slab[index])
+                    self._binding_identities[id(param)] = identity
+
     @torch.no_grad()
     def step(self, *, step_type: str | None = None,
              observed: Sequence[bool] | Mapping[Tensor, bool] | None = None) -> None:
@@ -2401,11 +2528,9 @@ class Engine:
         deliberate tradeoff (zero step-time cost, no implicit backward hooks), not an oversight.
         """
 
-        for group in self.groups:
-            for index, param in enumerate(group.params):
-                self._bindings[id(param)].validate(group.param_slab[index], group.grad_slab[index])
+        self._validate_bindings(force=observed is not None)
         if observed is None:
-            values = (True,) * len(self.params)
+            by_param = None
         elif isinstance(observed, Mapping):
             if len(observed) != len(self.params):
                 raise ValueError("observed must contain every trainable parameter")
@@ -2417,14 +2542,18 @@ class Engine:
             values = tuple(observed)
             if len(values) != len(self.params):
                 raise ValueError("observed must contain one value for every trainable parameter")
-        if any(not isinstance(value, bool) for value in values):
-            raise TypeError("observed values must be host bools")
-        by_param = {id(param): value for param, value in zip(self.params, values, strict=True)}
+        if observed is not None:
+            if any(not isinstance(value, bool) for value in values):
+                raise TypeError("observed values must be host bools")
+            by_param = {
+                id(param): value
+                for param, value in zip(self.params, values, strict=True)
+            }
         for group in self.groups:
             if not group.recipe.observations:
                 continue
             for param in group.params:
-                if not by_param[id(param)]:
+                if by_param is not None and not by_param[id(param)]:
                     continue
                 produced = getattr(param, _OBSERVATION_BINDING).produced
                 for name in group.recipe.observations:
@@ -2436,19 +2565,20 @@ class Engine:
         if step_type is None:
             step_type = self._cadence.next_step_type() if self._cadence is not None else "normal"
         compiled_step = self.compiled_steps[step_type]
-        for group in self.groups:
-            group_values = tuple(by_param[id(param)] for param in group.params)
-            if group_values != group.observed_cache:
-                group.observed.copy_(torch.tensor(
-                    group_values, dtype=torch.bool, device=group.param_slab.device
-                ))
-                group.observed_cache = group_values
+        if by_param is None:
+            for group in self.groups:
+                if group.observed_cache is not None:
+                    group.observed.fill_(True)
+                    group.observed_cache = None
+        else:
+            for group in self.groups:
+                group_values = tuple(by_param[id(param)] for param in group.params)
+                if group_values != group.observed_cache:
+                    group.observed.copy_(torch.tensor(
+                        group_values, dtype=torch.bool, device=group.param_slab.device
+                    ))
+                    group.observed_cache = group_values
         if self._run_deferred_param_init():
-            # Deferred (re)initialization just rewrote parameters from seeded frames. The gradient in
-            # the slab was computed at the pre-initialization parameter values, so applying it now would
-            # update the wrong parameters. Invalidate autograd versions and return without applying an
-            # update or advancing the step clock; the next forward/backward produces a gradient at the
-            # initialized parameters.
             self._bump_versions()
             return
         compiled_step()
@@ -2560,7 +2690,6 @@ class Engine:
         }
         if self._cadence is not None:
             probability = self._cadence.probability
-            # Callable schedules have no stable serialized identity, so checkpointing them must fail loudly.
             if callable(probability):
                 raise ValueError("cannot checkpoint a callable cadence probability schedule")
             if not isinstance(probability, Real) or isinstance(probability, bool):
@@ -2602,7 +2731,6 @@ class Engine:
         has_saved_cadence = "cadence" in state_dict
         saved_cadence = state_dict.get("cadence")
         cadence_state = None
-        # Format-2 checkpoints have no cadence state, so their constructed counters remain unchanged.
         if checkpoint_format in (3, 4) and (self._cadence is not None) != has_saved_cadence:
             raise ValueError("checkpoint cadence presence does not match this Engine")
         if self._cadence is not None and saved_cadence is not None:
@@ -2816,8 +2944,7 @@ class Engine:
         for target, value in copies:
             staged_copies.append((target, torch.empty_like(target).copy_(value)))
 
-        # Stage every fill into its target dtype before mutating anything, so a non-representable
-        # counter (NaN, infinity, overflow, non-integral) aborts the load without a partial write.
+        # Pre-casting every fill makes checkpoint loads atomic on invalid counters.
         staged_fills = []
         for target, value in fills:
             if not isinstance(value, Real) or isinstance(value, bool):

@@ -2,8 +2,11 @@
 
 import copy
 import inspect
+import math
 import os
 import warnings
+from dataclasses import dataclass
+from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
 import torch
@@ -100,15 +103,12 @@ def _recipe_defaults(recipe: Recipe | Route, overrides: Mapping[str, object]) ->
 
 
 def _recipe_hyperparameters(recipe: Recipe | Route) -> tuple[tuple[str, object, object], ...]:
-    # Sentinel-None recipe hypers (e.g. AdamC ``max_lr``, which inherits ``lr``) are nullable numeric
-    # references; annotate them ``float | None`` instead of the bare ``NoneType``.
     return tuple(
         (name, (float | None) if default is None else type(default), default)
         for name, default in _recipe_defaults(recipe, {}).items()
     )
 
 
-# Engine-level knobs every facade accepts through ``**hyper`` (build/Engine, not recipe defaults).
 _ENGINE_HYPERPARAMETERS: tuple[tuple[str, str, object], ...] = (
     ("storage_dtype", "torch.dtype | str | None", None),
     ("ecc", "int | str | None", None),
@@ -144,6 +144,26 @@ def _same_hyper_value(left: object, right: object) -> bool:
     except (RuntimeError, TypeError, ValueError):
         return False
     return bool(equal) if isinstance(equal, bool) else False
+
+
+@dataclass(frozen=True)
+class _TensorHyperSnapshot:
+    value: Tensor
+    version: int
+
+
+def _snapshot_hyper(value: object) -> object:
+    return _TensorHyperSnapshot(value, value._version) if isinstance(value, Tensor) else value
+
+
+def _matches_hyper_snapshot(value: object, snapshot: object) -> bool:
+    if isinstance(value, Tensor):
+        return (
+            isinstance(snapshot, _TensorHyperSnapshot)
+            and snapshot.value is value
+            and snapshot.version == value._version
+        )
+    return not isinstance(snapshot, _TensorHyperSnapshot) and _same_hyper_value(value, snapshot)
 
 
 def _canonical_optimizer_wide_value(name: str, value: object) -> object:
@@ -207,6 +227,146 @@ def _validate_param_group_options(
         raise ValueError(f"unknown hyperparameter override(s): {names}")
     if any("param_keys" in group for group in param_groups):
         raise ValueError("'param_keys' must be supplied once to the optimizer constructor, not per group")
+
+
+def _real_hyper_value(
+    optimizer_name: str,
+    name: str,
+    value: object,
+    *,
+    allow_none: bool = False,
+    allow_callable: bool = False,
+) -> float | None:
+    if value is None and allow_none:
+        return None
+    if callable(value) and allow_callable:
+        return None
+    if isinstance(value, Tensor):
+        if value.numel() != 1 or value.dtype is torch.bool or value.is_complex():
+            raise TypeError(
+                f"{optimizer_name} hyperparameter {name!r}={value!r} must be a real scalar"
+            )
+        scalar = value.detach().item()
+    else:
+        scalar = value
+    if not isinstance(scalar, Real) or isinstance(scalar, bool):
+        raise TypeError(
+            f"{optimizer_name} hyperparameter {name!r}={value!r} must be a real scalar"
+        )
+    try:
+        numeric = float(scalar)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{optimizer_name} hyperparameter {name!r}={value!r} must be finite"
+        ) from error
+    if not math.isfinite(numeric):
+        raise ValueError(
+            f"{optimizer_name} hyperparameter {name!r}={value!r} must be finite"
+        )
+    return numeric
+
+
+def _validate_hyperparameter_domains(
+    optimizer_name: str,
+    recipe: Recipe | Route,
+    param_groups: list[dict[str, object]],
+    defaults: Mapping[str, object],
+    *,
+    allow_callable_cadence: bool = True,
+    allow_inherited_max_lr: bool = False,
+) -> None:
+    recipe_names = set(_recipe_defaults(recipe, {}))
+    for effective in _effective_group_hypers(param_groups, defaults):
+        for name in recipe_names:
+            if name not in effective:
+                continue
+            value = effective[name]
+            numeric = _real_hyper_value(
+                optimizer_name,
+                name,
+                value,
+                allow_none=name == "max_lr" and allow_inherited_max_lr,
+                allow_callable=(
+                    name == "preconditioner_update_probability"
+                    and allow_callable_cadence
+                ),
+            )
+            if numeric is None:
+                continue
+            if name == "eps" and numeric <= 0:
+                domain = "greater than 0"
+            elif name in {"beta1", "beta2"} and not 0 <= numeric < 1:
+                domain = "in [0, 1)"
+            elif name in {"lr", "weight_decay", "max_lr"} and numeric < 0:
+                domain = "greater than or equal to 0"
+            else:
+                continue
+            raise ValueError(
+                f"{optimizer_name} hyperparameter {name!r}={value!r} must be {domain}"
+            )
+
+        clip_global_norm = effective.get("clip_global_norm")
+        if clip_global_norm is not None:
+            _real_hyper_value(
+                optimizer_name,
+                "clip_global_norm",
+                clip_global_norm,
+            )
+
+
+def _validate_engine_hyperparameter_types(
+    optimizer_name: str,
+    param_groups: list[dict[str, object]],
+) -> None:
+    for group in param_groups:
+        storage_dtype = group.get("storage_dtype")
+        resolved_storage_dtype = storage_dtype
+        if isinstance(storage_dtype, str):
+            resolved_storage_dtype = getattr(
+                torch,
+                storage_dtype.removeprefix("torch."),
+                storage_dtype,
+            )
+        ecc = group.get("ecc")
+        if ecc is not None and (
+            type(ecc) not in (int, str)
+            or ecc not in (8, 16, "bf16+8", "bf16+16")
+        ):
+            raise ValueError(
+                f"{optimizer_name} hyperparameter 'ecc'={ecc!r}: "
+                'ecc must be None, 8, 16, "bf16+8", or "bf16+16"'
+            )
+        if (
+            ecc is not None
+            and resolved_storage_dtype is not None
+            and resolved_storage_dtype is not torch.bfloat16
+        ):
+            raise ValueError(
+                f"{optimizer_name} hyperparameters 'ecc'={ecc!r}, "
+                f"'storage_dtype'={storage_dtype!r}: ecc requires storage_dtype "
+                "to be None or torch.bfloat16"
+            )
+        if resolved_storage_dtype is not None and resolved_storage_dtype is not torch.bfloat16:
+            raise ValueError(
+                f"{optimizer_name} hyperparameter 'storage_dtype'={storage_dtype!r}: "
+                "storage_dtype must be None or torch.bfloat16"
+            )
+        param_keys = group.get("param_keys")
+        if param_keys is not None and (
+            isinstance(param_keys, (str, bytes))
+            or not isinstance(param_keys, Sequence)
+            or any(not isinstance(key, str) for key in param_keys)
+        ):
+            raise TypeError(
+                f"{optimizer_name} hyperparameter 'param_keys'={param_keys!r} "
+                "must be a sequence of strings or None"
+            )
+
+
+def _recipe_has_observations(recipe: Recipe | Route) -> bool:
+    if isinstance(recipe, Recipe):
+        return bool(recipe.observations)
+    return _recipe_has_observations(recipe.then) or _recipe_has_observations(recipe.otherwise)
 
 
 def _build_group_aware_engine(
@@ -285,11 +445,14 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
     The interface deliberately differs from ``torch.optim``. Parameters and gradients are slab-bound
     into persistent buffers, so call ``optimizer.zero_grad(set_to_none=False)`` (the default), never
     reassign ``p.data``/``p.grad`` (write them in place), and do not change parameter storage after
-    construction (e.g. ``model.to(...)``). By default every optimized parameter advances on every
-    step -- weight decay, moments, and the step clock update even when it received no gradient -- but
-    conditional, MoE, and frozen workflows can pass ``observed=`` to ``step()`` to mark inactive
-    parameters. Defaults differ from similarly named ``torch.optim`` optimizers, and hyperparameters
-    are keyword-only.
+    construction (e.g. ``model.to(...)``). DDP must use ``gradient_as_bucket_view=False``. By default
+    every optimized parameter advances on every step -- weight decay, moments, and the step clock
+    update even when it received no gradient -- but callers can pass ``observed=`` to mark inactive
+    parameters. This mask controls only HeavyBall state advancement; it does not change DDP's
+    autograd-graph unused-parameter detection or collectives. Conditional DDP graphs still require
+    ``find_unused_parameters=True``, and conditional FSDP2 graphs require
+    ``set_reduce_scatter_unused_params(True)``. Defaults differ from similarly named ``torch.optim``
+    optimizers, and hyperparameters are keyword-only.
 
     Low-precision optimizer state (opt-in per optimizer; compute always promotes to
     fp32, so accuracy is preserved and only storage shrinks):
@@ -344,6 +507,11 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             raise ValueError("fsdp2() does not accept a recipe override; use an allowed optimizer facade")
         recipe = cls.recipe
         schedule_free = recipe is sf_adamw
+        if _recipe_has_observations(recipe):
+            raise ValueError(
+                f"{cls.__name__}.fsdp2(): observation-bearing recipes are not supported "
+                "under FSDP2 yet"
+            )
         if not fsdp2_recipe_scope_supported(recipe):
             raise ValueError(
                 f"{cls.__name__}.fsdp2() requires every callable to be shard-separable or whole-scoped"
@@ -417,6 +585,17 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         torch_params = _materialize_params(params)
         _validate_param_group_options(recipe, torch_params, hyper)
         defaults = _recipe_defaults(recipe, hyper)
+        _validate_hyperparameter_domains(
+            type(self).__name__,
+            recipe,
+            torch_params,
+            defaults,
+            allow_inherited_max_lr=True,
+        )
+        _validate_engine_hyperparameter_types(
+            type(self).__name__,
+            _effective_group_hypers(torch_params, defaults),
+        )
         self._recipe = recipe
         self._fsdp2_mode = _fsdp2_bindings is not None
         self._rng_seed = torch.initial_seed()
@@ -442,19 +621,19 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             self._initializing = False
         self._resolve_inherited_hypers()
         self._synced_hypers = [
-            {name: param_group[name] for name in self._hyper_names if name in param_group}
+            {
+                name: _snapshot_hyper(param_group[name])
+                for name in self._hyper_names
+                if name in param_group
+            }
             for param_group in self.param_groups
         ]
 
     def _resolve_inherited_hypers(self) -> None:
-        # AdamC's ``max_lr`` defaults to the per-group ``lr``. Resolve the None sentinel in the public
-        # param groups so _sync_hypers_from_groups (set_hyper -> _scalar, which rejects None) and
-        # user-facing state match the Engine's per-group resolution in core.py.
         for group in self.param_groups:
             if "max_lr" in group and group["max_lr"] is None:
                 lr = group["lr"]
-                # Clone tensor LRs: an in-place scheduler update (group["lr"].fill_(...)) must not also
-                # move max_lr, which would collapse lr/max_lr to 1 and defeat the decay scaling.
+                # Cloning prevents in-place LR schedules from aliasing AdamC's inherited maximum.
                 group["max_lr"] = lr.detach().clone() if isinstance(lr, Tensor) else lr
 
     def add_param_group(self, param_group: dict[str, object]) -> None:
@@ -465,6 +644,17 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             raise ValueError("fsdp2() optimizers cannot add parameters after their FSDP storage is bound")
         materialized_group = _materialize_params([param_group])[0]
         _validate_param_group_options(self._recipe, [materialized_group], {})
+        _validate_hyperparameter_domains(
+            type(self).__name__,
+            self._recipe,
+            [materialized_group],
+            self.defaults,
+            allow_inherited_max_lr=True,
+        )
+        _validate_engine_hyperparameter_types(
+            type(self).__name__,
+            _effective_group_hypers([materialized_group], self.defaults),
+        )
         if self.defaults.get("param_keys") is not None:
             raise ValueError("cannot add a parameter group when param_keys fixed the Engine parameter schema")
         candidate_groups = [dict(group) for group in self.param_groups]
@@ -476,54 +666,81 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             id(param): None if param.grad is None else param.grad.detach().clone()
             for param in old_engine.params
         }
-        engine, leaf_count = _build_group_aware_engine(
-            candidate_groups,
-            self._recipe,
-            self.defaults,
-            bindings=None,
-            rng_seed=self._rng_seed,
+        parameter_snapshots = tuple(
+            (param, param.data, param.grad, dict(vars(param)))
+            for group in candidate_groups
+            for param in group["params"]
+            if isinstance(param, Tensor)
         )
+        original_param_groups = list(self.param_groups)
+        try:
+            engine, leaf_count = _build_group_aware_engine(
+                candidate_groups,
+                self._recipe,
+                self.defaults,
+                bindings=None,
+                rng_seed=self._rng_seed,
+            )
 
-        migrated = engine.state_dict()
-        for name in ("age", "state", "param_init_pending"):
-            migrated[name].update(old_state[name])
-        if "corrections" in old_state:
-            migrated["corrections"].update(old_state["corrections"])
-        if len(engine._steps_by_device) == 1:
-            migrated["step"] = old_state["step"]
-        else:
-            if set(old_state["step"]) == {"global"}:
-                old_device = str(next(iter(old_engine._steps_by_device)))
-                migrated["step"][old_device] = old_state["step"]["global"]
+            migrated = engine.state_dict()
+            for name in ("age", "state", "param_init_pending"):
+                migrated[name].update(old_state[name])
+            if "corrections" in old_state:
+                migrated["corrections"].update(old_state["corrections"])
+            if len(engine._steps_by_device) == 1:
+                migrated["step"] = old_state["step"]
             else:
-                migrated["step"].update(old_state["step"])
-        migrated["train_mode"] = old_state["train_mode"]
-        if "cadence" in old_state:
-            migrated["cadence"] = old_state["cadence"]
-        engine.load_state_dict(migrated)
-        with torch.no_grad():
-            for param in old_engine.params:
-                param.copy_(old_values[id(param)])
-                if old_grads[id(param)] is not None:
-                    param.grad.copy_(old_grads[id(param)])
+                if set(old_state["step"]) == {"global"}:
+                    old_device = str(next(iter(old_engine._steps_by_device)))
+                    migrated["step"][old_device] = old_state["step"]["global"]
+                else:
+                    migrated["step"].update(old_state["step"])
+            migrated["train_mode"] = old_state["train_mode"]
+            if "cadence" in old_state:
+                migrated["cadence"] = old_state["cadence"]
+            engine.load_state_dict(migrated)
+            with torch.no_grad():
+                for param in old_engine.params:
+                    param.copy_(old_values[id(param)])
+                    if old_grads[id(param)] is not None:
+                        param.grad.copy_(old_grads[id(param)])
 
-        super().add_param_group(materialized_group)
-        self._resolve_inherited_hypers()
+            super().add_param_group(materialized_group)
+            self._resolve_inherited_hypers()
+            hyper_names = frozenset(
+                name for namespace in engine._hyper_locations.values() for name in vars(namespace)
+            )
+            synced_hypers = [
+                {
+                    name: _snapshot_hyper(group[name])
+                    for name in hyper_names
+                    if name in group
+                }
+                for group in self.param_groups
+            ]
+            engines = [engine]
+            engine_by_param_id = {id(param): engine for param in engine.params}
+        except BaseException:
+            self.param_groups[:] = original_param_groups
+            with torch.no_grad():
+                for param, data, grad, attributes in parameter_snapshots:
+                    param.data = data
+                    param.grad = grad
+                    vars(param).clear()
+                    vars(param).update(attributes)
+            raise
+
         self._engine = engine
-        self._engines = [engine]
-        self._engine_by_param_id = {id(param): engine for param in engine.params}
+        self._engines = engines
+        self._engine_by_param_id = engine_by_param_id
         self._rng_seed = engine._rng_seed
         self._rng_next_leaf_index = leaf_count
-        self._hyper_names = frozenset(
-            name for namespace in engine._hyper_locations.values() for name in vars(namespace)
-        )
-        self._synced_hypers = [
-            {name: group[name] for name in self._hyper_names if name in group}
-            for group in self.param_groups
-        ]
+        self._hyper_names = hyper_names
+        self._synced_hypers = synced_hypers
 
     @torch.no_grad()
     def _sync_hypers_from_groups(self, *, force: bool) -> None:
+        changed = []
         for group_id, (param_group, synced) in enumerate(
             zip(self.param_groups, self._synced_hypers, strict=True)
         ):
@@ -531,9 +748,29 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                 if name not in param_group:
                     continue
                 value = param_group[name]
-                if force or not _same_hyper_value(value, synced.get(name)):
-                    self._engine.set_hyper(name, value, group_id=group_id)
-                    synced[name] = value
+                if force or not _matches_hyper_snapshot(value, synced.get(name)):
+                    changed.append((group_id, name, value, synced))
+        if not changed:
+            return
+
+        _validate_hyperparameter_domains(
+            type(self).__name__,
+            self._recipe,
+            self.param_groups,
+            self.defaults,
+        )
+        _validate_engine_hyperparameter_types(type(self).__name__, self.param_groups)
+        if self._fsdp2_mode and self._recipe is sf_adamw:
+            for _, name, value, _ in changed:
+                if name in {"caution", "cautious_weight_decay"} and not self._fsdp2_disabled(value):
+                    raise ValueError(
+                        f"{type(self).__name__}.fsdp2() requires caution=0 and "
+                        "cautious_weight_decay=0 because cautious normalization reduces over "
+                        "the full logical parameter."
+                    )
+        for group_id, name, value, synced in changed:
+            self._engine.set_hyper(name, value, group_id=group_id)
+            synced[name] = _snapshot_hyper(value)
 
     def step(
         self,
@@ -544,26 +781,28 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
 
         ``observed`` accepts one host bool per trainable parameter, either as a sequence in
         construction order or as a mapping containing every parameter. Marking a parameter
-        ``False`` prevents it from advancing on this step, which supports conditional/MoE branches
-        and temporarily frozen parameters whose persistent gradient slab received no gradient.
-        Omitting it preserves HeavyBall's default that every parameter is observed.
+        ``False`` prevents its HeavyBall parameter update, moments, decay, and clock from advancing.
+        It does not suppress DDP communication or mark a parameter unused in the autograd graph:
+        conditional DDP graphs still need ``find_unused_parameters=True``. Conditional FSDP2 graphs
+        need ``set_reduce_scatter_unused_params(True)``. Omitting the mask preserves HeavyBall's
+        default that every parameter is observed.
         """
 
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        if self._fsdp2_mode and self._recipe is sf_adamw:
-            for param_group in self.param_groups:
-                if not self._fsdp2_disabled(param_group["caution"]) or not self._fsdp2_disabled(
-                    param_group["cautious_weight_decay"]
-                ):
-                    raise ValueError(
-                        f"{type(self).__name__}.fsdp2() requires caution=0 and cautious_weight_decay=0 because cautious "
-                        "normalization reduces over the full logical parameter."
-                    )
         self._sync_hypers_from_groups(force=False)
-        self._engine.step(observed=observed)
+        try:
+            self._engine.step(observed=observed)
+        except ValueError as error:
+            message = str(error)
+            if "gradient for parameter" in message and "no longer slab-bound" in message:
+                raise ValueError(
+                    f"{message} When using DistributedDataParallel, set "
+                    "gradient_as_bucket_view=False."
+                ) from error
+            raise
         return loss
 
     @torch.no_grad()
@@ -771,9 +1010,17 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         dcp.save(state_dict, checkpoint_id=checkpoint_dir)
 
     @torch.no_grad()
-    def dcp_load(self, checkpoint_dir: str | os.PathLike[str]) -> None:
+    def dcp_load(self, checkpoint_dir: str | os.PathLike[str], *, trusted: bool = False) -> None:
         """Load and reshard an FSDP2 model and optimizer checkpoint onto the current world."""
 
+        if not trusted:
+            import warnings
+            warnings.warn(
+                "DCP checkpoint loading deserializes untrusted data and may execute arbitrary code. "
+                "Only load checkpoints from sources you trust. Pass trusted=True to suppress this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
         import torch.distributed.checkpoint as dcp
         from torch.distributed.tensor import DTensor
 
@@ -853,17 +1100,41 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             for value in loaded_engine["rng_seeds"].values():
                 if tuple(int(word) for word in value.detach().cpu()) != seed_words:
                     raise ValueError("DCP checkpoint RNG tensor does not match its fingerprint")
+            loaded_steps = tuple(loaded_engine["steps"].values())
+            step_by_target_id = {}
+            for target, value in zip(
+                self._engines[engine_index]._steps,
+                loaded_steps,
+                strict=True,
+            ):
+                if value.ndim != 0:
+                    raise ValueError(
+                        "DCP checkpoint steps must be non-negative scalar counters"
+                    )
+                loaded_step = int(value.detach().cpu())
+                if not 0 <= loaded_step < (1 << 63):
+                    raise ValueError(
+                        "DCP checkpoint steps must be non-negative scalar counters"
+                    )
+                step_by_target_id[id(target)] = loaded_step
             for group_index, group in enumerate(self._engines[engine_index].groups):
                 loaded_group = loaded_engine["groups"][str(group_index)]
                 loaded_leaves = tuple(int(value) for value in loaded_group["leaf_indices"].detach().cpu())
                 param_keys = tuple(self._engines[engine_index]._param_keys[id(param)] for param in group.params)
                 if loaded_leaves != tuple(leaf_indices[key] for key in param_keys):
                     raise ValueError("DCP checkpoint RNG tensor does not match its fingerprint")
-                if bool((loaded_group["age"] < 0).any().detach().cpu()):
-                    raise ValueError("DCP checkpoint ages must be non-negative")
-            for value in loaded_engine["steps"].values():
-                if value.ndim != 0 or int(value.detach().cpu()) < 0:
-                    raise ValueError("DCP checkpoint steps must be non-negative scalar counters")
+                loaded_age = loaded_group["age"]
+                group_step = step_by_target_id.get(id(group.step))
+                if group_step is None:
+                    raise ValueError(
+                        "DCP checkpoint step counters do not match their parameter groups"
+                    )
+                if bool(
+                    ((loaded_age < 0) | (loaded_age >= group_step)).any().detach().cpu()
+                ):
+                    raise ValueError(
+                        "DCP checkpoint ages must be non-negative and smaller than their step counter"
+                    )
         if len({engine["rng"]["seed"] for engine in saved_engines}) != 1:
             raise ValueError("DCP checkpoint Engine RNG seeds do not match")
 
@@ -879,6 +1150,15 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                 or set(saved_group["values"]) != set(expected_group["values"])
             ):
                 raise ValueError("DCP checkpoint parameter groups do not match this optimizer")
+        saved_value_groups = [dict(saved_group["values"]) for saved_group in saved_groups]
+        _validate_hyperparameter_domains(
+            type(self).__name__,
+            self._recipe,
+            saved_value_groups,
+            self.defaults,
+            allow_callable_cadence=False,
+        )
+        _validate_engine_hyperparameter_types(type(self).__name__, saved_value_groups)
 
     @staticmethod
     def _validate_dcp_cadence(saved: object, engine) -> None:
@@ -894,15 +1174,22 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             raise ValueError("cannot load a checkpoint into a callable cadence probability schedule")
         probability = saved["probability"]
         step = saved["step"]
+        cumulative = saved["cumulative"]
+        compensation = saved["compensation"]
         if (
-            not isinstance(probability, (int, float))
+            not isinstance(probability, Real)
             or isinstance(probability, bool)
+            or not math.isfinite(float(probability))
             or not 0 <= probability <= 1
             or not isinstance(step, int)
             or isinstance(step, bool)
-            or step < 0
-            or not isinstance(saved["cumulative"], (int, float))
-            or not isinstance(saved["compensation"], (int, float))
+            or not 0 <= step < (1 << 63)
+            or not isinstance(cumulative, Real)
+            or isinstance(cumulative, bool)
+            or not math.isfinite(float(cumulative))
+            or not isinstance(compensation, Real)
+            or isinstance(compensation, bool)
+            or not math.isfinite(float(compensation))
         ):
             raise ValueError("DCP checkpoint cadence state does not match this optimizer")
 
@@ -910,8 +1197,6 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
         saved_groups = metadata["param_groups"]
         for param_group, saved_group in zip(self.param_groups, saved_groups, strict=True):
             param_group.update(copy.deepcopy(saved_group["values"]))
-        # Engine hyper tensors were already restored above; adopt the public group values (the source of
-        # truth for scheduler-driven hypers) so a value changed after the last step is not kept stale.
         self._sync_hypers_from_groups(force=True)
         seeds = set()
         for engine, saved_engine in zip(self._engines, metadata["engines"], strict=True):
@@ -955,9 +1240,7 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             current_ecc = None if engine.ecc is None else (8 if engine.ecc is torch.int8 else 16)
             if saved_ecc != current_ecc:
                 raise ValueError("checkpoint ECC configuration does not match this optimizer")
-        # Stage a rollback snapshot so a failure ANYWHERE in the load -- Engine commit, Torch public
-        # commit, the post-load hyper sync, or the RNG-seed check -- leaves the optimizer unchanged
-        # (true atomicity in both directions). Swapping the two commits cannot provide this.
+        # Snapshot both layers because either half of checkpoint commit can fail.
         engine_snapshots = [engine.state_dict() for engine in self._engines]
         group_snapshots = [dict(group) for group in self.param_groups]
         state_snapshot = copy.deepcopy(self.state)
@@ -967,8 +1250,6 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
             for index, engine in enumerate(self._engines):
                 engine.load_state_dict(engine_states[index])
             super().load_state_dict(torch_state_dict)
-            # Push the restored public group hypers into the Engine cells, then validate RNG seeds.
-            # Both can fail on a malformed checkpoint, so they belong inside the transaction.
             self._sync_hypers_from_groups(force=True)
             seeds = {engine._rng_seed for engine in self._engines}
             if len(seeds) != 1:
@@ -1164,15 +1445,17 @@ class MSAM(HeavyBallOptimizer):
 
 
 class AdaMuon(HeavyBallOptimizer):
-    """AdaMuon: Muon's orthogonalized direction with elementwise second-moment normalization
-    (RMSprop), for 2D weights; AdamW on other parameters."""
+    """AdaMuon: apply Muon's polar iteration to the sign of its momentum, divide by the raw
+    elementwise second-moment RMS using the same momentum coefficient, and align the result to RMS
+    0.2 for 2D weights; use AdamW on other parameters."""
 
     recipe = adamuon
 
 
 class Aurora(HeavyBallOptimizer):
-    """Aurora: heavy-ball momentum with a leverage-balanced polar direction, for 2D weights;
-    AdamW on other parameters."""
+    """Aurora: apply two damped leverage-balancing/polar iterations to heavy-ball momentum for
+    tall 2D weights, with ``beta2`` as the damping coefficient; use Muon for other matrices and
+    AdamW for non-matrix parameters."""
 
     recipe = aurora
 
@@ -1185,8 +1468,9 @@ class Muon(HeavyBallOptimizer):
 
 
 class SpEL(HeavyBallOptimizer):
-    """SpEL: Muon's orthogonalized direction followed by a Stiefel-manifold retraction, for 2D
-    weights; AdamW on other parameters."""
+    """SpEL: project EMA momentum into the Stiefel tangent space, apply the stochastic matrix-sign
+    linear minimization oracle, and retract the update onto the manifold for 2D weights; use AdamW
+    on other parameters."""
 
     recipe = spel
 
@@ -1206,8 +1490,8 @@ class MuonLaProp(HeavyBallOptimizer):
 
 
 class NorMuon(HeavyBallOptimizer):
-    """NorMuon: Muon's orthogonalized direction with row/column second-moment normalization and
-    Frobenius-norm preservation, for 2D weights; AdamW on other parameters."""
+    """NorMuon: orthogonalize EMA momentum, normalize it by a raw row-wise second moment, and set
+    its RMS to 0.2 for 2D weights; use AdamW on other parameters."""
 
     recipe = normuon
 
@@ -1460,24 +1744,76 @@ class SplitOpt(torch.optim.Optimizer):
         if len({id(p) for p in all_params}) != len(all_params):
             raise ValueError("A parameter cannot belong to multiple SplitOpt optimizers")
         self.optimizers = [cls(params, **kwargs) for cls, params, kwargs in normalized]
+        self._params_by_optimizer = tuple(
+            tuple(param for group in optimizer.param_groups for param in group["params"])
+            for optimizer in self.optimizers
+        )
         self._initializing = True
         try:
             super().__init__(all_params, {})
         finally:
             self._initializing = False
+        self.param_groups = [
+            group for optimizer in self.optimizers for group in optimizer.param_groups
+        ]
 
-    def step(self, closure=None):
+    def step(self, closure=None, observed=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        for opt in self.optimizers:
-            opt.step()
+        if observed is None:
+            child_observed = (None,) * len(self.optimizers)
+        elif isinstance(observed, Mapping):
+            all_params = tuple(
+                param for params in self._params_by_optimizer for param in params
+            )
+            if len(observed) != len(all_params):
+                raise ValueError("observed must contain every trainable parameter")
+            try:
+                values = tuple(observed[param] for param in all_params)
+            except KeyError as error:
+                raise ValueError(
+                    "observed must contain every trainable parameter"
+                ) from error
+            if any(not isinstance(value, bool) for value in values):
+                raise TypeError("observed values must be host bools")
+            child_observed = tuple(
+                {param: observed[param] for param in params}
+                for params in self._params_by_optimizer
+            )
+        else:
+            values = tuple(observed)
+            expected = sum(len(params) for params in self._params_by_optimizer)
+            if len(values) != expected:
+                raise ValueError(
+                    "observed must contain one value for every trainable parameter"
+                )
+            if any(not isinstance(value, bool) for value in values):
+                raise TypeError("observed values must be host bools")
+            child_values = []
+            offset = 0
+            for params in self._params_by_optimizer:
+                child_values.append(values[offset : offset + len(params)])
+                offset += len(params)
+            child_observed = tuple(child_values)
+        for opt, mask in zip(self.optimizers, child_observed, strict=True):
+            opt.step(observed=mask)
         return loss
 
     def zero_grad(self, set_to_none=False):
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=set_to_none)
+
+    def train(self, mode=True):
+        for opt in self.optimizers:
+            opt.train(mode)
+        return self
+
+    def eval(self):
+        for opt in self.optimizers:
+            opt.eval()
+        return self
 
     def state_dict(self):
         return {
@@ -1492,8 +1828,6 @@ class SplitOpt(torch.optim.Optimizer):
         expected = [f"{type(opt).__module__}.{type(opt).__qualname__}" for opt in self.optimizers]
         if state_dict["classes"] != expected:
             raise ValueError(f"Expected optimizer classes {expected}, got {state_dict['classes']}")
-        # Commit all children atomically: a failure loading one child (e.g. a fingerprint mismatch)
-        # must not leave earlier children mutated.
         snapshots = [opt.state_dict() for opt in self.optimizers]
         try:
             for opt, state in zip(self.optimizers, states, strict=True):

@@ -1,11 +1,6 @@
 """Proofs for the slab-native matrix preconditioners."""
 
-import os
-import re
-import subprocess
-import sys
 from dataclasses import replace
-from pathlib import Path
 
 import torch
 
@@ -148,46 +143,30 @@ def test_soap_refresh_transports():
     assert not torch.equal(state["GG_r"], expected_right)
 
 
-def _compiled_code(tmp_path: Path, step_type: str) -> str:
-    source = f"""
-import torch
-from heavyball.core import Engine
-from heavyball.matrix import soap_recipe
+def test_soap_normal_and_refresh_are_stable_fullgraphs():
+    """Normal preserves the basis, refresh changes it, and each host path compiles once."""
 
-params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
-optimizer = Engine(params, soap_recipe)
-optimizer.groups[0].grad_slab.normal_()
-optimizer.step(step_type={step_type!r})
-"""
-    environment = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / step_type))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = re.findall(r"Output code written to: (.*\.py)", output)
-    assert paths, output
-    return Path(paths[-1]).read_text()
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
+        optimizer = Engine(params, soap_recipe)
+        state = optimizer.groups[0].states[0]
+        initial_left = state["Q_l"].clone()
+        gradient = torch.arange(1, 25, dtype=torch.float32).reshape(2, 3, 4)
 
+        optimizer.groups[0].grad_slab.copy_(gradient)
+        optimizer.step(step_type="normal")
+        torch.testing.assert_close(state["Q_l"], initial_left, rtol=0, atol=0)
+        normal_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        optimizer.step(step_type="normal")
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == normal_graphs == 1
 
-def test_soap_fullgraph_clean(tmp_path):
-    """Normal SOAP is QR-free; the host-selected refresh graph contains QR."""
-
-    normal = _compiled_code(tmp_path, "normal").lower()
-    refresh = _compiled_code(tmp_path, "refresh").lower()
-    assert "linalg_qr" not in normal
-    assert "linalg_qr" in refresh
-    for artifact in (normal, refresh):
-        assert "torch.stack" not in artifact
-        assert "_local_scalar_dense" not in artifact
-        assert ".item(" not in artifact
-
-    source = Path(soap.__module__.replace(".", "/") + ".py")
-    if not source.exists():
-        source = Path(__file__).parents[1] / "heavyball" / "matrix.py"
-    text = source.read_text()
-    assert not re.search(r"_foreach|vmap|torch\.cond|dynamic=True|torch\.stack|\.item\(|\benabled\b|\bamp\b", text)
+        optimizer.step(step_type="refresh")
+        assert not torch.equal(state["Q_l"], initial_left)
+        refresh_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        optimizer.step(step_type="refresh")
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == refresh_graphs == 2
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()

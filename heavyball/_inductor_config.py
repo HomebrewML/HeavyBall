@@ -70,7 +70,4 @@ class OptimizerCSE(CustomGraphPass):
 
 
 OPTIMIZER_CSE = OptimizerCSE()
-# max_autotune is the minimum we need for fast kernels (it is what the "max-autotune" preset enables).
-# We pass it as an option (not mode=) so it composes with our scalar-CSE pass; no cudagraphs, matching
-# the prior "max-autotune-no-cudagraphs" behavior.
 STEP_COMPILE_OPTIONS = {"max_autotune": True, "post_grad_custom_pre_pass": OPTIMIZER_CSE}

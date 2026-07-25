@@ -1,15 +1,11 @@
 import torch
 
-from heavyball.kron import _max_singular_value_power_iter
+from heavyball.kron import _max_singular_value_power_iter, _next_lower_bound
 
 
 def test_power_iter_adversarial_underestimate():
-    """The top-2-row seeding misses the dominant direction when those rows are orthogonal to it.
+    """The estimate remains a valid nonnegative lower bound on an adversarial matrix."""
 
-    This documents the known limitation: _max_singular_value_power_iter is a LOWER BOUND,
-    not an exact spectral norm. PSGD's running_lower_bound EMA and precond_lr provide safety.
-    """
-    # Construct: 2 rows [0, 2], 100 rows [1, 0]. True sigma_max = 10.
     n_dominant = 100
     n_orthogonal = 2
     matrix = torch.zeros(1, n_dominant + n_orthogonal, 2, dtype=torch.float64)
@@ -19,13 +15,23 @@ def test_power_iter_adversarial_underestimate():
     true_sigma = torch.linalg.svdvals(matrix[0]).max()
     estimated = _max_singular_value_power_iter(matrix, power_iterations=16)
 
-    # True sigma is 10
-    assert abs(true_sigma.item() - 10.0) < 1e-10
-    # Estimated is ~2.83 (sqrt(8)), NOT 10
-    assert estimated.item() < 5.0, f"Expected underestimate, got {estimated.item()}"
-    # The underestimate ratio: estimated/true < 0.5
-    ratio = estimated.item() / true_sigma.item()
-    assert ratio < 0.5, f"Expected significant underestimate, ratio={ratio}"
+    assert estimated.item() >= 0.0
+    assert estimated.item() <= true_sigma.item() * (1 + 1e-12)
+
+
+def test_running_lower_bound_keeps_psgd_step_safe_under_an_underestimate():
+    """A stale high-curvature history keeps the normalized factor step below one."""
+
+    true_norm = torch.tensor(10.0, dtype=torch.float64)
+    underestimate = torch.tensor(2.0, dtype=torch.float64)
+    beta = torch.tensor(0.9, dtype=torch.float64)
+    precond_lr = torch.tensor(0.1, dtype=torch.float64)
+
+    divisor, next_bound = _next_lower_bound(underestimate, true_norm, beta)
+    effective_step = precond_lr * true_norm / divisor
+
+    torch.testing.assert_close(divisor, next_bound, rtol=0, atol=0)
+    assert effective_step < 1
 
 
 def test_power_iter_random_matrices_accurate():
@@ -68,8 +74,6 @@ def test_power_iter_batched():
 
 def test_running_lower_bound_catches_up():
     """The running_lower_bound EMA eventually recovers from an underestimate."""
-    from heavyball.kron import _next_lower_bound
-
     # Simulate: true ell=10, but power iter gives 2.83 for first few steps,
     # then corrects to 10 (as the matrix evolves).
     lower_bound = torch.tensor(0.0, dtype=torch.float64)

@@ -30,7 +30,7 @@ def test_default_observed_not_rebuilt_every_step(monkeypatch):
     for _ in range(6):
         optimizer.step()
 
-    assert rebuilds <= 1
+    assert rebuilds == 0
 
 
 def test_changing_observed_mask_still_applies():

@@ -104,9 +104,13 @@ neither momentum nor Nesterov; it is not the full `torch.optim.SGD` algorithm.
   gradient slab must remain bound.
 - By default, every optimized parameter advances on every `step()`, including its weight decay,
   state, and age, even if backward did not touch that parameter.
-- Conditional, MoE, temporarily frozen, and unused-parameter workflows must pass `observed=` to
-  `step()`. Supply one host `bool` per trainable parameter in construction order, or a mapping that
-  contains every trainable parameter. A `False` leaf does not update its parameter, state, or age.
+- `observed=` controls HeavyBall's optimizer activity only. Supply one host `bool` per trainable
+  parameter in construction order, or a mapping containing every trainable parameter. A `False`
+  leaf does not advance its parameter, moments, decay, or clock, but this mask does not change the
+  autograd graph or suppress DDP/FSDP collectives. Conditional or MoE graphs under DDP still require
+  `find_unused_parameters=True`; pass `observed=` as well so HeavyBall does not advance inactive
+  leaves. Under FSDP2, conditional graphs require `set_reduce_scatter_unused_params(True)` in
+  addition to the HeavyBall mask.
 - Hyperparameters are keyword-only. HeavyBall names separate `beta1` and `beta2` arguments rather
   than PyTorch's `betas` tuple, and it does not expose PyTorch implementation switches such as
   `foreach` or `fused`.
@@ -120,15 +124,16 @@ neither momentum nor Nesterov; it is not the full `torch.optim.SGD` algorithm.
 | CPU | Supported through the same compile-first Engine. |
 | CUDA | Supported; the shipped performance harness requires CUDA. |
 | AMP | Autocast and the standard `torch.amp.GradScaler` path work with the dense persistent gradient buffers. CPU autocast plus `GradScaler` was exercised in this pass; CUDA AMP was not rerun here. State precision is configured separately with `storage_dtype` or `ecc`. |
-| DDP | Supported. Construct HeavyBall after device placement and before `DistributedDataParallel(model)`. |
+| DDP | Supported with `gradient_as_bucket_view=False` (the DDP default). Construct HeavyBall after device placement and before `DistributedDataParallel(model)`. Conditional graphs still require `find_unused_parameters=True`; `observed=` does not replace DDP unused-parameter detection. |
 | FSDP2 | Implemented for recipes reported as supported by `heavyball.describe(name)`. Call `fully_shard(model)` first, then `heavyball.AdamW.fsdp2(model, ...)`; do not pass the DTensor parameters to the plain constructor. |
 | HSDP | The FSDP2 adapter accepts a 2-D device mesh named `("replicate", "shard")`; use the same `.fsdp2(model)` path. |
 | Sparse gradients | Sparse gradient storage is not preserved: HeavyBall binds a dense persistent gradient slab. |
-| Unused/conditional parameters | No automatic grad-`None` detection. Pass the complete `observed=` activity mask on every conditional step. |
+| Unused/conditional parameters | No automatic grad-`None` detection. Pass the complete `observed=` activity mask on every conditional step to stop HeavyBall state advancement. DDP also needs `find_unused_parameters=True`; FSDP2 needs `set_reduce_scatter_unused_params(True)`. |
 | Tied weights | A single shared `nn.Parameter` is supported because it appears once in `model.parameters()`. Distinct `nn.Parameter` objects with overlapping storage are rejected. The `register_truegrad()` observation helper rejects tied/shared parameters. |
 
-FSDP2 also rejects `clip_global_norm`, recipes whose callable scopes are not supported, scalar
-parameters sharded on dimension 0, and parameters that were not managed by `fully_shard`.
+FSDP2 also rejects `clip_global_norm`, observation-bearing recipes such as TrueGrad, recipes whose
+callable scopes are not supported, scalar parameters sharded on dimension 0, and parameters that
+were not managed by `fully_shard`.
 
 ## Compile lifecycle and cache
 

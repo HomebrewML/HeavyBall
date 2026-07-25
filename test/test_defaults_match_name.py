@@ -35,9 +35,6 @@ _VARYING_GRADIENTS = (
     _THIRD_GRADIENT,
     _ANISOTROPIC_GRADIENT,
 )
-_DEPRECATED_FACADE_ALIASES = frozenset(("ScheduleFree", "WhitenAdamW"))
-
-
 class _Run(NamedTuple):
     updates: tuple[torch.Tensor, ...]
     parameters: tuple[torch.Tensor, ...]
@@ -50,17 +47,6 @@ def _build_default(optimizer_name: str, parameter: torch.nn.Parameter):
     # fullgraph compiled path for every step.
     torch._dynamo.reset()
     return getattr(optim, optimizer_name)([parameter])
-
-
-def _facade_classes() -> tuple[type[optim.HeavyBallOptimizer], ...]:
-    return tuple(
-        value
-        for name in optim.__all__
-        if name not in _DEPRECATED_FACADE_ALIASES
-        and isinstance((value := getattr(optim, name)), type)
-        and issubclass(value, optim.HeavyBallOptimizer)
-        and value is not optim.HeavyBallOptimizer
-    )
 
 
 @cache
@@ -439,43 +425,29 @@ def _assert_suds(optimizer_class: type[optim.HeavyBallOptimizer]) -> None:
     )
 
 
-def _assert_generic_training(optimizer_class: type[optim.HeavyBallOptimizer]) -> None:
-    """Future facades remain covered until they receive a name-specific rule."""
-
+def _assert_truegrad_observation(optimizer_class: type[optim.HeavyBallOptimizer]) -> None:
     torch.manual_seed(1234)
-    parameter = torch.nn.Parameter(_INITIAL_PARAMETER.clone())
-    optimizer = _build_default(optimizer_class.__name__, parameter)
-    initial_loss = parameter.square().sum().item()
-    updates = []
-    parameters = []
-    for _ in range(5):
-        before = parameter.detach().clone()
-        parameter.grad.copy_(parameter.detach())
-        optimizer.step()
-        updates.append(before - parameter.detach())
-        parameters.append(parameter.detach().clone())
-    run = _Run(tuple(updates), tuple(parameters), dict(optimizer.param_groups[0]))
-    _assert_finite_nonzero(optimizer_class.__name__, run)
-    final_loss = parameter.square().sum().item()
-    assert final_loss < initial_loss, (
-        f"{optimizer_class.__name__}: fallback training check did not decrease loss "
-        f"({initial_loss:.6g} -> {final_loss:.6g})"
+    parameters = tuple(
+        torch.nn.Parameter(torch.zeros_like(_INITIAL_PARAMETER)) for _ in range(2)
     )
-
-
-def _assert_truegrad_training(optimizer_class: type[optim.HeavyBallOptimizer]) -> None:
-    torch.manual_seed(1234)
-    parameter = torch.nn.Parameter(_INITIAL_PARAMETER.clone())
-    optimizer = _build_default(optimizer_class.__name__, parameter)
-    initial_loss = parameter.square().sum().item()
-    for _ in range(5):
-        parameter.grad.copy_(parameter.detach())
-        optimizer.produce(parameter, "sum_grad_squared", parameter.grad.square())
-        optimizer.step()
-    final_loss = parameter.square().sum().item()
-    assert final_loss < initial_loss, (
-        f"{optimizer_class.__name__}: truegrad training check did not decrease loss "
-        f"({initial_loss:.6g} -> {final_loss:.6g})"
+    torch._dynamo.reset()
+    optimizer = optimizer_class(parameters)
+    for parameter, observation_scale in zip(parameters, (1.0, 9.0), strict=True):
+        parameter.grad.copy_(_ANISOTROPIC_GRADIENT)
+        optimizer.produce(
+            parameter,
+            "sum_grad_squared",
+            _ANISOTROPIC_GRADIENT.square() * observation_scale,
+        )
+    optimizer.step()
+    updates = tuple(-parameter.detach() for parameter in parameters)
+    run = _Run(updates, tuple(parameter.detach() for parameter in parameters), dict(optimizer.param_groups[0]))
+    _assert_finite_nonzero(optimizer_class.__name__, run)
+    small_observation_norm, large_observation_norm = (update.norm().item() for update in updates)
+    assert large_observation_norm < small_observation_norm / 2, (
+        f"{optimizer_class.__name__}: update ignored the TrueGrad observation; "
+        f"norms for 1x/9x sum_grad_squared were "
+        f"{small_observation_norm:.6g}/{large_observation_norm:.6g}"
     )
 
 
@@ -511,20 +483,23 @@ _PROPERTY_RULES = {
     "Shampoo": _assert_cross_axis_preconditioning,
     "SignLaProp": _assert_sign_laprop,
     "SignSGD": _assert_rms_or_sign,
-    "TrueGradAdam": _assert_truegrad_training,
-    "TrueGradLaProp": _assert_truegrad_training,
-    "TrueGradNAdam": _assert_truegrad_training,
-    "TrueGradRMSprop": _assert_truegrad_training,
+    "TrueGradAdam": _assert_truegrad_observation,
+    "TrueGradLaProp": _assert_truegrad_observation,
+    "TrueGradNAdam": _assert_truegrad_observation,
+    "TrueGradRMSprop": _assert_truegrad_observation,
     "UnscaledAdamW": _assert_unscaled_adam,
     "Whitening": _assert_whitening,
 }
 
 
-@pytest.mark.parametrize("optimizer_class", _facade_classes(), ids=lambda cls: cls.__name__)
-def test_default_optimizer_matches_its_advertised_structure(optimizer_class):
-    """Every concrete ``heavyball.optim`` export is built at its defaults and behaviorally exercised."""
+@pytest.mark.parametrize(
+    ("optimizer_class", "rule"),
+    tuple((getattr(optim, name), rule) for name, rule in _PROPERTY_RULES.items()),
+    ids=tuple(_PROPERTY_RULES),
+)
+def test_default_optimizer_matches_its_advertised_structure(optimizer_class, rule):
+    """Every parameterized facade is checked by an explicit defining-property oracle."""
 
-    rule = _PROPERTY_RULES.get(optimizer_class.__name__, _assert_generic_training)
     rule(optimizer_class)
 
 

@@ -7,18 +7,11 @@ from .numerics import _caution, _strictly_aligned, _wide, broadcast_leaf, stable
 from .transforms import beta_debias
 
 
-def _stable_l2_normalize(update: Tensor, *, eps: float) -> Tensor:
-    """Normalize each slab leaf through the shared stable-L2 primitive."""
-
-    flat = update.flatten(start_dim=1)
-    return stable_l2_normalize(flat, dim=1, eps=eps).reshape_as(update)
-
-
 def msam_commit_init(reference: Tensor) -> dict[str, Tensor]:
     """Seed MSAM's unperturbed master, momentum, and the perturbed iterate saved across eval."""
 
     ref = _wide(reference)
-    # z is the fp32 master: a low-precision parameter must not quantize the long-lived iterate.
+    # The fp32 master must not be quantized through a low-precision parameter.
     return {"z": ref.clone(), "exp_avg": torch.zeros_like(ref), "saved": reference.clone()}
 
 
@@ -45,8 +38,9 @@ def msam_commit(param: Tensor, update: Tensor, state: dict[str, Tensor], tempo):
         decay,
     )
     z_new = z * (1 - decay * lr) + filtered_exp_avg * -lr
-    # Per-leaf normalization is deliberate (adaptive, like AGC vs global clipping), diverging from MSAM's single global-momentum normalization.
-    perturbed_param = z_new - _stable_l2_normalize(filtered_exp_avg, eps=1e-8) * sam_step_size
+    flat_exp_avg = filtered_exp_avg.flatten(start_dim=1)
+    normalized_exp_avg = stable_l2_normalize(flat_exp_avg, dim=1, eps=1e-8).reshape_as(filtered_exp_avg)
+    perturbed_param = z_new - normalized_exp_avg * sam_step_size
     return perturbed_param, {"z": z_new, "exp_avg": exp_avg_new, "saved": state["saved"]}
 
 

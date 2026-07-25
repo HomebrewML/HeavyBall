@@ -48,6 +48,8 @@ def test_identity_basis_reduces_to_inner(recipe, inner, transported, extra_hyper
     torch.manual_seed(0)
     init = torch.randn(3, 4, dtype=torch.float64)
     grads = [torch.randn(3, 4, dtype=torch.float64) for _ in range(8)]
+    for step, gradient in enumerate(grads, start=1):
+        gradient[0, 0] = (-1) ** step * step * 1e-6
     hyper = {**_BASE_HYPER, **extra_hyper}
 
     with _eager():
@@ -98,7 +100,7 @@ def _hadamard_square(second_moment, left_old, left_new, right_old, right_new):
     # The diagonal variance re-expressed in the new basis: each variance rotates as the squared change.
     left = (left_old.mT @ left_new).square()
     right = (right_old.mT @ right_new).square()
-    return torch.einsum("ab,ac,bd->cd", second_moment, left, right)
+    return torch.einsum("ab,ac,bd->cd", second_moment.square(), left, right).clamp_min(0).sqrt()
 
 
 @pytest.mark.parametrize("recipe,inner,transported,extra_hyper,inner_keys", _VARIANTS)

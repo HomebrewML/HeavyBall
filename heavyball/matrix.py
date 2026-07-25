@@ -20,7 +20,6 @@ from .numerics import _wide, broadcast_leaf
 from .transforms import (
     WHOLE,
     Tempo,
-    _eigh_regularized_root,
     _eigh_scaled_gram_decomposition,
     _root_requires_spectral_application,
     adam,
@@ -125,13 +124,6 @@ def _project(
     return torch.einsum("nij,nia,njb->nab", gradient, left, right)
 
 
-def _gram_value(gram: Tensor, scale: Tensor) -> Tensor:
-    """Materialize a scaled Gram transiently in fp64 for a refresh."""
-
-    scale = broadcast_leaf(scale.double(), gram)
-    return gram.double() * scale.square()
-
-
 def _combine_gram(
     gram: Tensor,
     scale: Tensor,
@@ -173,12 +165,6 @@ def _accumulate_gram(
 ) -> tuple[Tensor, Tensor]:
     ones = torch.ones_like(scale)
     return _combine_gram(gram, scale, outer, outer_scale, ones, ones)
-
-
-def _outer(a: Tensor, b: Tensor) -> Tensor:
-    """Batched outer product in fp64 for callers that need the physical value."""
-
-    return a.double() @ b.double()
 
 
 def _scaled_outer(a: Tensor, b: Tensor) -> tuple[Tensor, Tensor]:
@@ -313,9 +299,7 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
         old_left = _wide(state["Q_l"]) if "GG_l" in state else None
         old_right = _wide(state["Q_r"]) if "GG_r" in state else None
         projected = _project(update, old_left, old_right, back=False)
-        # Inner bias-corrects by the per-leaf update count (age), matching SOAP (arXiv:2409.11321) and the
-        # official soap.py, and consistent with the Gram/transport side below. (Legacy SOAP keyed the inner
-        # on the global step; identical when always observed, wrong for leaves skipped via observed=.)
+        # Per-leaf age keeps bias correction valid when observations skip a leaf.
         preconditioned, inner_state, _ = inner(projected, obs, param, state, tempo)
         preconditioned = _project(preconditioned, old_left, old_right, back=True)
 
@@ -353,12 +337,11 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
                 next_left = _qr_basis(next_gg_left, old_left)
             if next_gg_right is not None:
                 next_right = _qr_basis(next_gg_right, old_right)
-            # The set is configurable because multi-moment inners like AdEMAMix must rotate every first moment with the basis.
             for name in transported:
                 inner_state[name] = _transport_exp_avg(
                     inner_state[name], old_left, old_right, next_left, next_right
                 )
-            # RMS slots represent diagonal variances; without this transport they stay in the stale basis.
+            # Diagonal variances must be transported when the basis changes.
             for name in squared:
                 inner_state[name] = _transport_exp_avg_sq(
                     inner_state[name], old_left, old_right, next_left, next_right
@@ -399,10 +382,6 @@ soap_nadam = _soap_factory(nadam)
 soap_nadam.__name__ = "soap_nadam"
 soap_ademamix = _soap_factory(ademamix, transported=("exp_avg_fast", "exp_avg_slow"))
 soap_ademamix.__name__ = "soap_ademamix"
-
-
-def _inverse_fourth_root(gram: Tensor, eps: Tensor) -> Tensor:
-    return _eigh_regularized_root(gram, eps, -0.25)
 
 
 def shampoo_init(ref_leaf: Tensor, *, max_precond_dim: Tensor) -> dict[str, Tensor]:
@@ -588,7 +567,6 @@ shampoo_recipe = Recipe(
     ),
 )
 
-# Short recipe aliases keep transform names available for composition.
 soapw = soap_recipe
 solpw = solp_recipe
 soap_nadamw = soap_nadam_recipe

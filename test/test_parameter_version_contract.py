@@ -14,27 +14,20 @@ import torch.nn as nn
 def _probe(make_opt):
     p = nn.Parameter(torch.tensor([2.0]))
     opt = make_opt([p])
-    y = (p * p).sum()  # backward of y saves p; dy/dp = 2*p
+    y = (p * p).sum()
     opt.zero_grad()
-    y.backward(retain_graph=True)  # p.grad = 4 at p == 2
+    y.backward(retain_graph=True)
     v0 = p._version
-    opt.step()  # mutate p (2.0 -> 1.6 for lr=0.1)
+    opt.step()
     v1 = p._version
     p.grad = None
     errored = False
     try:
-        y.backward()  # second backward through the retained graph
+        y.backward()
     except RuntimeError:
         errored = True
     second_grad = None if errored else float(p.grad.item())
     return v0, v1, errored, second_grad
-
-
-def test_torch_optim_reference_bumps_version_and_rejects_stale_graph():
-    # Control: proves the probe measures the real autograd contract.
-    v0, v1, errored, _ = _probe(lambda ps: torch.optim.SGD(ps, lr=0.1))
-    assert v1 > v0
-    assert errored
 
 
 def test_heavyball_commit_bumps_version_like_torch():

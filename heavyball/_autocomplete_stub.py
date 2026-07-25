@@ -5,7 +5,6 @@ from pathlib import Path
 from heavyball import optim
 from heavyball.optim import HeavyBallOptimizer, _facade_hyperparameters
 
-# Parameters may be supplied as an iterable of tensors or of parameter-group dicts.
 _PARAMS_TYPE = "Iterable[Tensor] | Iterable[Mapping[str, object]]"
 
 
@@ -20,9 +19,6 @@ def _render_init(hyperparameters: tuple[tuple[str, type, object], ...]) -> list[
         if isinstance(annotation, str):
             rendered = annotation
         elif default is None:
-            # Sentinel-None recipe hypers (e.g. AdamC ``max_lr``, which inherits ``lr``)
-            # are numeric references; render a nullable numeric type rather than the bare
-            # ``NoneType`` name, which is undefined in the stub scope.
             rendered = "float | None"
         else:
             rendered = annotation.__name__
@@ -72,9 +68,6 @@ def render() -> str:
         lines.extend(("", "", f"class {name}(HeavyBallOptimizer):"))
         lines.extend(_render_init(_facade_hyperparameters(facade.recipe)))
 
-    # SplitOpt is a public optimizer that delegates groups to distinct HeavyBall facades; it
-    # subclasses Optimizer directly (not HeavyBallOptimizer), so declare it explicitly to keep the
-    # ``__all__`` export honest and the F822 undefined-name check green.
     if "SplitOpt" in optim.__all__:
         lines.extend((
             "",

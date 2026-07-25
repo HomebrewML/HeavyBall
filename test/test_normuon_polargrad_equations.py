@@ -58,10 +58,10 @@ def test_polargrad_is_polar_factor_times_nuclear_norm(shape):
 
 def _perrow_normuon(dm, eps=1e-7):
     # NorMuon Alg. 1: reduce O*O across columns (the `in` axis) -> per output-neuron (row) vector,
-    # normalize, then restore the Frobenius norm.
-    v = dm.square().mean(dim=-1, keepdim=True)
-    normed = dm * v.clamp_min(eps).rsqrt()
-    return normed * (dm.norm() / normed.norm().clamp_min(eps))
+    # update the raw second moment, normalize, then set the matrix RMS to 0.2.
+    v = (1 - 0.95) * dm.square().mean(dim=-1, keepdim=True)
+    normed = dm / (v.sqrt() + eps)
+    return normed * (0.2 * dm.numel() ** 0.5 / normed.norm())
 
 
 @pytest.mark.parametrize("shape", [(8, 4), (16, 3), (4, 8), (3, 16)])
@@ -75,4 +75,4 @@ def test_normuon_normalizes_per_output_neuron(shape):
     state = {"moment2": normuon_normalize_init(d)["moment2"]}
     got = normuon_normalize(d.clone(), None, None, state, _tempo(1))[0][0]
     ref = _perrow_normuon(d[0])
-    assert _cos(got, ref) > 0.999, f"{shape}: normuon axis diverges from per-output-neuron (cos={_cos(got, ref):.4f})"
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)

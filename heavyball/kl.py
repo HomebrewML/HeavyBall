@@ -401,7 +401,7 @@ def kl_soap(update: Tensor, obs, param: Tensor, state: dict[str, Tensor], tempo:
     exp_avg = next_state["exp_avg"] * beta1 + projected * (1 - beta1)
     prior_exp_avg_sq = _wide(state["exp_avg_sq"])
     if tempo.refresh:
-        # The prior second moment lives in the old basis; rebase it before blending new-basis squares.
+        # The prior second moment must be rebased before blending new-basis squares.
         old_left = _wide(state["Q_l"]) if "GG_l" in state else None
         old_right = _wide(state["Q_r"]) if "GG_r" in state else None
         prior_exp_avg_sq = _transport_exp_avg_sq(

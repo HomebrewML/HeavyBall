@@ -24,16 +24,14 @@ from .transforms import WHOLE, Tempo, sgd_commit
 def _apply_once(update: Tensor, q0: Tensor, q1: Tensor) -> Tensor:
     """Apply one Q factor along each matrix dimension, as legacy QSGD does."""
 
-    # Contract pairwise: the 3-operand form materializes an O(n^4) intermediate without opt_einsum.
+    # Pairwise contraction avoids an O(n⁴) three-operand intermediate.
     return torch.einsum("nib,njb->nij", torch.einsum("nia,nab->nib", q0, update), q1)
 
 
 def _apply_once_mixed(update: Tensor, q0: Tensor, q1: Tensor) -> Tensor:
     """Apply mixed diagonal/triangular Q factors once, as legacy QSGD does."""
 
-    # Scale by the diagonal factor elementwise, then contract pairwise: the 3-operand form
-    # materializes an O(n^3) diagonal-outer-product intermediate without opt_einsum (OOM on
-    # oversized rectangular layers).
+    # Branching avoids an O(n³) three-operand intermediate.
     if q0.ndim == 2 and q1.ndim == 3:
         return torch.einsum("...ab,...Bb->...aB", q0.unsqueeze(-1) * update, q1)
     if q0.ndim == 3 and q1.ndim == 2:
@@ -235,10 +233,6 @@ def _partial_contraction_nfactor(update: Tensor, index: int, triangular: bool) -
     return flat.square().sum(dim=-1)
 
 
-def _balance_nfactor(factors: list[Tensor]) -> list[Tensor]:
-    return balance_factors(factors)
-
-
 def _refresh_nfactor(
     update: Tensor,
     factors: list[Tensor],
@@ -246,7 +240,7 @@ def _refresh_nfactor(
     tempo: Tempo,
     power_iterations: int,
 ) -> tuple[list[Tensor], list[Tensor]]:
-    factors = _balance_nfactor(factors)
+    factors = balance_factors(factors)
     damping = tempo.hyper.dampening + torch.finfo(update.dtype).eps * update.abs()
     preconditioned = _precondition_nfactor(update + damping * tempo.randn_like(update), factors)
     next_factors = []

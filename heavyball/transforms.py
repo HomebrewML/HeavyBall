@@ -136,10 +136,6 @@ class Tempo(NamedTuple):
         key0 = (base_seed[0] + folded0).bitwise_and(mask)
         key1 = (base_seed[1] + folded1_low + folded1_high).bitwise_and(mask)
 
-        # The default parameter path uses Philox-4x32-7 (BigCrush-passing). 10 unrolled rounds spill
-        # (~1ms/round of spill traffic: 10->11.6, 9->10.4, 8->9.1, 7->8.6 ms/step on 151M bf16 Adam);
-        # 7 rounds fit, so stochastic rounding is nearly free (8.6 vs 8.58 no-SR) and precision vs the
-        # fp64 ideal is unchanged (err 0.259 -> 0.268; torch bf16 is 4.17).
         for _ in range(self.rounds):
             high0, low0 = mulhilo32(counter0, round0)
             high1, low1 = mulhilo32(counter2, round1)
@@ -152,7 +148,6 @@ class Tempo(NamedTuple):
             key0 = (key0 + bump0).bitwise_and(mask)
             key1 = (key1 + bump1).bitwise_and(mask)
 
-        # The upper 24 bits convert exactly to float32 values in [0, 1).
         output = counter0 if _stream == 0 else counter1
         return (output.bitwise_right_shift(8).float() * (2.0**-24)).reshape(value.shape)
 
@@ -164,24 +159,6 @@ class Tempo(NamedTuple):
         radius = (-2.0 * torch.log1p(-uniform0)).sqrt()
         gaussian = radius * torch.cos((2.0 * math.pi) * uniform1)
         return gaussian.to(value.dtype)
-
-
-def _eigh_regularized_decomposition(
-    gram: Tensor, eps: Tensor, exponent: float
-) -> tuple[Tensor, Tensor]:
-    """Return eigenvectors and a regularized root with relative null-space classification."""
-
-    regularized = gram * 0.5 + gram.mH * 0.5 + eps * torch.eye(  # halve before adding: no overflow near fp32 max
-        gram.shape[-1], dtype=gram.dtype, device=gram.device
-    )
-    values, vectors = torch.linalg.eigh(regularized)
-    signal = (values - eps).clamp_min(0)
-    maximum = signal.amax(dim=-1, keepdim=True)
-    roundoff = gram.shape[-1] * torch.finfo(gram.dtype).eps * maximum
-    rooted = values.clamp_min(eps).pow(exponent)
-    null_root = torch.as_tensor(eps, dtype=values.dtype, device=values.device).pow(exponent)
-    rooted = torch.where(signal <= roundoff, null_root, rooted)
-    return vectors, rooted
 
 
 def _eigh_scaled_gram_decomposition(
@@ -215,39 +192,11 @@ def _eigh_scaled_gram_decomposition(
     return vectors, rooted
 
 
-def _eigh_regularized_root(gram: Tensor, eps: Tensor, exponent: float) -> Tensor:
-    """Materialize a symmetric regularized matrix root."""
-
-    vectors, rooted = _eigh_regularized_decomposition(gram, eps, exponent)
-    return (vectors * rooted.unsqueeze(-2)) @ vectors.mT
-
-
-def _spectral_root_application(
-    value: Tensor,
-    vectors: Tensor,
-    rooted: Tensor,
-    *,
-    left: bool,
-) -> Tensor:
-    """Apply a matrix root in spectral coordinates without materializing ill-conditioned sums."""
-
-    value = value.to(vectors.dtype)
-    if left:
-        return vectors @ (rooted.unsqueeze(-1) * (vectors.mT @ value))
-    return ((value @ vectors) * rooted.unsqueeze(-2)) @ vectors.mT
-
-
 def _root_requires_spectral_application(rooted: Tensor, dtype: torch.dtype) -> Tensor:
     """Identify roots whose mode ratio cannot survive materialization in ``dtype``."""
 
     ratio = rooted.amax(dim=-1) / rooted.amin(dim=-1).clamp_min(torch.finfo(rooted.dtype).tiny)
     return ratio * torch.finfo(dtype).eps > 0.25
-
-
-def _matrix_inv_sqrt(gram: Tensor, eps: Tensor) -> Tensor:
-    """Symmetric inverse square root via eigendecomposition (batched over leading dims)."""
-
-    return _eigh_regularized_root(gram, eps, -0.5)
 
 
 def beta_debias(beta: Tensor, age: Tensor) -> Tensor:
@@ -353,6 +302,21 @@ def rmsprop(update, obs, param, state, tempo):
 
 
 rmsprop.init = rmsprop_init
+
+
+def adamuon_rmsprop(update, obs, param, state, tempo):
+    """AdaMuon's raw second moment using the same coefficient as its momentum."""
+
+    del obs, param
+    update = _wide(update)
+    exp_avg_sq = _second_moment(state["exp_avg_sq"], update, tempo.hyper.beta1)
+    denominator = exp_avg_sq.to(update.dtype) + torch.as_tensor(
+        tempo.hyper.eps, dtype=update.dtype, device=update.device
+    )
+    return update / denominator, {"exp_avg_sq": exp_avg_sq}, tempo.live
+
+
+adamuon_rmsprop.init = rmsprop_init
 
 
 def lion_init(ref_leaf: Tensor) -> dict[str, Tensor]:
@@ -533,7 +497,6 @@ def mars(update, obs, param, state, tempo):
     a = -tempo.hyper.mars_gamma * tempo.hyper.beta1 / (1 - tempo.hyper.beta1)
     corrected = update + a * (old_grad - update)
     if corrected.numel():
-        # MARS (Algorithm 2) clips the corrected gradient to unit L2 norm per leaf before both moments.
         flat, scale, norm = _slab_l2_components(corrected)
         corrected = (flat / (scale * norm).clamp_min(1.0)).reshape_as(corrected)
     return corrected, {"mars_old_grad": update}, tempo.live
@@ -599,9 +562,7 @@ def orthograd(update, obs, param, state, tempo):
     safe_param_scale = torch.where(param_scale != 0, param_scale, torch.ones_like(param_scale))
     scaled_update = update_flat / safe_update_scale
     scaled_param = param_flat / safe_param_scale
-    # OrthoGrad's projection (Grokking at the Edge of Numerical Stability, eq. 11) is exact: the amax
-    # scaling keeps this sum in {0} u [1, numel], so the zero-param case is the only guard needed. It
-    # is decoupled from the adaptive eps, which is 22 orders larger and would leak a parallel gradient.
+    # Adaptive epsilon would leak a parallel component into OrthoGrad's exact projection.
     denominator = scaled_param.square().sum(dim=1, keepdim=True)
     numerator = (scaled_param * scaled_update).sum(dim=1, keepdim=True)
     projection = torch.where(denominator != 0, numerator / denominator, torch.zeros_like(denominator))
@@ -740,7 +701,6 @@ def adopt(update, obs, param, state, tempo):
     update = _wide(update)
     seen = state["seen"]
     first = seen.logical_not()
-    # ADOPT's EMAs are raw, not bias-corrected; seeding v from g_0^2 is the only correction.
     beta1 = tempo.hyper.beta1
     beta2 = tempo.hyper.beta2
     exp_avg = _wide(state["exp_avg"])
@@ -804,9 +764,6 @@ def orthogonalize(update, obs, param, state, tempo):
     del obs, param, state
     dtype = update.dtype
     normalized = _stable_matrix_normalize(update, eps=1e-7)
-    # Newton-Schulz runs in bf16 for non-fp64 inputs by design (Muon-standard: matches legacy and Keller
-    # Jordan's reference, for tensor-core throughput). This is an intended ~2%-vs-fp64 tradeoff on the fp32
-    # path, not an fp64 baseline; pass fp64 params for a full-precision orthogonalization.
     x = (
         normalized
         if normalized.dtype == torch.float64
@@ -823,7 +780,6 @@ def orthogonalize(update, obs, param, state, tempo):
         (2.8366, -3.0525, 1.2012),
     ):
         s = x @ x.mT
-        # Evaluate b*S + c*S^2 directly so baddbmm can keep the coefficients in the GEMM epilogue.
         y = torch.baddbmm(s, s, s, beta=b, alpha=c)
         y.diagonal(dim1=-2, dim2=-1).add_(a)
         x = y @ x
@@ -854,6 +810,27 @@ def oblique_tangent_projection(update, obs, param, state, tempo):
 oblique_tangent_projection.init = orthogonalize_init
 
 
+def stiefel_tangent_projection(update, obs, param, state, tempo):
+    """Project an update onto the Stiefel tangent space at ``param``."""
+
+    del obs, state
+    update = _wide(update)
+    param = _wide(param)
+    if update.numel() == 0:
+        return update, {}, tempo.live
+    transposed = update.shape[-2] < update.shape[-1]
+    tangent_update = update.mT if transposed else update
+    point = param.mT if transposed else param
+    point_t_update = point.mT @ tangent_update
+    symmetric = (point_t_update + point_t_update.mT) * 0.5
+    projected = tangent_update - point @ symmetric
+    return projected.mT if transposed else projected, {}, tempo.live
+
+
+stiefel_tangent_projection.init = orthogonalize_init
+stiefel_tangent_projection.distributed_scope = Whole(("update", "param"))
+
+
 def polargrad_direction(update, obs, param, state, tempo):
     """Scale the polar direction by the momentum's nuclear norm."""
 
@@ -873,50 +850,35 @@ polargrad_direction.distributed_scope = WHOLE
 def normuon_normalize_init(ref_leaf: Tensor) -> dict[str, Tensor]:
     wide = _wide(ref_leaf)
     shape = list(wide.shape)
-    shape[-1] = 1  # per output-neuron (row) second moment; NorMuon (arXiv:2510.05491) Alg. 1
+    shape[-1] = 1
     return {"moment2": torch.zeros(shape, dtype=wide.dtype, device=wide.device)}
 
 
 def normuon_normalize(update, obs, param, state, tempo):
-    """Normalize Muon's direction by a reduced second moment while preserving its Frobenius norm."""
+    """Apply NorMuon's raw row-wise second moment and RMS-0.2 alignment."""
 
     del obs, param
     update = _wide(update)
     if update.numel() == 0:
-        # Zero-element matrices (e.g. shape (0, n)) are routed here as 2-D leaves; the reductions
-        # below would reduce over an empty axis. Pass them through unchanged.
         return update, {"moment2": _wide(state["moment2"])}, tempo.live
-    # Reduce over the input axis -> a per-output-neuron (row) second moment, applied to tall and wide
-    # matrices alike, per NorMuon (arXiv:2510.05491) Alg. 1. (Was shorter-axis, wrong for wide leaves.)
     row_max = update.abs().amax(dim=-1, keepdim=True)
     safe_row_max = torch.where(row_max != 0, row_max, torch.ones_like(row_max))
     observation_rms = (
         (update / safe_row_max).square().mean(dim=-1, keepdim=True).sqrt()
         * safe_row_max
     )
-    beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    moment2 = _second_moment(state["moment2"], observation_rms, beta2)
-    normalized = update / _second_moment_denom(
-        moment2, tempo.hyper.eps, update.dtype
+    moment2 = _second_moment(state["moment2"], observation_rms, tempo.hyper.beta2)
+    normalized = update / (
+        moment2.to(update.dtype)
+        + torch.as_tensor(tempo.hyper.eps, dtype=update.dtype, device=update.device)
     )
 
-    matrix_max = update.abs().amax(dim=(-2, -1), keepdim=True)
-    matrix_limit = math.sqrt(
-        torch.finfo(update.dtype).max / (update.shape[-2] * update.shape[-1])
-    )
-    safe_matrix_max = torch.where(matrix_max != 0, matrix_max, torch.ones_like(matrix_max))
-    stable_scale = (update / safe_matrix_max).norm(
-        dim=(-2, -1), keepdim=True
-    ) / normalized.norm(
-        dim=(-2, -1), keepdim=True
-    ).clamp_min(tempo.hyper.eps)
-    stable_output = normalized * stable_scale * safe_matrix_max
-    direct_scale = update.norm(dim=(-2, -1), keepdim=True) / normalized.norm(
-        dim=(-2, -1), keepdim=True
-    ).clamp_min(tempo.hyper.eps)
-    direct_output = normalized * direct_scale
-    output = torch.where(matrix_max <= matrix_limit, direct_output, stable_output)
-    return output, {"moment2": moment2}, tempo.live
+    count = update.shape[-2] * update.shape[-1]
+    flat, scale, norm = _slab_l2_components(normalized)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    safe_norm = torch.where(norm != 0, norm, torch.ones_like(norm))
+    output = flat / safe_scale / safe_norm * (0.2 * math.sqrt(count))
+    return output.reshape_as(update), {"moment2": moment2}, tempo.live
 
 
 normuon_normalize.init = normuon_normalize_init
@@ -949,22 +911,28 @@ rms_align.distributed_scope = WHOLE
 
 
 def balanced_orthogonalize(update, obs, param, state, tempo):
-    """Apply Aurora's two-round leverage-balanced polar direction."""
+    """Apply two inner rounds of Aurora's damped leverage-balanced polar iteration."""
 
-    if update.shape[-2] == update.shape[-1]:
+    update = _wide(update)
+    if update.numel() == 0 or update.shape[-2] <= update.shape[-1]:
         return orthogonalize(update, obs, param, state, tempo)
 
-    transposed = update.shape[-2] < update.shape[-1]
-    tall = update.mT if transposed else update
-    target_row_sq = tall.shape[-1] / tall.shape[-2]
-    balanced = stable_l2_normalize(tall, dim=-1, eps=1e-7)
-    for round_index in range(2):
-        direction = orthogonalize(balanced, obs, param, state, tempo)[0]
-        if round_index < 1:
-            row_sum_sq = direction.square().sum(dim=-1, keepdim=True).clamp_min(1e-7 * 1e-7)
-            balanced = balanced * (target_row_sq / row_sum_sq).sqrt()
-    if transposed:
-        direction = direction.mT
+    direction = _stable_matrix_normalize(update, eps=1e-7)
+    row_scale = torch.ones_like(direction[..., :1])
+    damping = torch.as_tensor(
+        tempo.hyper.beta2, dtype=direction.dtype, device=direction.device
+    )
+    target_row_norm = math.sqrt(direction.shape[-1] / direction.shape[-2])
+    epsilon = torch.as_tensor(
+        tempo.hyper.eps, dtype=direction.dtype, device=direction.device
+    )
+    for _ in range(2):
+        row_norm = torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(
+            epsilon
+        )
+        row_scale = row_scale.pow(damping) * row_norm.pow(1 - damping)
+        rescaled = direction / row_scale * target_row_norm
+        direction = orthogonalize(rescaled, obs, param, state, tempo)[0]
     return direction, {}, tempo.live
 
 
@@ -1065,9 +1033,7 @@ def adamc_commit(param, update, state, tempo):
     del state
     wide = _wide(param)
     max_lr = tempo.hyper.lr if tempo.hyper.max_lr is None else tempo.hyper.max_lr
-    # When construction ``lr`` (and thus inherited ``max_lr``) is 0, ``lr / max_lr`` is 0/0 and would
-    # NaN-poison the update even though the step is a no-op. Substitute 1.0 there (the ratio is unused
-    # because ``lr`` zeroes the whole update); nonzero ``max_lr`` keeps the exact ``lr / max_lr`` ratio.
+    # Substituting one for zero max_lr prevents a no-op AdamC step from producing 0/0.
     safe_max_lr = torch.where(max_lr != 0, max_lr, torch.ones_like(max_lr))
     decay = tempo.hyper.weight_decay * tempo.hyper.lr / safe_max_lr
     return wide * (1 - tempo.hyper.lr * decay) - tempo.hyper.lr * update, {}

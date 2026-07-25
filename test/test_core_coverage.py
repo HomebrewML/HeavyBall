@@ -2,6 +2,7 @@
 
 import copy
 import re
+from collections import OrderedDict
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -10,7 +11,8 @@ import torch
 
 from heavyball import Engine, Recipe, RefreshCadence, Route, adamw, msam_laprop, sgd
 from heavyball.codecs import decode
-from heavyball.transforms import sgd_commit
+from heavyball.core import PlainBinding, _bounded_cache_get_or_create
+from heavyball.transforms import Tempo, sgd_commit
 
 
 def _build(params, recipe=adamw, **kwargs):
@@ -97,6 +99,64 @@ def _tagged_parameter(index):
 
 def _exact(message):
     return f"^{re.escape(message)}$"
+
+
+def test_bounded_ordered_cache_refreshes_hits_for_lru_eviction(monkeypatch):
+    import heavyball.core as core
+
+    cache = OrderedDict((key, key.upper()) for key in ("a", "b"))
+    monkeypatch.setattr(core, "_COMPILE_CACHE_MAX_SIZE", 2)
+
+    assert _bounded_cache_get_or_create(cache, "a", lambda: "new") == "A"
+    _bounded_cache_get_or_create(cache, "c", lambda: "C")
+
+    assert tuple(cache) == ("a", "c")
+
+
+@pytest.mark.parametrize("ecc", (None, 16))
+def test_fp32_adamw_and_ecc16_skip_philox_rounding_noise(ecc):
+    parameter = _parameter()
+
+    with patch.object(
+        Tempo,
+        "random_like",
+        side_effect=AssertionError("unnecessary Philox noise"),
+    ):
+        engine = _build([parameter], adamw, ecc=ecc)
+        parameter.grad.fill_(1)
+        engine.step()
+
+
+def test_default_observation_path_reuses_all_true_masks_and_binding_validation():
+    parameter = _parameter()
+    engine = _build([parameter], adamw)
+    original_validate = PlainBinding.validate
+    validations = 0
+
+    def counted_validate(binding, param_row, grad_row):
+        nonlocal validations
+        validations += 1
+        return original_validate(binding, param_row, grad_row)
+
+    parameter.grad.fill_(1)
+    with patch.object(PlainBinding, "validate", counted_validate):
+        engine.step()
+        assert validations == 0
+        assert engine.groups[0].observed_cache is None
+
+        engine.step(observed=[False])
+        assert validations == 1
+        assert not engine.groups[0].observed.any()
+
+        engine.step()
+        assert validations == 1
+        assert engine.groups[0].observed.all()
+        assert engine.groups[0].observed_cache is None
+
+        parameter.data = parameter.data.clone()
+        with pytest.raises(ValueError, match="weights.*no longer slab-bound"):
+            engine.step()
+        assert validations == 2
 
 
 def test_refresh_cadence_rejects_an_invalid_scheduled_probability():

@@ -1,10 +1,5 @@
 """Proofs for the slab-native PSGD-PRO and QSGD ports."""
 
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -179,59 +174,39 @@ def test_psgd_pro_refresh_only_updates_Q(recipe):
         torch.testing.assert_close(state[name], value, rtol=0, atol=0)
 
 
-def _compiled_codes(tmp_path: Path, recipe_name: str) -> tuple[str, str]:
-    source = f"""
-import torch
-from heavyball.core import Engine
-from heavyball.psgd_pro import {recipe_name}
+@pytest.mark.parametrize("recipe", (psgd_pro, qsgd), ids=("psgd_pro", "qsgd"))
+def test_psgd_pro_normal_and_refresh_are_stable_fullgraphs(recipe):
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        parameter = torch.nn.Parameter(torch.randn(3, 4))
+        optimizer = Engine(
+            [parameter],
+            recipe,
+            lr=0.01,
+            precond_lr=0.05,
+            dampening=1e-6,
+            weight_decay=0.0,
+        )
+        state = optimizer.groups[0].states[0]
+        initial_q = state["Q_0"].clone()
+        parameter.grad.copy_(torch.arange(1, 13, dtype=torch.float32).reshape(3, 4))
 
-params = [torch.nn.Parameter(torch.randn(2, 2))]
-optimizer = Engine(params, {recipe_name}, lr=0.01, precond_lr=0.05, dampening=1e-6, weight_decay=0.0)
-optimizer.groups[0].grad_slab.normal_()
-optimizer.step(step_type="normal")
-optimizer.step(step_type="refresh")
-"""
-    environment = dict(
-        os.environ,
-        TORCH_LOGS="output_code",
-        TORCHINDUCTOR_FX_GRAPH_CACHE="0",
-        TORCHINDUCTOR_CACHE_DIR=str(tmp_path / f"{recipe_name}_artifacts"),
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = [Path(path) for path in re.findall(r"Output code written to: (.*\.py)", output)]
-    assert paths, output
-    artifacts = [path.read_text() for path in dict.fromkeys(paths)]
-    normal = next((artifact for artifact in artifacts if "log1p" not in artifact.lower()), None)
-    refresh = next((artifact for artifact in artifacts if "log1p" in artifact.lower()), None)
-    assert normal is not None, output
-    assert refresh is not None, output
-    return normal, refresh
+        optimizer.step(step_type="normal")
+        torch.testing.assert_close(state["Q_0"], initial_q, rtol=0, atol=0)
+        normal_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        optimizer.step(step_type="normal")
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == normal_graphs == 1
 
-
-@pytest.mark.parametrize("recipe_name", ("psgd_pro", "qsgd"))
-def test_psgd_pro_fullgraph_clean(tmp_path, recipe_name):
-    """Both host-selected artifacts compile without banned graph operations."""
-
-    normal, refresh = (artifact.lower() for artifact in _compiled_codes(tmp_path, recipe_name))
-    assert "log1p" not in normal
-    assert "log1p" in refresh
-    for artifact in (normal, refresh):
-        assert "torch.stack" not in artifact
-        assert "while_loop" not in artifact
-        assert not re.search(r"torch\\.cond|\\bcond\\b", artifact)
-        assert "_local_scalar_dense" not in artifact
-        assert ".item(" not in artifact
-
-    source = (Path(__file__).parents[1] / "heavyball" / "psgd_pro.py").read_text()
-    assert not re.search(r"_foreach|vmap|while_loop|torch\.cond|dynamic=True|torch\.stack|\.item\(|autocast", source)
+        optimizer.step(step_type="refresh")
+        assert not torch.equal(state["Q_0"], initial_q)
+        refresh_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        optimizer.step(step_type="refresh")
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == refresh_graphs == 2
+        assert torch.isfinite(parameter).all()
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()
 
 
 def test_psgd_pro_rejects_leaves_that_do_not_merge_to_2d():

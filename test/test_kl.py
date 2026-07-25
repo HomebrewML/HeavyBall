@@ -1,10 +1,5 @@
 """Proofs for the slab-native KL-SOAP and KL-Shampoo ports."""
 
-import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -177,53 +172,39 @@ def test_kl_fp64_accuracy(capsys):
         torch._dynamo.reset()
 
 
-def _compiled_code(tmp_path: Path, label: str, step_type: str) -> str:
-    source = f"""
-import torch
-from heavyball.core import Engine
-from heavyball.kl import {label}_recipe
-
-params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
-optimizer = Engine(params, {label}_recipe)
-optimizer.groups[0].grad_slab.normal_()
-optimizer.step(step_type={step_type!r})
-"""
-    environment = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / label / step_type))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = re.findall(r"Output code written to: (.*\.py)", output)
-    assert paths, output
-    return Path(paths[-1]).read_text()
-
-
-def test_kl_fullgraph_clean(tmp_path):
-    """Normal KL graphs omit QR; refresh graphs contain it and remain fullgraph-clean."""
-
+@pytest.mark.parametrize(
+    "recipe",
+    (kl_soap_recipe, kl_shampoo_recipe),
+    ids=("kl_soap", "kl_shampoo"),
+)
+def test_kl_normal_and_refresh_are_stable_fullgraphs(recipe):
     assert kl_soap_export is kl_soap_recipe
     assert kl_shampoo_export is kl_shampoo_recipe
     assert kl_soap_adamw.then is kl_soap_recipe
     assert kl_shampoo_adamw.then is kl_shampoo_recipe
-    source = Path(__file__).parents[1] / "heavyball" / "kl.py"
-    text = source.read_text()
-    assert text.count("def _wide") == 0
-    assert "_slab_l2_components" not in text
-    assert "heavyball" + "_legacy.utils" not in text
-    assert "heavyball" + "_legacy.chainable" not in text
-    assert not re.search(r"_foreach|vmap|torch\.cond|while_loop|dynamic=True|torch\.stack|\.item\(|autocast", text)
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(3, 4)) for _ in range(2)]
+        optimizer = Engine(params, recipe)
+        state = optimizer.groups[0].states[0]
+        initial_left = state["Q_l"].clone()
+        optimizer.groups[0].grad_slab.copy_(
+            torch.arange(1, 25, dtype=torch.float32).reshape(2, 3, 4)
+        )
 
-    for label in ("kl_soap", "kl_shampoo"):
-        normal = _compiled_code(tmp_path, label, "normal").lower()
-        refresh = _compiled_code(tmp_path, label, "refresh").lower()
-        assert "linalg_qr" not in normal
-        assert "linalg_qr" in refresh
-        for artifact in (normal, refresh):
-            assert "torch.stack" not in artifact
-            assert "_local_scalar_dense" not in artifact
-            assert ".item(" not in artifact
+        optimizer.step(step_type="normal")
+        optimizer.step(step_type="normal")
+        torch.testing.assert_close(state["Q_l"], initial_left, rtol=0, atol=0)
+        normal_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        assert normal_graphs == 1
+
+        optimizer.step(step_type="refresh")
+        assert not torch.equal(state["Q_l"], initial_left)
+        refresh_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        optimizer.step(step_type="refresh")
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == refresh_graphs == 2
+        assert all(torch.isfinite(param).all() for param in params)
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()

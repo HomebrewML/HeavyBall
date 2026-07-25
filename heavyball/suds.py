@@ -13,8 +13,6 @@ def stable_l2_normalize(x: Tensor, dim: int | tuple[int, ...] | None = None, eps
 
     return _stable_l2_normalize(_wide(x), dim=dim, eps=eps)
 
-
-# Kept local: the Householder construction requires a scale-restored norm, not a unit vector.
 def _stable_l2_norm(x: Tensor, *, dim: int) -> Tensor:
     """Stable norm form used by the legacy Householder construction."""
 

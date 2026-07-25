@@ -9,8 +9,6 @@ from torch import Tensor
 from .core import Engine
 from .numerics import _wide
 
-
-# Kept local: Program requires 0-d tensors, unlike Engine's one-element coercion.
 def _scalar(value: float | Tensor, reference: Tensor) -> Tensor:
     dtype = torch.float64 if reference.dtype == torch.float64 else torch.float32
     if isinstance(value, Tensor):
@@ -18,11 +16,6 @@ def _scalar(value: float | Tensor, reference: Tensor) -> Tensor:
             raise ValueError("program hyperparameters must be 0-d tensors or Python scalars")
         return value.detach().to(device=reference.device, dtype=dtype)
     return torch.tensor(value, device=reference.device, dtype=dtype)
-
-
-def _sum_squares(value: Tensor) -> Tensor:
-    return value.double().square().sum()
-
 
 class Program:
     """A host-side controller around one slab-backed :class:`Engine`."""
@@ -54,7 +47,6 @@ class SAM(Program):
         reference = base.groups[0].param_slab
         self.hyper = SimpleNamespace(rho=_scalar(rho, reference), eps=_scalar(eps, reference))
         self.rho, self.eps = self.hyper.rho, self.hyper.eps
-        # Low-precision addition and subtraction do not necessarily recover the original slab.
         self._original = tuple(torch.empty_like(group.param_slab) for group in base.groups)
         self.compiled_phases = {
             "perturb": self._compile_perturb(),
@@ -71,7 +63,7 @@ class SAM(Program):
         rho, eps = self.hyper.rho, self.hyper.eps
 
         def whole_step():
-            squared = [_sum_squares(grad_slab) for _, grad_slab, _, _ in plans]
+            squared = [grad_slab.double().square().sum() for _, grad_slab, _, _ in plans]
             total = squared[0]
             for value in squared[1:]:
                 total = total + value
@@ -108,11 +100,13 @@ class SAM(Program):
         with torch.enable_grad():
             loss = closure()
         self.compiled_perturb()
+        self.base._bump_versions()
         self.base.zero_grad()
         try:
             with torch.enable_grad():
                 closure()
         finally:
             self.compiled_restore()
+            self.base._bump_versions()
         self.base.step()
         return loss

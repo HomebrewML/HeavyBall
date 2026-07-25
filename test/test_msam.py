@@ -1,11 +1,6 @@
 """Parity, accuracy, and lifecycle proofs for the slab-native MSAMLaProp port."""
 
-import os
-import re
-import subprocess
-import sys
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -250,40 +245,38 @@ def test_msam_master_is_fp32_and_swap_exact_for_low_precision_params():
         assert torch.equal(param, before)  # the fp16 perturbed iterate is restored bit-for-bit
 
 
-def test_msam_lifecycle_fullgraph_clean(tmp_path):
-    """MSAM's step and literal lifecycle swaps remain scalar-free fullgraph artifacts."""
+def test_msam_step_and_lifecycle_swaps_are_stable_fullgraphs():
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    try:
+        params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
+        optimizer = Engine(params, _cautious_msam_recipe(), caution=True)
+        for step in range(3):
+            for index, param in enumerate(params):
+                param.grad.copy_(
+                    torch.linspace(-1, 1, param.numel()).reshape_as(param) * (step + index + 1)
+                )
+            optimizer.step()
+            if step == 0:
+                step_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        assert step_graphs == 1
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == step_graphs
 
-    source = """
-import torch
-from dataclasses import replace
-from heavyball import Engine, msam_laprop
+        training = [param.detach().clone() for param in params]
+        optimizer.eval()
+        master = [param.detach().clone() for param in params]
+        optimizer.train()
+        for param, expected in zip(params, training, strict=True):
+            torch.testing.assert_close(param, expected, rtol=0, atol=0)
+        assert any(not torch.equal(train, base) for train, base in zip(training, master, strict=True))
+        lifecycle_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
-params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(2)]
-recipe = replace(msam_laprop, defaults={**msam_laprop.defaults, "caution": 0.0})
-optimizer = Engine(params, recipe, caution=True)
-for _ in range(3):
-    for param in params:
-        param.grad.normal_()
-    optimizer.step()
-optimizer.eval()
-optimizer.train()
-"""
-    env = dict(os.environ, TORCH_LOGS="output_code", TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"))
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).parents[1],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    paths = {Path(value) for value in re.findall(r"Output code written to: (.*\.py)", output)}
-    assert len(paths) >= 2, output
-    for path in paths:
-        code = path.read_text()
-        for forbidden in (".item(", "while_loop", "cond", "stack", "_local_scalar_dense"):
-            assert forbidden not in code, f"{forbidden} in {path}"
+        optimizer.eval()
+        optimizer.train()
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == lifecycle_graphs == 3
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("radius", (0.05, 0.1, 0.2))

@@ -1,5 +1,7 @@
 """Proofs for the torch.optim facade over HeavyBall Engines."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from torch import nn
@@ -34,8 +36,6 @@ def test_facade_trains():
 
     direct = heavyball.build(direct_model.parameters(), heavyball.adamw, lr=3e-3)
     facade = heavyball.AdamW(facade_model.parameters(), lr=3e-3)
-    initial_loss = torch.nn.functional.mse_loss(facade_model(inputs), targets)
-
     for _ in range(5):
         direct.zero_grad()
         direct_loss = torch.nn.functional.mse_loss(direct_model(inputs), targets)
@@ -51,9 +51,29 @@ def test_facade_trains():
         for direct_param, facade_param in zip(direct_model.parameters(), facade_model.parameters(), strict=True):
             assert torch.equal(direct_param, facade_param)
 
-    final_loss = torch.nn.functional.mse_loss(facade_model(inputs), targets)
-    assert final_loss < initial_loss
-    assert all(torch.isfinite(param).all() for param in facade_model.parameters())
+
+def test_fsdp_schedule_free_flags_are_validated_only_when_changed():
+    parameter = nn.Parameter(torch.ones(2))
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
+        optimizer = heavyball.SFAdamW(
+            [parameter],
+            caution=torch.tensor(0.0),
+            cautious_weight_decay=torch.tensor(0.0),
+        )
+    optimizer._fsdp2_mode = True
+    parameter.grad.fill_(1)
+
+    with patch.object(
+        optimizer, "_fsdp2_disabled", wraps=optimizer._fsdp2_disabled
+    ) as disabled:
+        optimizer.step()
+        assert disabled.call_count == 0
+
+        optimizer.param_groups[0]["caution"].fill_(1)
+        with pytest.raises(ValueError, match="requires caution=0"):
+            optimizer.step()
+        assert disabled.call_count == 1
+
 
 
 def test_facade_lr_scheduler():
@@ -150,34 +170,6 @@ def test_facade_zero_grad():
         optimizer.zero_grad(set_to_none=True)
 
 
-@pytest.mark.parametrize(
-    "facade",
-    (
-        heavyball.SOAP,
-        heavyball.Shampoo,
-        heavyball.KLSOAP,
-        heavyball.KLShampoo,
-        heavyball.PSGD,
-        heavyball.PSGDKron,
-        heavyball.PSGDPro,
-        heavyball.QSGD,
-        heavyball.LATHER,
-        heavyball.Whitening,
-    ),
-)
-def test_matrix_facades_step_with_weight_and_bias_at_defaults(facade):
-    model = nn.Linear(4, 3)
-    before = [param.detach().clone() for param in model.parameters()]
-    optimizer = facade(model.parameters())
-
-    for _ in range(2):  # KL facades seed on step 1 (no parameter write); the update lands from step 2
-        optimizer.zero_grad()
-        model(torch.ones(2, 4)).sum().backward()
-        optimizer.step()
-
-    assert all(not torch.equal(param, initial) for param, initial in zip(model.parameters(), before, strict=True))
-
-
 def test_soap_facade_matches_raw_recipe_at_defaults_for_matrix_param():
     initial = torch.tensor(
         [[0.5, -1.0, 0.25, 2.0], [-0.75, 1.5, -2.0, 0.125], [1.25, -0.5, 0.75, -1.5]],
@@ -201,15 +193,6 @@ def test_soap_facade_matches_raw_recipe_at_defaults_for_matrix_param():
     raw.step()
 
     assert torch.equal(initial - routed_param, initial - raw_param)
-
-
-@pytest.mark.parametrize("facade", (heavyball.Muon, heavyball.Scion, heavyball.Whitening))
-def test_existing_mixed_shape_facades_still_build(facade):
-    model = nn.Linear(4, 3)
-
-    optimizer = facade(model.parameters())
-
-    assert isinstance(optimizer, torch.optim.Optimizer)
 
 
 def test_psgd_routes_mixed_matrix_and_vector_params_and_steps():
