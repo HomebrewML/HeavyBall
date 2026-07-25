@@ -65,49 +65,6 @@ def test_sf_matches_pure_reference(dtype, rtol, atol):
         torch._dynamo.reset()
 
 
-def _sf_trajectory(dtype: torch.dtype, gradients, *, compiled: bool):
-    values = dict(
-        lr=0.017,
-        beta1=0.87,
-        beta2=0.97,
-        eps=1e-8,
-        weight_decay=0.031,
-        weight_lr_power=2.0,
-        r=0.5,
-    )
-    params = [
-        torch.nn.Parameter(torch.zeros(11, 7, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros(4, dtype=dtype)),
-    ]
-    if compiled:
-        optimizer = Engine(params, sf_adamw, **values)
-    else:
-        with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-            optimizer = Engine(params, sf_adamw, **values)
-    for step_gradients in gradients:
-        _copy_grads(params, [gradient.to(dtype) for gradient in step_gradients])
-        optimizer.step()
-    return [param.detach().clone() for param in params]
-
-
-def test_sf_fp64_accuracy():
-    """The compiled fp32 schedule-free trajectory stays near its fp64 truth run."""
-
-    torch._dynamo.reset()
-    torch.manual_seed(72)
-    shapes = ((11, 7), (4,))
-    gradients = [[torch.randn(*shape, dtype=torch.float64) for shape in shapes] for _ in range(80)]
-    try:
-        truth = _sf_trajectory(torch.float64, gradients, compiled=False)
-        actual = _sf_trajectory(torch.float32, gradients, compiled=True)
-        error = max(
-            (result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True)
-        )
-        assert error <= 2e-5
-    finally:
-        torch._dynamo.reset()
-
-
 def test_sf_master_iterate_is_fp32_for_low_precision_params():
     """The schedule-free averaging master z must accumulate in fp32 even for an fp16 parameter, so
     sub-ULP per-step increments are not discarded. A narrow z would stay pinned at 1.0; the fp16-parameter

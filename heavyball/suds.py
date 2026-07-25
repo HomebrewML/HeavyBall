@@ -13,14 +13,6 @@ def stable_l2_normalize(x: Tensor, dim: int | tuple[int, ...] | None = None, eps
 
     return _stable_l2_normalize(_wide(x), dim=dim, eps=eps)
 
-def _stable_l2_norm(x: Tensor, *, dim: int) -> Tensor:
-    """Stable norm form used by the legacy Householder construction."""
-
-    x = _wide(x)
-    scale = x.abs().amax(dim=dim, keepdim=True)
-    safe = torch.where(scale != 0, scale, torch.ones_like(scale))
-    return torch.linalg.vector_norm(x / safe, dim=dim, keepdim=True) * scale
-
 
 def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
     """Return the batched reflector vector whose Householder map sends e1 to ``v``."""
@@ -29,8 +21,11 @@ def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
     e1 = torch.zeros_like(v)
     e1[..., 0] = 1.0
     w = e1 - v
+    scale = w.abs().amax(dim=-1, keepdim=True)
+    safe = torch.where(scale != 0, scale, torch.ones_like(scale))
+    norm = torch.linalg.vector_norm(w / safe, dim=-1, keepdim=True) * scale
     return torch.where(
-        _stable_l2_norm(w, dim=-1) >= eps,
+        norm >= eps,
         stable_l2_normalize(w, dim=-1),
         torch.zeros_like(w),
     )

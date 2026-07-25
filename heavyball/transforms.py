@@ -391,28 +391,6 @@ def nadam(update, obs, param, state, tempo):
 nadam.init = nadam_init
 
 
-def _ademamix_schedules(tempo) -> tuple[Tensor, Tensor]:
-    """Legacy AdEMAMix beta3 half-life and alpha warmups, per leaf age."""
-
-    age = tempo.age.to(tempo.hyper.beta1.dtype)
-    alpha_warmup = tempo.hyper.alpha_warmup
-    alpha_progress = (age / alpha_warmup.clamp_min(1)).clamp(min=0, max=1)
-    alpha = torch.where(
-        alpha_warmup > 0,
-        tempo.hyper.alpha * alpha_progress,
-        torch.ones_like(age) * tempo.hyper.alpha,
-    )
-
-    beta3_warmup = tempo.hyper.beta3_warmup
-    beta3_progress = (age / beta3_warmup.clamp_min(1)).clamp(min=0, max=1)
-    half_life_start = math.log(0.5) / (tempo.hyper.beta1 + 1e-8).log() - 1
-    half_life_end = math.log(0.5) / (tempo.hyper.beta3 + 1e-8).log() - 1
-    half_life = half_life_start + beta3_progress * (half_life_end - half_life_start)
-    warmed_beta3 = torch.exp2(-1 / (half_life + 1)).clamp(min=0, max=1 - 1e-8)
-    beta3 = torch.where(beta3_warmup > 0, warmed_beta3, torch.ones_like(age) * tempo.hyper.beta3)
-    return beta3, alpha
-
-
 def ademamix_init(ref_leaf: Tensor) -> dict[str, Tensor]:
     ref = _wide(ref_leaf)
     return {
@@ -429,7 +407,25 @@ def ademamix(update, obs, param, state, tempo):
     update = _wide(update)
     beta1 = broadcast_leaf(beta_debias(tempo.hyper.beta1, tempo.age), update)
     beta2 = broadcast_leaf(beta_debias(tempo.hyper.beta2, tempo.age), update)
-    beta3, alpha = _ademamix_schedules(tempo)
+    age = tempo.age.to(tempo.hyper.beta1.dtype)
+    alpha_warmup = tempo.hyper.alpha_warmup
+    alpha_progress = (age / alpha_warmup.clamp_min(1)).clamp(min=0, max=1)
+    alpha = torch.where(
+        alpha_warmup > 0,
+        tempo.hyper.alpha * alpha_progress,
+        torch.ones_like(age) * tempo.hyper.alpha,
+    )
+    beta3_warmup = tempo.hyper.beta3_warmup
+    beta3_progress = (age / beta3_warmup.clamp_min(1)).clamp(min=0, max=1)
+    half_life_start = math.log(0.5) / (tempo.hyper.beta1 + 1e-8).log() - 1
+    half_life_end = math.log(0.5) / (tempo.hyper.beta3 + 1e-8).log() - 1
+    half_life = half_life_start + beta3_progress * (half_life_end - half_life_start)
+    warmed_beta3 = torch.exp2(-1 / (half_life + 1)).clamp(min=0, max=1 - 1e-8)
+    beta3 = torch.where(
+        beta3_warmup > 0,
+        warmed_beta3,
+        torch.ones_like(age) * tempo.hyper.beta3,
+    )
     beta3 = broadcast_leaf(beta3, update)
     alpha = broadcast_leaf(alpha, update)
     exp_avg_fast = _wide(state["exp_avg_fast"]) * beta1 + update * (1 - beta1)

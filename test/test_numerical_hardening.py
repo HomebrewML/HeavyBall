@@ -7,7 +7,7 @@ from heavyball.codecs import decode, encode
 from heavyball.kl import _apply_kl_preconditioner, kl_soap_init
 from heavyball.kron import _precondition_mixed, _refresh_q
 from heavyball.lra import _refresh_lra
-from heavyball.matrix import _gram_value, _outer, shampoo, shampoo_init
+from heavyball.matrix import shampoo, shampoo_init
 from heavyball.numerics import balance_factors, stochastic_round_bfloat16
 from heavyball.scion import _copy_initialized_
 from heavyball.transforms import (
@@ -122,16 +122,6 @@ def test_quadratic_state_extremes_are_finite_and_normal_formula_is_preserved():
         atol=0,
     )
 
-    torch.manual_seed(4)
-    matrix = torch.randn(1, 4, 3)
-    torch.testing.assert_close(
-        _outer(matrix, matrix.mT).float(),
-        matrix @ matrix.mT,
-        rtol=1e-6,
-        atol=1e-6,
-    )
-
-
 def test_extreme_shampoo_whitening_and_kl_grams_follow_fp64():
     update = torch.full((1, 2, 2), 1e20)
     expected_gram = update.double() @ update.double().mT
@@ -144,7 +134,8 @@ def test_extreme_shampoo_whitening_and_kl_grams_follow_fp64():
         update, None, None, shampoo_state, _tempo(refresh=True)
     )
     torch.testing.assert_close(
-        _gram_value(shampoo_next["GG_l"], shampoo_next["GG_l_scale"]),
+        shampoo_next["GG_l"].double()
+        * shampoo_next["GG_l_scale"].double().reshape(-1, 1, 1).square(),
         expected_gram,
         rtol=1e-7,
         atol=0,

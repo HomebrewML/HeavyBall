@@ -23,18 +23,17 @@ def _params() -> list[torch.nn.Parameter]:
     return [torch.nn.Parameter(torch.randn(3, 4)), torch.nn.Parameter(torch.randn(5))]
 
 
-def _gradients(params: list[torch.nn.Parameter]) -> tuple[tuple[torch.Tensor, ...], ...]:
-    torch.manual_seed(1)
-    return tuple(tuple(torch.randn_like(param) for param in params) for _ in range(6))
-
-
 @pytest.mark.parametrize(("_name", "recipe", "matrix"), RECIPES)
 def test_compiled_matches_eager(_name, recipe, matrix):
     """The compiled route matches its eager route after six identical steps."""
 
     compiled_params = _params()
     eager_params = _params()
-    gradients = _gradients(compiled_params)
+    torch.manual_seed(1)
+    gradients = tuple(
+        tuple(torch.randn_like(param) for param in compiled_params)
+        for _ in range(6)
+    )
     try:
         compiled = Engine(compiled_params, recipe)
         with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):

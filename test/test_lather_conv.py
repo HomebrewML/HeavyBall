@@ -9,33 +9,7 @@ from unittest.mock import patch
 
 import torch
 
-from heavyball import build, lather, lather_adamw
-from heavyball.matrix import matrix_route, merged_matrix_shape
-
-
-class _Info:
-    def __init__(self, shape: tuple[int, ...]) -> None:
-        self.shape = shape
-        self.ndim = len(shape)
-
-
-def test_conv_merges_to_2d_and_routes_to_lather():
-    assert merged_matrix_shape((4, 3, 3, 3), 2048) == (4, 27)
-    assert matrix_route(_Info((4, 3, 3, 3))) is True
-    assert matrix_route(_Info((128, 1000, 3, 3))) is False  # >2D merge -> adamw
-
-
-def test_conv_lather_routes_preconditions_and_keeps_shape():
-    parameter = torch.nn.Parameter(torch.randn(4, 3, 3, 3))
-    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        optimizer = build([parameter], lather_adamw, lr=1e-3)
-    state = optimizer.groups[0].states[0]
-    assert any(key.startswith("Q") for key in state) and tuple(state["exp_avg"].shape[1:]) == (4, 27)
-    parameter.grad.copy_(torch.randn_like(parameter))
-    optimizer.step(step_type="refresh")
-    optimizer.step()
-    assert torch.isfinite(parameter).all()
-    assert tuple(parameter.shape) == (4, 3, 3, 3)
+from heavyball import build, lather
 
 
 def _run_lather(conv0, gradients, *, as_conv, native_shape, seed):

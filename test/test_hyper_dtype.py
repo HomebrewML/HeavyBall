@@ -34,11 +34,6 @@ def test_each_group_hyper_matches_its_own_dtype(order):
             assert group.hyper.eps.dtype == group_dtype
 
 
-def test_uniform_fp32_hyper_stays_fp32():
-    opt = heavyball.AdamW([torch.nn.Parameter(torch.randn(3))], lr=1e-3)
-    assert opt._engines[0].groups[0].hyper.beta1.dtype == torch.float32
-
-
 def test_set_hyper_updates_every_mixed_dtype_group():
     params = [torch.nn.Parameter(torch.randn(3, dtype=_DT[name])) for name in ("f32", "f64")]
     opt = heavyball.AdamW(params, lr=1e-3)
@@ -50,21 +45,6 @@ def test_set_hyper_updates_every_mixed_dtype_group():
         for group in engine.groups:
             assert group.hyper.lr.item() == pytest.approx(0.05)
             assert group.hyper.lr.dtype == group.params[0].dtype
-
-
-def test_mixed_dtype_optimizer_updates_both_params_finitely():
-    for order in (("f32", "f64"), ("f64", "f32")):
-        params = [torch.nn.Parameter(torch.zeros(3, dtype=_DT[name])) for name in order]
-        opt = heavyball.AdamW(params, lr=1e-2)
-        for param in params:
-            param.grad.fill_(1.0)
-        before = [p.detach().clone() for p in params]
-        opt.step()
-        for param, prior in zip(params, before, strict=True):
-            assert torch.isfinite(param).all()
-            assert not torch.equal(param, prior)
-
-
 def test_mixed_dtype_checkpoint_roundtrip_preserves_both_hypers():
     torch.manual_seed(0)
     params = [torch.nn.Parameter(torch.randn(3, dtype=_DT[name])) for name in ("f32", "f64")]

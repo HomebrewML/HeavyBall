@@ -272,10 +272,6 @@ def _recipe_has_observations(recipe: Recipe | Route) -> bool:
     return _recipe_has_observations(recipe.then) or _recipe_has_observations(recipe.otherwise)
 
 
-def _fsdp2_supported(recipe: Recipe | Route) -> bool:
-    return not _recipe_has_observations(recipe) and fsdp2_recipe_scope_supported(recipe)
-
-
 def _distributed_limitations(
     name: str,
     recipe: Recipe | Route,
@@ -339,7 +335,10 @@ def describe(name: str) -> dict[str, object]:
         for parameter_name, parameter in inspect.signature(facade).parameters.items()
         if parameter_name != "params" and parameter.default is not inspect.Parameter.empty
     }
-    fsdp2_supported = _fsdp2_supported(facade.recipe)
+    fsdp2_supported = (
+        not _recipe_has_observations(facade.recipe)
+        and fsdp2_recipe_scope_supported(facade.recipe)
+    )
     return {
         "name": name,
         "canonical_name": canonical_name,

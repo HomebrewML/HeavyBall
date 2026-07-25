@@ -18,16 +18,6 @@ from heavyball.scion import _scion_bias_rms_direction, scion_param_init
 from heavyball.transforms import Tempo, _stable_matrix_normalize, orthograd, sign_graft
 
 
-def _tempo(count: int) -> Tempo:
-    return Tempo(
-        step=torch.ones((), dtype=torch.int64),
-        age=torch.ones(count, dtype=torch.int64),
-        live=torch.ones(count, dtype=torch.bool),
-        hyper=SimpleNamespace(),
-        refresh=False,
-    )
-
-
 def test_autocomplete_script_writes_the_rendered_stub():
     stub_generator = Path(heavyball.__file__).with_name("_autocomplete_stub.py")
     output = Path(heavyball.optim.__file__).with_suffix(".pyi")
@@ -79,7 +69,13 @@ def test_empty_normalizers_and_grafts_preserve_empty_slab_contracts():
     assert normalized.dtype is torch.float64
     assert normalized.numel() == 0
 
-    tempo = _tempo(2)
+    tempo = Tempo(
+        step=torch.ones((), dtype=torch.int64),
+        age=torch.ones(2, dtype=torch.int64),
+        live=torch.ones(2, dtype=torch.bool),
+        hyper=SimpleNamespace(),
+        refresh=False,
+    )
     grafted, graft_state, graft_live = sign_graft(empty, None, None, {}, tempo)
     assert grafted.shape == (2, 0)
     assert graft_state == {}

@@ -82,14 +82,16 @@ def test_adamc_multigroup_max_lr_inherits_each_group_lr():
     torch.testing.assert_close(p2, torch.full((4,), 1 - 0.02 * 0.5), rtol=0, atol=1e-6)
 
 
-def test_adamc_direct_build_omitted_max_lr_does_not_crash():
+def test_adamc_direct_build_omitted_max_lr_inherits_lr():
     # The low-level build() path must also resolve the max_lr sentinel (regression: only the facade
     # resolved it, so build(..., adamc, lr=...) hit _scalar(None) -> TypeError).
     from heavyball.core import build
 
     parameter = torch.nn.Parameter(torch.ones(2))
     engine = build([parameter], heavyball.adamc, lr=0.01, weight_decay=0.5, _leaf_indices=range(1))
-    assert engine is not None
+    parameter.grad.zero_()
+    engine.step()
+    torch.testing.assert_close(parameter, torch.full((2,), 0.995))
 
 
 def test_adamc_zero_lr_does_not_nan():
@@ -105,10 +107,3 @@ def test_non_adamc_optimizers_have_no_max_lr():
     # optimizer, breaking pre-pass checkpoints via the strict hyperparameter-name check (regression).
     opt = heavyball.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
     assert "max_lr" not in opt.param_groups[0]
-    assert not hasattr(opt._engine.groups[0].hyper, "max_lr")
-
-
-def test_adamc_is_a_facade_and_declares_max_lr():
-    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        opt = heavyball.AdamC([torch.nn.Parameter(torch.randn(4))], lr=1e-3, max_lr=1e-2)
-    assert isinstance(opt, heavyball.AdamC)

@@ -19,19 +19,6 @@ with patch("heavyball.core.torch.compile", lambda f, **k: f):
 from heavyball.matrix import soap, soap_init
 
 
-def _hyper():
-    return SimpleNamespace(
-        beta1=torch.tensor(0.9, dtype=torch.float64),
-        beta2=torch.tensor(0.999, dtype=torch.float64),
-        eps=torch.tensor(1e-12, dtype=torch.float64),
-        shampoo_beta=torch.tensor(0.95, dtype=torch.float64),
-        beta3=torch.tensor(0.9999, dtype=torch.float64),
-        alpha=torch.tensor(2.0, dtype=torch.float64),
-        beta3_warmup=torch.tensor(0.0, dtype=torch.float64),
-        alpha_warmup=torch.tensor(0.0, dtype=torch.float64),
-    )
-
-
 def _tempo(age, step, count=1):
     from heavyball.transforms import Tempo
 
@@ -39,7 +26,16 @@ def _tempo(age, step, count=1):
         torch.tensor(step, dtype=torch.long),
         torch.full((count,), age, dtype=torch.long),
         torch.ones(count, dtype=torch.bool),
-        _hyper(),
+        SimpleNamespace(
+            beta1=torch.tensor(0.9, dtype=torch.float64),
+            beta2=torch.tensor(0.999, dtype=torch.float64),
+            eps=torch.tensor(1e-12, dtype=torch.float64),
+            shampoo_beta=torch.tensor(0.95, dtype=torch.float64),
+            beta3=torch.tensor(0.9999, dtype=torch.float64),
+            alpha=torch.tensor(2.0, dtype=torch.float64),
+            beta3_warmup=torch.tensor(0.0, dtype=torch.float64),
+            alpha_warmup=torch.tensor(0.0, dtype=torch.float64),
+        ),
         False,
     )
 

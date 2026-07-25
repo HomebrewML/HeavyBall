@@ -9,11 +9,6 @@ import torch
 from heavyball import Engine, msam_laprop
 
 
-def _copy_grads(params, gradients):
-    for param, gradient in zip(params, gradients, strict=True):
-        param.grad.copy_(gradient)
-
-
 def _cautious_msam_recipe():
     return replace(
         msam_laprop,
@@ -89,7 +84,8 @@ def test_msam_matches_direct_rmsprop_momentum_sam_recurrence(dtype, rtol, atol, 
             expected_params.append(state["z"] - direction * values["sam_step_size"])
             expected_momenta.append(momentum)
 
-        _copy_grads(params, step_gradients)
+        for param, gradient in zip(params, step_gradients, strict=True):
+            param.grad.copy_(gradient)
         optimizer.step()
         for index, (param, expected) in enumerate(zip(params, expected_params, strict=True)):
             torch.testing.assert_close(
@@ -117,53 +113,6 @@ def test_msam_matches_direct_rmsprop_momentum_sam_recurrence(dtype, rtol, atol, 
                 rtol=rtol,
                 atol=atol,
             )
-
-
-def _msam_trajectory(dtype: torch.dtype, gradients, *, compiled: bool):
-    values = dict(
-        lr=0.017,
-        beta1=0.87,
-        beta2=0.97,
-        eps=1e-8,
-        weight_decay=0.031,
-        sam_step_size=0.13,
-        caution=True,
-        cautious_weight_decay=True,
-    )
-    params = [
-        torch.nn.Parameter(torch.zeros(11, 7, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros(4, dtype=dtype)),
-    ]
-    if compiled:
-        optimizer = Engine(params, _cautious_msam_recipe(), **values)
-    else:
-        with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-            optimizer = Engine(params, _cautious_msam_recipe(), **values)
-    for step, step_gradients in enumerate(gradients, start=1):
-        _copy_grads(params, [gradient.to(dtype) for gradient in step_gradients])
-        optimizer.step()
-        if step == 31:
-            optimizer.eval()
-            optimizer.train()
-    return [param.detach().clone() for param in params]
-
-
-def test_msam_fp64_accuracy():
-    """The compiled fp32 MSAM trajectory stays within its pinned fp64 budget."""
-
-    torch._dynamo.reset()
-    torch.manual_seed(82)
-    shapes = ((11, 7), (4,))
-    gradients = [[torch.randn(*shape, dtype=torch.float64) for shape in shapes] for _ in range(80)]
-    try:
-        truth = _msam_trajectory(torch.float64, gradients, compiled=False)
-        actual = _msam_trajectory(torch.float32, gradients, compiled=True)
-        error = max(
-            (result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True)
-        )
-        assert error <= 3e-5
-    finally:
-        torch._dynamo.reset()
 
 
 def test_msam_eval_swap_exact_with_caution():

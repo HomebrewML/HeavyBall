@@ -25,27 +25,20 @@ def _orthogonal_direction(update: Tensor, tempo: Tempo) -> Tensor:
     return direction.reshape_as(update)
 
 
-def _scion_spectral_direction(update: Tensor, tempo: Tempo) -> Tensor:
-    direction = _orthogonal_direction(update, tempo)
-    in_dimension = max(update.reshape(update.shape[0], update.shape[1], -1).shape[2], 1)
-    return direction * math.sqrt(update.shape[1] / in_dimension)
-
-
-def _scion_spectral_conv_direction(update: Tensor, tempo: Tempo) -> Tensor:
-    direction = _orthogonal_direction(update, tempo)
-    spatial = math.prod(update.shape[3:])
-    return direction * (math.sqrt(update.shape[1] / max(update.shape[2], 1)) / max(spatial, 1))
-
-
 def scion_lmo(update: Tensor, obs, param: Tensor, state: dict[str, Tensor], tempo: Tempo):
     """Apply Scion's leaf-ndim-selected LMO to a full ``[N, *shape]`` slab."""
 
     del obs, param, state
     update = _wide(update)
     if update.ndim >= 4:
-        direction = _scion_spectral_conv_direction(update, tempo)
+        direction = _orthogonal_direction(update, tempo)
+        spatial = math.prod(update.shape[3:])
+        direction = direction * (
+            math.sqrt(update.shape[1] / max(update.shape[2], 1)) / max(spatial, 1)
+        )
     elif update.ndim == 3:
-        direction = _scion_spectral_direction(update, tempo)
+        direction = _orthogonal_direction(update, tempo)
+        direction = direction * math.sqrt(update.shape[1] / max(update.shape[2], 1))
     else:
         direction = _scion_bias_rms_direction(update, tempo.hyper.eps)
     scale = tempo.hyper.scale.to(dtype=direction.dtype, device=direction.device)

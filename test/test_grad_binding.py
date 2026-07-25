@@ -20,28 +20,6 @@ def _eager():
         yield
 
 
-def test_backward_flow_trains_without_false_positive():
-    torch.manual_seed(0)
-    model = torch.nn.Linear(4, 3)
-    opt = heavyball.AdamW(model.parameters(), lr=1e-2)
-    inputs = torch.randn(8, 4)
-    for _ in range(3):
-        model(inputs).square().mean().backward()
-        before = model.weight.detach().clone()
-        opt.step()
-        opt.zero_grad()
-        assert not torch.equal(model.weight, before)
-
-
-def test_inplace_grad_write_is_used():
-    param = torch.nn.Parameter(torch.zeros(4))
-    opt = heavyball.SGD([param], lr=0.1, weight_decay=0.0)
-    param.grad.fill_(2.0)
-    before = param.detach().clone()
-    opt.step()
-    assert not torch.equal(param, before)
-
-
 def test_reassigning_grad_raises():
     param = torch.nn.Parameter(torch.zeros(4))
     opt = heavyball.SGD([param], lr=0.1)

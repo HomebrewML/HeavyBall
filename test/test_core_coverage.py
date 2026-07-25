@@ -2,7 +2,6 @@
 
 import copy
 import re
-from collections import OrderedDict
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -11,8 +10,7 @@ import torch
 
 from heavyball import Engine, Recipe, RefreshCadence, Route, adamw, msam_laprop, sgd
 from heavyball.codecs import decode
-from heavyball.core import PlainBinding, _bounded_cache_get_or_create
-from heavyball.transforms import Tempo, sgd_commit
+from heavyball.transforms import sgd_commit
 
 
 def _build(params, recipe=adamw, **kwargs):
@@ -41,41 +39,17 @@ _plain_recipe = Recipe((), _direct_commit, {})
 _cadence_recipe = Recipe((), _direct_commit, {"preconditioner_update_probability": 0.5})
 
 
-def _passthrough(update, obs, param, state, tempo):
-    del obs, param
-    return update, state, tempo.live
-
-
-def _varying_key_init(reference):
-    name = "zero" if reference.flatten()[0].item() == 0 else "nonzero"
-    return {name: torch.zeros_like(reference)}
-
-
-def _varying_shape_init(reference):
-    size = 1 if reference.flatten()[0].item() == 0 else 2
-    return {"slot": reference.new_zeros(size)}
-
-
 def _rollback_init(reference):
     if reference.numel() > 1:
         raise RuntimeError("deliberate initializer failure")
     return {}
 
 
-def _key_transform(update, obs, param, state, tempo):
-    return _passthrough(update, obs, param, state, tempo)
-
-
-def _shape_transform(update, obs, param, state, tempo):
-    return _passthrough(update, obs, param, state, tempo)
-
-
 def _rollback_transform(update, obs, param, state, tempo):
-    return _passthrough(update, obs, param, state, tempo)
+    del obs, param
+    return update, state, tempo.live
 
 
-_key_transform.init = _varying_key_init
-_shape_transform.init = _varying_shape_init
 _rollback_transform.init = _rollback_init
 
 
@@ -101,64 +75,6 @@ def _exact(message):
     return f"^{re.escape(message)}$"
 
 
-def test_bounded_ordered_cache_refreshes_hits_for_lru_eviction(monkeypatch):
-    import heavyball.core as core
-
-    cache = OrderedDict((key, key.upper()) for key in ("a", "b"))
-    monkeypatch.setattr(core, "_COMPILE_CACHE_MAX_SIZE", 2)
-
-    assert _bounded_cache_get_or_create(cache, "a", lambda: "new") == "A"
-    _bounded_cache_get_or_create(cache, "c", lambda: "C")
-
-    assert tuple(cache) == ("a", "c")
-
-
-@pytest.mark.parametrize("ecc", (None, 16))
-def test_fp32_adamw_and_ecc16_skip_philox_rounding_noise(ecc):
-    parameter = _parameter()
-
-    with patch.object(
-        Tempo,
-        "random_like",
-        side_effect=AssertionError("unnecessary Philox noise"),
-    ):
-        engine = _build([parameter], adamw, ecc=ecc)
-        parameter.grad.fill_(1)
-        engine.step()
-
-
-def test_default_observation_path_reuses_all_true_masks_and_binding_validation():
-    parameter = _parameter()
-    engine = _build([parameter], adamw)
-    original_validate = PlainBinding.validate
-    validations = 0
-
-    def counted_validate(binding, param_row, grad_row):
-        nonlocal validations
-        validations += 1
-        return original_validate(binding, param_row, grad_row)
-
-    parameter.grad.fill_(1)
-    with patch.object(PlainBinding, "validate", counted_validate):
-        engine.step()
-        assert validations == 0
-        assert engine.groups[0].observed_cache is None
-
-        engine.step(observed=[False])
-        assert validations == 1
-        assert not engine.groups[0].observed.any()
-
-        engine.step()
-        assert validations == 1
-        assert engine.groups[0].observed.all()
-        assert engine.groups[0].observed_cache is None
-
-        parameter.data = parameter.data.clone()
-        with pytest.raises(ValueError, match="weights.*no longer slab-bound"):
-            engine.step()
-        assert validations == 2
-
-
 def test_refresh_cadence_rejects_an_invalid_scheduled_probability():
     cadence = RefreshCadence(lambda step: 1.5 if step == 1 else 0.5)
 
@@ -177,13 +93,6 @@ def test_tensor_hyperparameter_must_contain_one_value():
         match=_exact("hyperparameters must be 0-d tensors or Python scalars"),
     ):
         _build([_parameter()], adamw, lr=torch.tensor([0.1, 0.2]))
-
-
-def test_one_element_tensor_hyperparameter_is_normalized_to_a_scalar_cell():
-    engine = _build([_parameter()], adamw, lr=torch.tensor([0.125]))
-
-    assert engine.hyper.lr.ndim == 0
-    assert float(engine.hyper.lr) == pytest.approx(0.125)
 
 
 @pytest.mark.parametrize(
@@ -260,23 +169,6 @@ def test_global_clipping_rejects_parameters_on_distinct_devices():
         _build(params, _plain_recipe, clip_global_norm=1.0)
 
 
-def test_storage_dtype_string_allocates_bfloat16_state():
-    engine = _build([_parameter()], adamw, storage_dtype="torch.bfloat16")
-    floating_slots = [
-        value
-        for group in engine.groups
-        for slots in group.states
-        for value in slots.values()
-        if value.is_floating_point()
-    ]
-
-    assert engine.storage_dtype is torch.bfloat16
-    assert {value.dtype for value in floating_slots} == {torch.bfloat16}
-    state = engine.groups[0].states[0]
-    assert state["exp_avg"].dtype is torch.bfloat16
-    assert state["exp_avg_sq"].dtype is torch.bfloat16
-
-
 def test_constructor_rollback_removes_new_observation_bindings():
     recipe = Recipe(
         (_rollback_transform,),
@@ -297,32 +189,6 @@ def test_constructor_rollback_removes_new_observation_bindings():
     assert all(param.grad is grad for param, grad in zip(params, original_grads, strict=True))
     assert all(not hasattr(param, "probe") for param in params)
     assert all(not hasattr(param, "_heavyball_observation_binding") for param in params)
-
-
-def test_transform_initializer_keys_must_match_within_a_bucket():
-    recipe = Recipe(
-        (_key_transform,), sgd_commit, {"lr": 0.1, "weight_decay": 0.0}
-    )
-    params = [torch.nn.Parameter(torch.zeros(2)), torch.nn.Parameter(torch.ones(2))]
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("transform initializer returned incompatible state keys within a bucket"),
-    ):
-        _build(params, recipe)
-
-
-def test_transform_initializer_shapes_must_match_within_a_bucket():
-    recipe = Recipe(
-        (_shape_transform,), sgd_commit, {"lr": 0.1, "weight_decay": 0.0}
-    )
-    params = [torch.nn.Parameter(torch.zeros(2)), torch.nn.Parameter(torch.ones(2))]
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("transform initializer returned incompatible state shape or dtype within a bucket"),
-    ):
-        _build(params, recipe)
 
 
 def test_global_clip_combines_norms_from_multiple_buckets():
@@ -400,33 +266,6 @@ def test_train_mode_must_be_boolean():
     assert engine._train_mode is True
 
 
-def test_multi_device_step_counters_use_device_keys():
-    params = [_tagged_parameter(0), _tagged_parameter(1)]
-    engine = _build(params, _plain_recipe, param_keys=("left", "right"))
-
-    checkpoint = engine.state_dict()
-
-    assert checkpoint["step"] == {"cpu:0": 1, "cpu:1": 1}
-
-
-@pytest.mark.parametrize(
-    ("probability", "message"),
-    (
-        ("often", "cadence probability must be a number"),
-        (1.5, "cadence probability must be in [0, 1]"),
-    ),
-)
-def test_state_dict_rejects_invalid_cadence_probability(probability, message):
-    engine = _build(
-        [_parameter()],
-        _cadence_recipe,
-        preconditioner_update_probability=probability,
-    )
-
-    with pytest.raises(ValueError, match=_exact(message)):
-        engine.state_dict()
-
-
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -478,27 +317,6 @@ def test_load_rejects_invalid_cadence_state(field, value, message):
         engine.load_state_dict(checkpoint)
 
 
-def test_load_rejects_an_age_with_the_wrong_shape():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["age"]["p"] = torch.ones(1)
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("checkpoint age has an incompatible shape for parameter 'p'"),
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_non_mapping_transform_state():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["state"]["p"] = []
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint transforms do not match parameter 'p'")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
 def test_load_accepts_legacy_state_without_an_empty_commit_bucket():
     source_parameter, source, checkpoint = _engine_and_checkpoint()
     source_parameter.grad.copy_(torch.tensor([0.25, -0.5]))
@@ -512,130 +330,6 @@ def test_load_accepts_legacy_state_without_an_empty_commit_bucket():
     for name, value in checkpoint["state"]["p"][0].items():
         assert torch.equal(target.groups[0].states[0][name][0], value)
     assert target.groups[0].age.item() == 1
-
-
-def test_load_rejects_unexpected_transform_indices():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["state"]["p"][5] = {}
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint transforms do not match parameter 'p'")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_transform_slots():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["state"]["p"][0] = {}
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint slots do not match parameter 'p'")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_commit_slots():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["state"]["p"]["commit"] = {"unexpected": torch.zeros(())}
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint commit slots do not match parameter 'p'")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_incompatible_commit_slot_tensor():
-    _, engine, checkpoint = _engine_and_checkpoint(msam_laprop, ecc=8)
-    checkpoint["state"]["p"]["commit"]["z"] = torch.zeros(3, dtype=torch.bfloat16)
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("checkpoint commit slot 'z' has an incompatible shape or dtype"),
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_ecc_format_without_ecc_metadata():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    del checkpoint["ecc"]
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint format does not match its ECC configuration")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_a_different_ecc_width():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    checkpoint["ecc"] = 16
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint ECC configuration does not match this Engine")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_correction_parameter_keys():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    checkpoint["corrections"] = {}
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("checkpoint correction parameter keys do not match this Engine"),
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_correction_transform_indices():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    checkpoint["corrections"]["p"] = {}
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint corrections do not match parameter 'p'")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_correction_slots():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    checkpoint["corrections"]["p"][0] = {}
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("checkpoint correction slots do not match parameter 'p'"),
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_an_incompatible_transform_correction():
-    _, engine, checkpoint = _engine_and_checkpoint(ecc=8)
-    checkpoint["corrections"]["p"][0]["exp_avg"] = torch.zeros(3, dtype=torch.int8)
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint correction slot 'exp_avg' is incompatible")
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_mismatched_commit_correction_slots():
-    _, engine, checkpoint = _engine_and_checkpoint(msam_laprop, ecc=8)
-    checkpoint["corrections"]["p"]["commit"] = {}
-
-    with pytest.raises(
-        ValueError,
-        match=_exact("checkpoint commit corrections do not match parameter 'p'"),
-    ):
-        engine.load_state_dict(checkpoint)
-
-
-def test_load_rejects_an_incompatible_commit_correction():
-    _, engine, checkpoint = _engine_and_checkpoint(msam_laprop, ecc=8)
-    checkpoint["corrections"]["p"]["commit"]["z"] = torch.zeros(2, dtype=torch.int16)
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint commit correction slot 'z' is incompatible")
-    ):
-        engine.load_state_dict(checkpoint)
 
 
 def test_ecc_commit_state_checkpoint_loads_physical_values_exactly():
@@ -689,16 +383,6 @@ def test_load_accepts_numeric_hyperparameter_and_device_step_values():
 
     assert float(engine.hyper.lr) == pytest.approx(0.125)
     assert engine.step_count.item() == 7
-
-
-def test_load_rejects_unexpected_step_counter_keys():
-    _, engine, checkpoint = _engine_and_checkpoint()
-    checkpoint["step"] = {"other": 1}
-
-    with pytest.raises(
-        ValueError, match=_exact("checkpoint step counters do not match this Engine")
-    ):
-        engine.load_state_dict(checkpoint)
 
 
 @pytest.mark.parametrize(

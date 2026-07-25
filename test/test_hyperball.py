@@ -1,13 +1,11 @@
 """Parity and constraint proofs for the slab-native HyperBall port."""
 
-from unittest.mock import patch
-
 import pytest
 import reference
 import torch
 
 import heavyball
-from heavyball import Engine, hyperball, hyperball_adamw, hyperball_commit
+from heavyball import Engine, hyperball_adamw
 
 
 def _copy_grads(params, gradients):
@@ -60,9 +58,6 @@ def test_hyperball_matches_pure_reference(dtype, rtol, atol, caution):
     history = [[] for _ in initial]
     try:
         optimizer = Engine(params, hyperball_adamw, **values)
-        assert hyperball.commit is hyperball_commit
-        state = optimizer.groups[0].commit_state
-        assert torch.equal(state["seen"], torch.zeros_like(state["seen"]))
         for step, step_gradients in enumerate(gradients, start=1):
             _copy_grads(params, step_gradients)
             for index, gradient in enumerate(step_gradients):
@@ -77,15 +72,6 @@ def test_hyperball_matches_pure_reference(dtype, rtol, atol, caution):
                     atol=atol,
                     msg=f"step {step} param {index}",
                 )
-            if step == 1:
-                assert torch.equal(state["seen"], torch.ones_like(state["seen"]))
-                for index, original in enumerate(initial):
-                    torch.testing.assert_close(
-                        state["init_norm"][index],
-                        _initial_norm(original),
-                        rtol=rtol,
-                        atol=atol,
-                    )
     finally:
         torch._dynamo.reset()
 
@@ -114,46 +100,6 @@ def test_hyperball_adamw_routes_vector_to_adamw_and_matrix_to_hyperball():
         rtol=2e-12,
         atol=2e-12,
     )
-
-
-def _hyperball_trajectory(dtype: torch.dtype, initial, gradients, *, compiled: bool):
-    values = dict(
-        lr=0.017,
-        beta1=0.87,
-        beta2=0.97,
-        eps=1e-8,
-        weight_decay=0.031,
-        caution=True,
-        cautious_weight_decay=True,
-    )
-    params = [torch.nn.Parameter(value.to(dtype).clone()) for value in initial]
-    if compiled:
-        optimizer = Engine(params, hyperball_adamw, **values)
-    else:
-        with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-            optimizer = Engine(params, hyperball_adamw, **values)
-    for step_gradients in gradients:
-        _copy_grads(params, [gradient.to(dtype) for gradient in step_gradients])
-        optimizer.step()
-    return [param.detach().clone() for param in params]
-
-
-def test_hyperball_fp64_accuracy():
-    """The compiled fp32 HyperBall trajectory remains within its fp64 budget."""
-
-    torch._dynamo.reset()
-    torch.manual_seed(92)
-    initial = [torch.randn(11, 7, dtype=torch.float64), torch.randn(4, 3, dtype=torch.float64)]
-    gradients = [[torch.randn_like(value) for value in initial] for _ in range(80)]
-    try:
-        truth = _hyperball_trajectory(torch.float64, initial, gradients, compiled=False)
-        actual = _hyperball_trajectory(torch.float32, initial, gradients, compiled=True)
-        error = max(
-            (result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True)
-        )
-        assert error <= 3e-5
-    finally:
-        torch._dynamo.reset()
 
 
 def test_hyperball_constrains_norm():

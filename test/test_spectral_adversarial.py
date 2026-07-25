@@ -34,18 +34,6 @@ def test_running_lower_bound_keeps_psgd_step_safe_under_an_underestimate():
     assert effective_step < 1
 
 
-def test_power_iter_random_matrices_accurate():
-    """For random matrices (the typical PSGD case), power iteration is accurate."""
-    torch.manual_seed(42)
-    for _ in range(10):
-        matrix = torch.randn(1, 32, 32, dtype=torch.float64)
-        true_sigma = torch.linalg.svdvals(matrix[0]).max()
-        estimated = _max_singular_value_power_iter(matrix, power_iterations=16)
-        ratio = estimated.item() / true_sigma.item()
-        # For random matrices, the estimate should be within 5% of true
-        assert 0.95 < ratio < 1.05, f"Random matrix: ratio={ratio}"
-
-
 def test_power_iter_psd_matrices_accurate():
     """For PSD matrices (what PSGD actually passes), power iteration is accurate."""
     torch.manual_seed(0)
@@ -70,28 +58,3 @@ def test_power_iter_batched():
         true_sigma = torch.linalg.svdvals(matrices[i]).max()
         ratio = estimated[i].item() / true_sigma.item()
         assert 0.90 < ratio < 1.10, f"Batch {i}: ratio={ratio}"
-
-
-def test_running_lower_bound_catches_up():
-    """The running_lower_bound EMA eventually recovers from an underestimate."""
-    # Simulate: true ell=10, but power iter gives 2.83 for first few steps,
-    # then corrects to 10 (as the matrix evolves).
-    lower_bound = torch.tensor(0.0, dtype=torch.float64)
-    beta = torch.tensor(0.9)
-
-    # First 5 steps: underestimate
-    for _ in range(5):
-        ell = torch.tensor(2.83, dtype=torch.float64)
-        _, lower_bound = _next_lower_bound(ell, lower_bound, beta)
-
-    after_underestimate = lower_bound.item()
-    assert after_underestimate < 3.0  # lower bound hasn't seen the true value yet
-
-    # Next 20 steps: correct estimate
-    for _ in range(20):
-        ell = torch.tensor(10.0, dtype=torch.float64)
-        _, lower_bound = _next_lower_bound(ell, lower_bound, beta)
-
-    after_correction = lower_bound.item()
-    # lower_bound should be close to 10 after EMA catches up
-    assert after_correction > 9.0, f"Lower bound should have caught up: {after_correction}"

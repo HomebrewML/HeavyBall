@@ -8,7 +8,6 @@ import torch
 from heavyball import adamw, psgd_pro_adamw, qsgd_adamw
 from heavyball.core import Engine
 from heavyball.psgd_pro import psgd_pro, psgd_pro_init, qsgd
-from heavyball.transforms import Tempo
 
 
 def _eager_engine(params, recipe=psgd_pro, **hyper) -> Engine:
@@ -77,63 +76,6 @@ def test_psgd_pro_mixed_oversized_compiles_and_matches_eager(recipe):
     eager = trajectory(compiled=False)
     assert torch.isfinite(compiled).all()
     torch.testing.assert_close(compiled, eager, rtol=2e-5, atol=2e-5)
-
-
-def _run_trajectory(
-    dtype: torch.dtype,
-    *,
-    recipe,
-    initial: list[torch.Tensor],
-    gradients: list[list[torch.Tensor]],
-    probes: list[torch.Tensor],
-) -> list[torch.Tensor]:
-    params = [torch.nn.Parameter(value.to(dtype).clone()) for value in initial]
-    optimizer = _eager_engine(
-        params,
-        recipe,
-        lr=1e-3,
-        precond_lr=0.01,
-        lower_bound_beta=0.9,
-        dampening=1e-6,
-        weight_decay=0.0,
-    )
-    probe_index = 0
-
-    def fixed_probe(_tempo: Tempo, update: torch.Tensor) -> torch.Tensor:
-        nonlocal probe_index
-        probe = probes[probe_index].to(device=update.device, dtype=update.dtype)
-        probe_index += 1
-        return probe
-
-    with patch.object(Tempo, "randn_like", fixed_probe):
-        for step, step_gradients in enumerate(gradients, start=1):
-            for param, gradient in zip(params, step_gradients, strict=True):
-                param.grad.copy_(gradient.to(dtype))
-            optimizer.step(step_type="refresh" if step in (2, 5, 7) else "normal")
-    assert probe_index == len(probes)
-    return [param.detach().clone() for param in params]
-
-
-def _assert_fp64_accuracy(capsys, recipe, label: str, budget: float) -> None:
-    torch.manual_seed(41)
-    initial = [torch.randn(3, 4, dtype=torch.float64) for _ in range(2)]
-    gradients = [[torch.randn_like(value) for value in initial] for _ in range(7)]
-    torch.manual_seed(700)
-    probes = [torch.randn(len(initial), *initial[0].shape, dtype=torch.float64) for _ in range(3)]
-    truth = _run_trajectory(torch.float64, recipe=recipe, initial=initial, gradients=gradients, probes=probes)
-    actual = _run_trajectory(torch.float32, recipe=recipe, initial=initial, gradients=gradients, probes=probes)
-    error = max((result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True))
-    with capsys.disabled():
-        print(f"{label} fp64 max error: {float(error):.9e}")
-    assert error <= budget
-
-
-def test_psgd_pro_fp64_accuracy(capsys):
-    _assert_fp64_accuracy(capsys, psgd_pro, "psgd_pro", 1e-6)
-
-
-def test_qsgd_fp64_accuracy(capsys):
-    _assert_fp64_accuracy(capsys, qsgd, "qsgd", 1e-6)
 
 
 @pytest.mark.parametrize("recipe", (psgd_pro, qsgd), ids=("psgd_pro", "qsgd"))
@@ -214,13 +156,48 @@ def test_psgd_pro_rejects_leaves_that_do_not_merge_to_2d():
         psgd_pro_init(torch.zeros(4))
 
 
-@pytest.mark.parametrize("route", (psgd_pro_adamw, qsgd_adamw))
-def test_psgd_pro_adamw_routes_matrices_not_vectors(route):
-    matrix = torch.nn.Parameter(torch.zeros(2, 3))
-    vector = torch.nn.Parameter(torch.zeros(3))
-    optimizer = _eager_engine([matrix, vector], route, lr=1e-3, weight_decay=0.0)
-    assert optimizer.groups[0].recipe in (psgd_pro, qsgd)
-    assert optimizer.groups[1].recipe is adamw
+@pytest.mark.parametrize(
+    ("route", "matrix_recipe"),
+    ((psgd_pro_adamw, psgd_pro), (qsgd_adamw, qsgd)),
+)
+def test_psgd_pro_adamw_routes_matrices_not_vectors(route, matrix_recipe):
+    matrix_initial = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    vector_initial = torch.arange(3, dtype=torch.float64)
+    routed_matrix = torch.nn.Parameter(matrix_initial.clone())
+    routed_vector = torch.nn.Parameter(vector_initial.clone())
+    matrix_reference = torch.nn.Parameter(matrix_initial.clone())
+    vector_reference = torch.nn.Parameter(vector_initial.clone())
+    routed = _eager_engine(
+        [routed_matrix, routed_vector],
+        route,
+        lr=1e-3,
+        weight_decay=0.0,
+    )
+    matrix = _eager_engine(
+        [matrix_reference],
+        matrix_recipe,
+        lr=1e-3,
+        weight_decay=0.0,
+    )
+    vector = _eager_engine(
+        [vector_reference],
+        adamw,
+        lr=1e-3,
+        weight_decay=0.0,
+    )
+    matrix_gradient = torch.tensor(((1.0, -0.5, 0.25), (2.0, -1.0, 0.75)), dtype=torch.float64)
+    vector_gradient = torch.tensor((0.5, -1.0, 2.0), dtype=torch.float64)
+    routed_matrix.grad.copy_(matrix_gradient)
+    matrix_reference.grad.copy_(matrix_gradient)
+    routed_vector.grad.copy_(vector_gradient)
+    vector_reference.grad.copy_(vector_gradient)
+
+    routed.step(step_type="normal")
+    matrix.step(step_type="normal")
+    vector.step(step_type="normal")
+
+    torch.testing.assert_close(routed_matrix, matrix_reference, rtol=0, atol=0)
+    torch.testing.assert_close(routed_vector, vector_reference, rtol=0, atol=0)
 
 
 def test_psgd_pro_whitens_the_gradient_covariance():

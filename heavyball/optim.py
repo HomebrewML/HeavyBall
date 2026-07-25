@@ -102,13 +102,6 @@ def _recipe_defaults(recipe: Recipe | Route, overrides: Mapping[str, object]) ->
     return defaults
 
 
-def _recipe_hyperparameters(recipe: Recipe | Route) -> tuple[tuple[str, object, object], ...]:
-    return tuple(
-        (name, (float | None) if default is None else type(default), default)
-        for name, default in _recipe_defaults(recipe, {}).items()
-    )
-
-
 _ENGINE_HYPERPARAMETERS: tuple[tuple[str, str, object], ...] = (
     ("storage_dtype", "torch.dtype | str | None", None),
     ("ecc", "int | str | None", None),
@@ -129,7 +122,11 @@ _ENGINE_HYPERPARAMETER_DEFAULTS = {
 
 
 def _facade_hyperparameters(recipe: Recipe | Route) -> tuple[tuple[str, object, object], ...]:
-    return (*_recipe_hyperparameters(recipe), *_ENGINE_HYPERPARAMETERS)
+    recipe_hyperparameters = (
+        (name, (float | None) if default is None else type(default), default)
+        for name, default in _recipe_defaults(recipe, {}).items()
+    )
+    return (*recipe_hyperparameters, *_ENGINE_HYPERPARAMETERS)
 
 
 def _same_hyper_value(left: object, right: object) -> bool:
@@ -154,16 +151,6 @@ class _TensorHyperSnapshot:
 
 def _snapshot_hyper(value: object) -> object:
     return _TensorHyperSnapshot(value, value._version) if isinstance(value, Tensor) else value
-
-
-def _matches_hyper_snapshot(value: object, snapshot: object) -> bool:
-    if isinstance(value, Tensor):
-        return (
-            isinstance(snapshot, _TensorHyperSnapshot)
-            and snapshot.value is value
-            and snapshot.version == value._version
-        )
-    return not isinstance(snapshot, _TensorHyperSnapshot) and _same_hyper_value(value, snapshot)
 
 
 def _canonical_optimizer_wide_value(name: str, value: object) -> object:
@@ -748,7 +735,19 @@ class HeavyBallOptimizer(torch.optim.Optimizer):
                 if name not in param_group:
                     continue
                 value = param_group[name]
-                if force or not _matches_hyper_snapshot(value, synced.get(name)):
+                snapshot = synced.get(name)
+                if isinstance(value, Tensor):
+                    unchanged = (
+                        isinstance(snapshot, _TensorHyperSnapshot)
+                        and snapshot.value is value
+                        and snapshot.version == value._version
+                    )
+                else:
+                    unchanged = (
+                        not isinstance(snapshot, _TensorHyperSnapshot)
+                        and _same_hyper_value(value, snapshot)
+                    )
+                if force or not unchanged:
                     changed.append((group_id, name, value, synced))
         if not changed:
             return

@@ -8,35 +8,32 @@ import heavyball
 from heavyball.core import build
 
 
-def _no_compile(function, **_kwargs):
-    return function
-
-
-def _lra_state(ambient_seed: int) -> dict[str, torch.Tensor]:
+def _lra_trajectory(ambient_seed: int) -> tuple[torch.Tensor, ...]:
     torch.manual_seed(ambient_seed)
     parameters = [
         torch.nn.Parameter(torch.ones(2, 3)),
-        torch.nn.Parameter(torch.full((2, 3), 2.0)),
+        torch.nn.Parameter(torch.ones(2, 3)),
     ]
-    with patch("heavyball.core.torch.compile", _no_compile):
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
         engine = build(
             parameters,
             heavyball.PSGDLRA.recipe,
             _rng_seed=123,
+            lr=0.01,
             rank=2,
+            weight_decay=0.0,
         )
-    return next(
-        state
-        for state in engine.groups[0].states
-        if {"U", "V", "d"}.issubset(state)
-    )
+    gradient = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    for parameter in parameters:
+        parameter.grad.copy_(gradient)
+    engine.step(step_type="refresh")
+    return tuple(parameter.detach().clone() for parameter in parameters)
 
 
-def test_lra_initial_state_uses_synchronized_seed_not_ambient_rng():
-    first = _lra_state(1)
-    second = _lra_state(999)
+def test_lra_uses_synchronized_seed_not_ambient_rng():
+    first = _lra_trajectory(1)
+    second = _lra_trajectory(999)
 
-    assert torch.equal(first["U"], second["U"])
-    assert torch.equal(first["V"], second["V"])
-    assert not torch.equal(first["U"][0], first["U"][1])
-    assert not torch.equal(first["V"][0], first["V"][1])
+    for left, right in zip(first, second, strict=True):
+        assert torch.equal(left, right)
+    assert not torch.equal(first[0], first[1])

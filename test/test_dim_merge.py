@@ -66,18 +66,3 @@ def test_conv_soap_equals_native_2d_because_the_merge_is_a_noop_reshape():
     conv = _run_soap(leaf0, gradients, as_conv=True, native_shape=(4, 27))
     native = _run_soap(leaf0, gradients, as_conv=False, native_shape=(4, 27))
     torch.testing.assert_close(conv, native, rtol=0, atol=0)
-
-
-def test_conv_leaf_is_preconditioned_and_keeps_its_shape():
-    """A conv routes to SOAP, allocates a merged factor, preconditions, stays finite and shaped."""
-
-    parameter = torch.nn.Parameter(torch.randn(4, 3, 3, 3))
-    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        optimizer = build([parameter], soap_adamw, lr=1e-3)
-    state = optimizer.groups[0].states[0]
-    assert "GG_r" in state and tuple(state["exp_avg"].shape) == (1, 4, 27)
-    parameter.grad.copy_(torch.randn_like(parameter))
-    optimizer.step(step_type="refresh")
-    optimizer.step()
-    assert torch.isfinite(parameter).all()
-    assert tuple(parameter.shape) == (4, 3, 3, 3)

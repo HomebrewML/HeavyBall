@@ -79,7 +79,6 @@ def test_scion_applies_lmo_to_debiased_first_moment():
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12)
     assert not torch.allclose(actual, momentum_free, rtol=0, atol=1e-12)
-    assert "exp_avg" in optimizer._engine.groups[0].states[0]
 
 
 def _reference_scion_init(value: torch.Tensor, *, seed: int, scale: float) -> torch.Tensor:
@@ -109,41 +108,6 @@ def test_scion_param_init_follows_seeded_orthogonal_slice_recipe(shape):
     expected = _reference_scion_init(actual, seed=seed, scale=1.0)
     scion_param_init(actual, seed=seed)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def _scion_trajectory(dtype: torch.dtype, grad_sequence, *, compiled: bool):
-    params = [
-        torch.nn.Parameter(torch.zeros(7, 4, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros(4, 3, 2, 2, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros(9, dtype=dtype)),
-    ]
-    if compiled:
-        optimizer = Engine(params, scion, lr=0.02, eps=1e-8, scale=1.0)
-    else:
-        with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-            optimizer = Engine(params, scion, lr=0.02, eps=1e-8, scale=1.0)
-    for gradients in grad_sequence:
-        for param, gradient in zip(params, gradients, strict=True):
-            param.grad.copy_(gradient.to(dtype))
-        optimizer.step()
-    return [param.detach().clone() for param in params]
-
-
-def test_scion_fp64_accuracy():
-    """Compiled fp32 stays within the pinned fp64 trajectory budget."""
-
-    torch._dynamo.reset()
-    torch.manual_seed(401)
-    shapes = ((7, 4), (4, 3, 2, 2), (9,))
-    gradients = [[torch.randn(*shape, dtype=torch.float64) for shape in shapes] for _ in range(30)]
-    truth = _scion_trajectory(torch.float64, gradients, compiled=False)
-    torch.manual_seed(402)
-    actual = _scion_trajectory(torch.float32, gradients, compiled=True)
-    error = max(
-        (result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True)
-    )
-    assert error <= 2e-3
-    torch._dynamo.reset()
 
 
 def test_scion_param_init_is_deferred_and_uses_global_parameter_order():

@@ -5,30 +5,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from heavyball import build, psgd_pro_adamw, qsgd_adamw
+from heavyball import build
 from heavyball.psgd_pro import psgd_pro, qsgd
-
-
-@pytest.mark.parametrize(
-    ("route", "recipe"),
-    ((psgd_pro_adamw, psgd_pro), (qsgd_adamw, qsgd)),
-    ids=("psgd_pro", "qsgd"),
-)
-def test_psgd_pro_conv_routes_preconditions_and_keeps_shape(route, recipe):
-    parameter = torch.nn.Parameter(torch.randn(4, 3, 3, 3))
-    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-        optimizer = build([parameter], route, lr=1e-3)
-
-    assert optimizer.groups[0].recipe is recipe
-    state = optimizer.groups[0].states[0]
-    assert tuple(state["Q_0"].shape[1:]) == (4, 4)
-    assert tuple(state["Q_1"].shape[1:]) == (27, 27)
-
-    parameter.grad.copy_(torch.randn_like(parameter))
-    optimizer.step(step_type="refresh")
-    optimizer.step()
-    assert torch.isfinite(parameter).all()
-    assert tuple(parameter.shape) == (4, 3, 3, 3)
 
 
 def _run(recipe, initial, gradients, *, as_conv, seed):

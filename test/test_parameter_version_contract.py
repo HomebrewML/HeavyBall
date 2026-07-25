@@ -11,9 +11,12 @@ import torch
 import torch.nn as nn
 
 
-def _probe(make_opt):
+def test_heavyball_commit_bumps_version_like_torch():
+    with patch("heavyball.core.torch.compile", lambda f, **k: f):
+        import heavyball
+
     p = nn.Parameter(torch.tensor([2.0]))
-    opt = make_opt([p])
+    opt = heavyball.SGD([p], lr=0.1)
     y = (p * p).sum()
     opt.zero_grad()
     y.backward(retain_graph=True)
@@ -27,14 +30,6 @@ def _probe(make_opt):
     except RuntimeError:
         errored = True
     second_grad = None if errored else float(p.grad.item())
-    return v0, v1, errored, second_grad
-
-
-def test_heavyball_commit_bumps_version_like_torch():
-    with patch("heavyball.core.torch.compile", lambda f, **k: f):
-        import heavyball
-
-        v0, v1, errored, second_grad = _probe(lambda ps: heavyball.SGD(ps, lr=0.1))
     assert v1 > v0, (
         f"commit did not bump Parameter._version ({v0} -> {v1}); the update is invisible to autograd"
     )

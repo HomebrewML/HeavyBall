@@ -24,23 +24,20 @@ MATRIX_OPTS = ["SOAP", "Shampoo", "KLSOAP", "SOAPNAdam", "PSGDKron", "PSGDPro", 
 SHAPE = (32, 24)
 
 
-def _reachable_patterns(g):
-    m, n = SHAPE
-    u = torch.randn(m, 1, generator=g, device="cuda")
-    v = torch.randn(1, n, generator=g, device="cuda")
-    const = torch.randn(SHAPE, generator=g, device="cuda")
-    return {
-        "rank_one": lambda s: u @ v,  # covariance is exactly rank one -> singular
-        "all_zero": lambda s: torch.zeros(SHAPE, device="cuda"),
-        "constant": lambda s: const,  # identical each step -> rank-one accumulation
-        "underflow": lambda s: 1e-30 * const,
-    }
-
-
 @pytest.mark.parametrize("name", MATRIX_OPTS)
 def test_reachable_pathological_gradients_stay_finite(name):
     g = torch.Generator(device="cuda").manual_seed(0)
-    for pattern, make_grad in _reachable_patterns(g).items():
+    rows, columns = SHAPE
+    left = torch.randn(rows, 1, generator=g, device="cuda")
+    right = torch.randn(1, columns, generator=g, device="cuda")
+    constant = torch.randn(SHAPE, generator=g, device="cuda")
+    patterns = {
+        "rank_one": lambda _: left @ right,
+        "all_zero": lambda _: torch.zeros(SHAPE, device="cuda"),
+        "constant": lambda _: constant,
+        "underflow": lambda _: 1e-30 * constant,
+    }
+    for pattern, make_grad in patterns.items():
         weight = torch.nn.Parameter(torch.randn(SHAPE, generator=g, device="cuda"))
         opt = getattr(heavyball, name)([weight], lr=1e-3)
         for step in range(20):  # exceed any preconditioner-refresh cadence

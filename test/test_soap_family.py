@@ -96,13 +96,6 @@ def test_refresh_preserves_physical_moments(recipe, inner, transported, extra_hy
         )
 
 
-def _hadamard_square(second_moment, left_old, left_new, right_old, right_new):
-    # The diagonal variance re-expressed in the new basis: each variance rotates as the squared change.
-    left = (left_old.mT @ left_new).square()
-    right = (right_old.mT @ right_new).square()
-    return torch.einsum("ab,ac,bd->cd", second_moment.square(), left, right).clamp_min(0).sqrt()
-
-
 @pytest.mark.parametrize("recipe,inner,transported,extra_hyper,inner_keys", _VARIANTS)
 def test_refresh_transports_second_moment(recipe, inner, transported, extra_hyper, inner_keys):
     torch.manual_seed(2)
@@ -127,5 +120,12 @@ def test_refresh_transports_second_moment(recipe, inner, transported, extra_hype
     refreshed = run(refresh_last=True)
     held = run(refresh_last=False)  # identical inner second moment, left in the old basis
     assert not torch.allclose(refreshed["Q_l"], held["Q_l"])  # the final refresh actually rotated the basis
-    expected = _hadamard_square(held["exp_avg_sq"], held["Q_l"], refreshed["Q_l"], held["Q_r"], refreshed["Q_r"])
+    left = (held["Q_l"].mT @ refreshed["Q_l"]).square()
+    right = (held["Q_r"].mT @ refreshed["Q_r"]).square()
+    expected = torch.einsum(
+        "ab,ac,bd->cd",
+        held["exp_avg_sq"].square(),
+        left,
+        right,
+    ).clamp_min(0).sqrt()
     torch.testing.assert_close(refreshed["exp_avg_sq"], expected, rtol=0, atol=1e-10)

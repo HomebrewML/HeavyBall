@@ -21,19 +21,18 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("shape", ((1, 16), (1, 3, 16)))
 def test_leading_singleton_shape_routing(name, shape):
     torch.manual_seed(0)
-    p = nn.Parameter(torch.randn(shape).cuda())
+    initial = torch.randn(shape, device="cuda")
+    parameter = nn.Parameter(initial.clone())
+    reference = nn.Parameter(initial.clone())
     lr = inspect.signature(getattr(heavyball, name)).parameters["lr"].default
-    opt = getattr(heavyball, name)([p], lr=lr)
-    before = p.detach().clone()
-
-    assert len(opt._engine.groups) == 1
-    assert opt._engine.groups[0].recipe is heavyball.adamw
+    optimizer = getattr(heavyball, name)([parameter], lr=lr)
+    adamw = heavyball.AdamW([reference], lr=lr)
 
     for _ in range(4):
-        g = torch.randn(shape, device="cuda") * 0.1
-        (p * g).sum().backward()
-        opt.step()
-        opt.zero_grad()
+        gradient = torch.randn(shape, device="cuda") * 0.1
+        parameter.grad.copy_(gradient)
+        reference.grad.copy_(gradient)
+        optimizer.step()
+        adamw.step()
 
-    assert torch.isfinite(p).all(), f"{name} {shape}: non-finite"
-    assert not torch.equal(p, before), f"{name} {shape}: did not move"
+    torch.testing.assert_close(parameter, reference, rtol=0, atol=0)

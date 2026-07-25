@@ -341,7 +341,6 @@ def _soap_factory(inner: Transform, transported=("exp_avg",), squared=("exp_avg_
                 inner_state[name] = _transport_exp_avg(
                     inner_state[name], old_left, old_right, next_left, next_right
                 )
-            # Diagonal variances must be transported when the basis changes.
             for name in squared:
                 inner_state[name] = _transport_exp_avg_sq(
                     inner_state[name], old_left, old_right, next_left, next_right

@@ -8,18 +8,10 @@ from heavyball.core import Engine
 from heavyball.lra import _lra_precond, lra, make_psgd_lra
 
 
-def _no_compile(function, **kwargs):
-    return function
-
-
 @pytest.fixture(autouse=True)
 def disable_compile():
-    with patch("heavyball.core.torch.compile", _no_compile):
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
         yield
-
-
-def _mv_dense(matrix, vector):
-    return (matrix @ vector.unsqueeze(-1)).squeeze(-1)
 
 
 def test_lra_precond_matches_dense_qtq():
@@ -31,7 +23,8 @@ def test_lra_precond_matches_dense_qtq():
     identity = torch.eye(flat, dtype=torch.float64).expand(batch, -1, -1)
     q = (identity + U @ V.mT) * d.unsqueeze(-2)
     result = _lra_precond(g, U, V, d)
-    torch.testing.assert_close(result, _mv_dense(q.mT @ q, g))
+    expected = ((q.mT @ q) @ g.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(result, expected)
 
 
 def test_lra_different_ranks():

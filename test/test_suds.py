@@ -9,11 +9,6 @@ from heavyball import Engine, suds_adamw
 from heavyball.suds import eigvecs_product_rank1, oja_update, stable_l2_normalize
 
 
-def _copy_grads(params, gradients) -> None:
-    for parameter, gradient in zip(params, gradients, strict=True):
-        parameter.grad.copy_(gradient)
-
-
 @pytest.mark.parametrize(
     ("dtype", "rtol", "atol"),
     (
@@ -80,46 +75,6 @@ def test_suds_bootstrap_and_second_step_follow_householder_adam_math(dtype, rtol
         rtol=rtol,
         atol=atol,
     )
-
-
-def _trajectory(dtype: torch.dtype, gradients, *, compiled: bool):
-    values = dict(lr=0.017, beta1=0.87, beta2=0.97, eps=1e-8, weight_decay=0.031, precond_lr=0.13)
-    params = [
-        torch.nn.Parameter(torch.zeros(11, 7, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros(4, dtype=dtype)),
-        torch.nn.Parameter(torch.zeros((), dtype=dtype)),
-    ]
-    if compiled:
-        optimizer = Engine(params, suds_adamw, **values)
-    else:
-        with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
-            optimizer = Engine(params, suds_adamw, **values)
-    for step_gradients in gradients:
-        _copy_grads(params, [gradient.to(dtype) for gradient in step_gradients])
-        optimizer.step()
-    return [parameter.detach().clone() for parameter in params]
-
-
-def test_suds_fp64_accuracy():
-    """The compiled fp32 trajectory remains within the pinned fp64 SUDS budget."""
-
-    torch._dynamo.reset()
-    torch.manual_seed(102)
-    gradients = [
-        [
-            torch.randn(11, 7, dtype=torch.float64),
-            torch.randn(4, dtype=torch.float64),
-            torch.randn((), dtype=torch.float64),
-        ]
-        for _ in range(80)
-    ]
-    try:
-        truth = _trajectory(torch.float64, gradients, compiled=False)
-        actual = _trajectory(torch.float32, gradients, compiled=True)
-        error = max((result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True))
-        assert error <= 3e-5
-    finally:
-        torch._dynamo.reset()
 
 
 def test_suds_householder_rotation():

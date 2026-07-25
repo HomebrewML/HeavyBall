@@ -25,13 +25,6 @@ def _lra_precond(update_flat: Tensor, U: Tensor, V: Tensor, d: Tensor) -> Tensor
     return d * _lra_low_rank_mm(V, U, q_update)
 
 
-def _balance_lra(U: Tensor, V: Tensor) -> tuple[Tensor, Tensor]:
-    """Balance the low-rank factor maxima without changing their product."""
-
-    U, V = balance_factors([U, V])
-    return U, V
-
-
 def _mv(matrix: Tensor, vector: Tensor) -> Tensor:
     return (matrix @ vector.unsqueeze(-1)).squeeze(-1)
 
@@ -45,7 +38,7 @@ def _refresh_lra(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Run one scale-normalized fp32 Lie-group refresh."""
 
-    U, V = _balance_lra(U, V)
+    U, V = balance_factors([U, V])
     vector = tempo.randn_like(update_flat)
     eps = torch.finfo(update_flat.dtype).eps
     dimensions = tuple(range(1, update_flat.ndim))

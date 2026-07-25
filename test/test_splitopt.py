@@ -35,14 +35,6 @@ def _split_optimizer(model):
     return optimizer, matrices, vectors
 
 
-def _gradient(parameter, parameter_index, step):
-    gradient = torch.arange(
-        parameter.numel(), dtype=parameter.dtype, device=parameter.device
-    ).reshape_as(parameter)
-    gradient = gradient.mul(0.013 * (parameter_index + 1)).add(-0.2 + 0.037 * step)
-    return gradient.neg() if (parameter_index + step) % 2 else gradient
-
-
 def _train(model, optimizer, inputs, targets, steps):
     for _ in range(steps):
         ((model(inputs) - targets) ** 2).mean().backward()
@@ -86,7 +78,14 @@ def test_delegates_each_parameter_family_to_its_assigned_optimizer():
         for index, (split_parameter, standalone_parameter) in enumerate(
             zip(split_model.parameters(), standalone_model.parameters(), strict=True)
         ):
-            gradient = _gradient(split_parameter, index, step)
+            gradient = torch.arange(
+                split_parameter.numel(),
+                dtype=split_parameter.dtype,
+                device=split_parameter.device,
+            ).reshape_as(split_parameter)
+            gradient = gradient.mul(0.013 * (index + 1)).add(-0.2 + 0.037 * step)
+            if (index + step) % 2:
+                gradient = gradient.neg()
             split_parameter.grad.copy_(gradient)
             standalone_parameter.grad.copy_(gradient)
 

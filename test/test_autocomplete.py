@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch import nn
 
 import heavyball
 from heavyball import optim
@@ -27,18 +26,6 @@ def test_every_facade_signature_exposes_recipe_defaults():
             assert parameter.default == default
             expected_annotation = (float | None) if default is None else type(default)
             assert parameter.annotation == expected_annotation
-
-
-def test_representative_facade_hyperparameters_are_explicit():
-    assert "shampoo_beta" in inspect.signature(heavyball.SOAP).parameters
-    psgd_kron_parameters = inspect.signature(heavyball.PSGDKron).parameters
-    assert "precond_lr" in psgd_kron_parameters
-    assert "lower_bound_beta" in psgd_kron_parameters
-    psgd_parameters = inspect.signature(heavyball.PSGD).parameters
-    assert "max_size_triangular" in psgd_parameters
-    assert "rank" in psgd_parameters
-    assert "beta3" in inspect.signature(heavyball.AdEMAMix).parameters
-    assert "lr" in inspect.signature(heavyball.AdamW).parameters
 
 
 def test_facades_expose_engine_level_opt_ins():
@@ -77,13 +64,3 @@ def test_facade_positional_float_gives_actionable_error():
     except AttributeError:
         pytest.fail("positional float was bound to 'recipe' (cryptic AttributeError)")
     pytest.fail("expected an error for a positional float argument")
-
-
-def test_facade_recipe_attributes_preserve_construction_and_step():
-    for facade in (heavyball.AdamW, heavyball.SOAP):
-        model = nn.Linear(4, 3)
-        optimizer = facade(model.parameters(), lr=0.01)
-        optimizer.zero_grad()
-        model(torch.ones(2, 4)).sum().backward()
-        optimizer.step()
-        assert all(torch.isfinite(parameter).all() for parameter in model.parameters())

@@ -8,18 +8,6 @@ from heavyball.numerics import stochastic_copy_
 from heavyball.transforms import _STATE_PHILOX_ROUNDS, Tempo
 
 
-def _tempo() -> Tempo:
-    return Tempo(
-        torch.zeros((), dtype=torch.int64),
-        torch.zeros(1, dtype=torch.int64),
-        torch.ones(1, dtype=torch.bool),
-        object(),
-        False,
-        base_seed=torch.tensor((1, 2), dtype=torch.int64),
-        leaf_indices=torch.zeros(1, dtype=torch.int64),
-    )
-
-
 def _fp32_state_trajectory(state_rounds: int) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     initial = torch.linspace(-1.0, 1.0, 32, dtype=torch.float32).bfloat16()
     generator = torch.Generator().manual_seed(731)
@@ -46,7 +34,15 @@ def _fp32_state_trajectory(state_rounds: int) -> tuple[torch.Tensor, tuple[torch
 
 
 def test_param_rounds_default_seven():
-    tempo = _tempo()
+    tempo = Tempo(
+        torch.zeros((), dtype=torch.int64),
+        torch.zeros(1, dtype=torch.int64),
+        torch.ones(1, dtype=torch.bool),
+        object(),
+        False,
+        base_seed=torch.tensor((1, 2), dtype=torch.int64),
+        leaf_indices=torch.zeros(1, dtype=torch.int64),
+    )
 
     assert tempo.rounds == 7
     assert torch.equal(tempo.random_like(torch.zeros(1, 8)), tempo._replace(rounds=7).random_like(torch.zeros(1, 8)))

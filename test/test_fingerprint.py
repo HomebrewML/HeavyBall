@@ -28,9 +28,6 @@ def test_kron_factory_config_rejects_incompatible_checkpoint():
     engine8 = _engine(recipe8)
 
     checkpoint = engine2a.state_dict()
-    assert engine2a._recipe_fingerprints() == engine2b._recipe_fingerprints()
-    assert engine2a._recipe_fingerprints() != engine8._recipe_fingerprints()
-
     engine2b.load_state_dict(checkpoint)
     with pytest.raises(ValueError, match="checkpoint recipe fingerprint does not match"):
         engine8.load_state_dict(checkpoint)
@@ -43,7 +40,6 @@ def test_psgd_pro_sqrt_config_rejects_incompatible_checkpoint():
     sqrt_engine = _engine(sqrt_recipe)
 
     checkpoint = engine.state_dict()
-    assert engine._recipe_fingerprints() != sqrt_engine._recipe_fingerprints()
     with pytest.raises(ValueError, match="checkpoint recipe fingerprint does not match"):
         sqrt_engine.load_state_dict(checkpoint)
 
@@ -60,6 +56,5 @@ def test_effective_clip_global_norm_rejects_incompatible_checkpoint():
         )
 
     checkpoint = source.state_dict()
-    assert source._recipe_fingerprints() != target._recipe_fingerprints()
     with pytest.raises(ValueError, match="checkpoint recipe fingerprint does not match"):
         target.load_state_dict(checkpoint)

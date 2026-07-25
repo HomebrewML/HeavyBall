@@ -21,16 +21,6 @@ def _trajectory(facade, *, storage_dtype=...):
     return parameter.detach().clone(), optimizer
 
 
-def _state_slabs(optimizer):
-    return [
-        slab
-        for engine in optimizer._engines
-        for group in engine.groups
-        for slots in (*group.states, group.commit_state)
-        for slab in slots.values()
-    ]
-
-
 def test_default_is_bit_for_bit():
     for facade in (heavyball.AdamW, heavyball.SOAP):
         default, _ = _trajectory(facade)
@@ -41,7 +31,13 @@ def test_default_is_bit_for_bit():
 @pytest.mark.parametrize("facade", _FACADES)
 def test_bf16_state_is_allocated_and_close(facade):
     bf16_parameter, bf16_optimizer = _trajectory(facade, storage_dtype=torch.bfloat16)
-    slabs = _state_slabs(bf16_optimizer)
+    slabs = [
+        slab
+        for engine in bf16_optimizer._engines
+        for group in engine.groups
+        for slots in (*group.states, group.commit_state)
+        for slab in slots.values()
+    ]
     assert slabs
     assert any(slab.dtype is torch.bfloat16 for slab in slabs)
     assert all(slab.dtype in (torch.bfloat16, torch.float64) for slab in slabs)

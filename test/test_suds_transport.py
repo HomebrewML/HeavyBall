@@ -3,7 +3,7 @@
 Four invariants:
 1. Physical first-moment invariance: m_stored @ H(fisher_stored) is the same before and after transport.
 2. Unchanged basis => unchanged moments (identity transport).
-3. Second-moment trace preservation: sum(q) is conserved.
+3. Second-moment trace preservation: sum(rms**2) is conserved.
 4. Rotating-basis momentum convergence: under a steadily rotating basis with constant physical gradient,
    transported momentum converges to the true gradient; untransported momentum lags with magnitude
    |1-beta| / |1 - beta*exp(i*delta)| < 1 and nonzero phase error.
@@ -62,7 +62,7 @@ def test_unchanged_basis_preserves_moments(rng):
 
 
 def test_second_moment_trace_preserved(rng):
-    """sum(q_new) == sum(q_old) per leaf."""
+    """The variance trace is invariant under the basis change."""
     n, d = 8, 64
     fisher_old = _random_fisher(n, d, rng)
     fisher_new = _random_fisher(n, d, rng)
@@ -71,7 +71,12 @@ def test_second_moment_trace_preserved(rng):
     q = torch.rand(n, d, generator=rng, dtype=torch.float64).clamp_min(1e-8)
 
     q_new = _transport_rank1_second_moment(q, w_old, w_new)
-    torch.testing.assert_close(q.sum(dim=-1), q_new.sum(dim=-1), atol=1e-10, rtol=0)
+    torch.testing.assert_close(
+        q.square().sum(dim=-1),
+        q_new.square().sum(dim=-1),
+        atol=1e-10,
+        rtol=0,
+    )
 
 
 def test_second_moment_matches_dense(rng):
@@ -86,7 +91,7 @@ def test_second_moment_matches_dense(rng):
     H_old = torch.eye(d, dtype=torch.float64) - 2.0 * w_old.unsqueeze(-1) * w_old.unsqueeze(-2)
     H_new = torch.eye(d, dtype=torch.float64) - 2.0 * w_new.unsqueeze(-1) * w_new.unsqueeze(-2)
     C = H_old @ H_new
-    q_dense = torch.einsum("ni,nij->nj", q, C.square())
+    q_dense = torch.einsum("ni,nij->nj", q.square(), C.square()).clamp_min(0).sqrt()
 
     q_fast = _transport_rank1_second_moment(q, w_old, w_new)
     torch.testing.assert_close(q_fast, q_dense, atol=1e-10, rtol=0)

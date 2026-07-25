@@ -4,13 +4,12 @@ import torch
 from heavyball.codecs import decode, encode
 
 
-def _random_values() -> list[torch.Tensor]:
-    generator = torch.Generator().manual_seed(1729)
-    return [torch.randn(4096, generator=generator) * scale for scale in (2.0**-20, 2.0**-7, 1.0, 2.0**9)]
-
-
 def test_correction_recovers_precision():
-    values = _random_values()
+    generator = torch.Generator().manual_seed(1729)
+    values = [
+        torch.randn(4096, generator=generator) * scale
+        for scale in (2.0**-20, 2.0**-7, 1.0, 2.0**9)
+    ]
     value = torch.cat(values)
 
     torch.manual_seed(100)
@@ -22,10 +21,6 @@ def test_correction_recovers_precision():
     int8_error = (value - decode(narrow8, correction8, torch.int8)).abs().mean()
     int16_error = (value - decode(narrow16, correction16, torch.int16)).abs().mean()
 
-    print(
-        f"reconstruction MAE: bf16={bf16_error.item():.9e}, "
-        f"bf16+int8={int8_error.item():.9e}, bf16+int16={int16_error.item():.9e}"
-    )
     assert int8_error < bf16_error / 8
     assert int16_error < bf16_error / 100
 

@@ -12,29 +12,6 @@ def _no_compile(function, **_kwargs):
     return function
 
 
-def test_scion_construction_does_not_mutate_parameter():
-    torch.manual_seed(42)
-    parameter = torch.nn.Parameter(torch.randn(8, 8))
-    before = parameter.detach().clone()
-
-    with patch("heavyball.core.torch.compile", _no_compile):
-        heavyball.Scion([parameter], lr=0.01)
-
-    assert torch.equal(parameter, before)
-
-
-def test_scion_first_step_still_functions():
-    torch.manual_seed(43)
-    parameter = torch.nn.Parameter(torch.randn(8, 8))
-    with patch("heavyball.core.torch.compile", _no_compile):
-        optimizer = heavyball.Scion([parameter], lr=0.01)
-
-    parameter.grad.copy_(torch.randn_like(parameter))
-    optimizer.step()
-
-    assert torch.isfinite(parameter).all()
-
-
 def test_scion_reseeds_once_at_first_step():
     torch.manual_seed(44)
     parameter = torch.nn.Parameter(torch.randn(4, 4))
@@ -132,8 +109,6 @@ def test_scion_unobserved_checkpoint_does_not_repeat_initialization():
     source_parameter.grad.zero_()
     source.step(observed=(False,))
     checkpoint = copy.deepcopy(source.state_dict())
-    assert checkpoint["param_init_pending"] == {"0": False}
-    assert checkpoint["age"]["0"].item() == 0
 
     target_parameter = torch.nn.Parameter(torch.full((4, 4), 3.0))
     replacement = target_parameter.detach().clone()

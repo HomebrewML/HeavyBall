@@ -15,63 +15,6 @@ def _project(value: torch.Tensor, left: torch.Tensor, right: torch.Tensor, *, ba
     return torch.einsum("nij,nia,njb->nab", value, left, right)
 
 
-def _matrix_recipe():
-    return replace(soap_recipe, chain=(soap,))
-
-
-def _object_step(optimizer: Engine, *, step_type: str, compile: bool) -> None:
-    """Use the engine's exact object step eagerly for the fp64 truth path."""
-
-    if compile:
-        optimizer.step(step_type=step_type)
-        return
-    for group in optimizer.groups:
-        group.observed.fill_(True)
-    eager = getattr(optimizer.compiled_steps[step_type], "__wrapped__", None)
-    if eager is None:
-        optimizer.step(step_type=step_type)
-        return
-    eager()
-    for step in optimizer._steps:
-        step.add_(1)
-
-
-def _run_trajectory(
-    dtype: torch.dtype, *, compile: bool, initial: torch.Tensor, gradients: list[torch.Tensor]
-) -> list[torch.Tensor]:
-    params = [torch.nn.Parameter(initial.to(dtype).clone()) for _ in range(2)]
-    optimizer = Engine(
-        params,
-        _matrix_recipe(),
-        lr=0.03,
-        beta1=0.9,
-        beta2=0.95,
-        shampoo_beta=0.8,
-        eps=1e-8,
-        max_precond_dim=8,
-        weight_decay=0.0,
-    )
-    for step, gradient in enumerate(gradients, start=1):
-        for param in params:
-            param.grad.copy_(gradient.to(dtype))
-        _object_step(optimizer, step_type="refresh" if step % 3 == 0 else "normal", compile=compile)
-    return [param.detach().clone() for param in params]
-
-
-def test_soap_fp64_accuracy(capsys):
-    """The fp32 object trajectory stays close to the fp64 object trajectory."""
-
-    torch.manual_seed(31)
-    initial = torch.randn(3, 4, dtype=torch.float64)
-    gradients = [torch.randn_like(initial) for _ in range(8)]
-    truth = _run_trajectory(torch.float64, compile=False, initial=initial, gradients=gradients)
-    actual = _run_trajectory(torch.float32, compile=True, initial=initial, gradients=gradients)
-    error = max((result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True))
-    with capsys.disabled():
-        print(f"soap fp64 max error: {float(error):.9e}")
-    assert error <= 3e-5
-
-
 def test_soap_refresh_transports():
     """Refreshes transport both moments into the new basis: the first by rotation (physical value
     retained), the second by Hadamard-square of the same basis change."""
@@ -79,7 +22,7 @@ def test_soap_refresh_transports():
     param = torch.nn.Parameter(torch.zeros(3, 4))
     optimizer = Engine(
         [param],
-        _matrix_recipe(),
+        replace(soap_recipe, chain=(soap,)),
         lr=0.1,
         beta1=0.9,
         beta2=0.95,

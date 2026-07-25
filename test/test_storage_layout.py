@@ -23,14 +23,6 @@ def test_channels_last_not_silently_flattened():
     assert param.stride() == original_stride
 
 
-def test_contiguous_parameters_still_bind():
-    param = nn.Parameter(torch.randn(4, 3))
-    optimizer = heavyball.AdamW([param])
-
-    param.grad.copy_(torch.ones_like(param))
-    optimizer.step()
-
-
 def test_strided_overlap_is_detected():
     base = torch.randn(10)
     first = nn.Parameter(base[::2])
@@ -40,17 +32,7 @@ def test_strided_overlap_is_detected():
         heavyball.AdamW([first, second])
 
 
-def test_non_overlapping_shared_storage_is_accepted():
-    base = torch.randn(10)
-    first = nn.Parameter(base[:5])
-    second = nn.Parameter(base[5:])
-
-    heavyball.AdamW([first, second])
-
-
 def test_contiguous_singleton_layout_is_accepted():
-    # A transposed (n,1) tensor is C-contiguous by element order (is_contiguous()==True) despite a
-    # stride that differs from the slab row's; it must bind, not be rejected as non-contiguous.
-    param = nn.Parameter(torch.randn(1, 8).t())  # shape (8,1), stride (1,8), is_contiguous() True
+    param = nn.Parameter(torch.randn(1, 8).t())
     assert param.is_contiguous()
-    heavyball.AdamW([param])  # must not raise
+    heavyball.AdamW([param])

@@ -24,15 +24,6 @@ from .transforms import Tempo, _second_moment, _second_moment_denom, sgd_commit
 _DEFAULT_INIT_FACTOR = 0.1
 
 
-def _initial_factor(ref: Tensor, init_factor: Tensor | float) -> Tensor:
-    """Match legacy KL's finite, strictly positive eigenvalue initializer."""
-
-    factor = torch.as_tensor(init_factor, dtype=ref.dtype, device=ref.device)
-    if factor.numel() != 1 or not bool(torch.isfinite(factor) & (factor > 0)):
-        raise ValueError("init_factor must be finite and positive")
-    return factor.reshape(())
-
-
 def _kl_state(
     ref_leaf: Tensor, *, init_factor: Tensor | float = _DEFAULT_INIT_FACTOR, max_precond_dim: Tensor
 ) -> dict[str, Tensor]:
@@ -41,7 +32,10 @@ def _kl_state(
     state = soap_init(ref_leaf, max_precond_dim=max_precond_dim)
     ref = _wide(ref_leaf)
     rows, columns = _merged_matrix_dimensions(tuple(ref_leaf.shape), int(max_precond_dim))
-    factor = _initial_factor(ref, init_factor)
+    factor = torch.as_tensor(init_factor, dtype=ref.dtype, device=ref.device)
+    if factor.numel() != 1 or not bool(torch.isfinite(factor) & (factor > 0)):
+        raise ValueError("init_factor must be finite and positive")
+    factor = factor.reshape(())
     if "GG_l" in state:
         state["eigenvalues_l"] = torch.ones(
             (rows,), dtype=ref.dtype, device=ref.device

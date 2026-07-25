@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -69,67 +70,18 @@ def _assert_differs_from_base(truegrad_recipe, base_recipe, **hyperparameters):
         assert not torch.allclose(truegrad_param, base_param, rtol=1e-5, atol=1e-7)
 
 
-def test_truegrad_rmsprop_matches_base_when_observation_equals_grad_squared():
-    _assert_matches_base(
-        heavyball.truegrad_rmsprop,
-        heavyball.rmsprop,
-        lr=0.05,
-        beta2=0.99,
-        eps=1e-8,
-    )
-
-
-def test_truegrad_rmsprop_differs_from_base_when_observation_differs():
-    _assert_differs_from_base(
-        heavyball.truegrad_rmsprop,
-        heavyball.rmsprop,
-        lr=0.05,
-        beta2=0.99,
-        eps=1e-8,
-    )
-
-
-def test_truegrad_laprop_matches_base_when_observation_equals_grad_squared():
-    _assert_matches_base(
-        heavyball.truegrad_laprop,
-        heavyball.laprop,
-        lr=0.05,
-        beta1=0.9,
-        beta2=0.99,
-        eps=1e-8,
-    )
-
-
-def test_truegrad_laprop_differs_from_base_when_observation_differs():
-    _assert_differs_from_base(
-        heavyball.truegrad_laprop,
-        heavyball.laprop,
-        lr=0.05,
-        beta1=0.9,
-        beta2=0.99,
-        eps=1e-8,
-    )
-
-
-def test_truegrad_nadam_matches_base_when_observation_equals_grad_squared():
-    _assert_matches_base(
+_CASES = (
+    (heavyball.truegrad_rmsprop, heavyball.rmsprop, dict(lr=0.05, beta2=0.99, eps=1e-8)),
+    (heavyball.truegrad_laprop, heavyball.laprop, dict(lr=0.05, beta1=0.9, beta2=0.99, eps=1e-8)),
+    (
         heavyball.truegrad_nadam,
         heavyball.nadam,
-        lr=0.05,
-        beta1=0.9,
-        beta2=0.99,
-        eps=1e-8,
-        momentum_decay=0.004,
-    )
+        dict(lr=0.05, beta1=0.9, beta2=0.99, eps=1e-8, momentum_decay=0.004),
+    ),
+)
 
 
-def test_truegrad_nadam_differs_from_base_when_observation_differs():
-    _assert_differs_from_base(
-        heavyball.truegrad_nadam,
-        heavyball.nadam,
-        lr=0.05,
-        beta1=0.9,
-        beta2=0.99,
-        eps=1e-8,
-        momentum_decay=0.004,
-    )
+@pytest.mark.parametrize(("truegrad_recipe", "base_recipe", "hyperparameters"), _CASES)
+def test_truegrad_variants_use_the_supplied_observation(truegrad_recipe, base_recipe, hyperparameters):
+    _assert_matches_base(truegrad_recipe, base_recipe, **hyperparameters)
+    _assert_differs_from_base(truegrad_recipe, base_recipe, **hyperparameters)

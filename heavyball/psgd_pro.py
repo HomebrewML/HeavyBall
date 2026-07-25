@@ -225,14 +225,6 @@ def _precondition_nfactor(update: Tensor, factors: list[Tensor]) -> Tensor:
     return preconditioned
 
 
-def _partial_contraction_nfactor(update: Tensor, index: int, triangular: bool) -> Tensor:
-    moved = update.movedim(index + 1, 1)
-    flat = moved.reshape(moved.shape[0], moved.shape[1], -1)
-    if triangular:
-        return torch.bmm(flat, flat.mT)
-    return flat.square().sum(dim=-1)
-
-
 def _refresh_nfactor(
     update: Tensor,
     factors: list[Tensor],
@@ -247,7 +239,9 @@ def _refresh_nfactor(
     next_lower_bounds = []
     for index, (factor, lower_bound) in enumerate(zip(factors, lower_bounds, strict=True)):
         triangular = factor.ndim == 3
-        covariance = _partial_contraction_nfactor(preconditioned, index, triangular)
+        moved = preconditioned.movedim(index + 1, 1)
+        flat = moved.reshape(moved.shape[0], moved.shape[1], -1)
+        covariance = torch.bmm(flat, flat.mT) if triangular else flat.square().sum(dim=-1)
         target_energy = update.numel() / (factor.shape[0] * factor.shape[-1])
         if triangular:
             factor, lower_bound = _update_factor(

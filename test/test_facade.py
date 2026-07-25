@@ -97,7 +97,6 @@ def test_facade_lr_scheduler():
         param.grad.fill_(1)
         optimizer.step()
         assert torch.equal(param, before - 0.125)
-    assert torch.equal(optimizer._engine.hyper.lr, torch.tensor(0.125))
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
 
 
@@ -147,7 +146,6 @@ def test_facade_state_dict_roundtrip():
     optimizer_b.load_state_dict(checkpoint)
     assert optimizer_b.param_groups[0]["lr"] == optimizer_a.param_groups[0]["lr"]
     assert optimizer_b.param_groups[0]["weight_decay"] == optimizer_a.param_groups[0]["weight_decay"]
-    assert torch.equal(optimizer_b._engine.hyper.lr, optimizer_a._engine.hyper.lr)
 
     for gradient in gradients[3:]:
         param_a.grad.copy_(gradient)
@@ -195,22 +193,26 @@ def test_soap_facade_matches_raw_recipe_at_defaults_for_matrix_param():
     assert torch.equal(initial - routed_param, initial - raw_param)
 
 
-def test_psgd_routes_mixed_matrix_and_vector_params_and_steps():
+def test_psgd_routes_mixed_matrix_and_vector_params():
     matrix = nn.Parameter(torch.eye(2))
     vector = nn.Parameter(torch.ones(3))
-    optimizer = heavyball.PSGD([matrix, vector], max_size_triangular=2)
-    groups = {tuple(group.params[0].shape): group for group in optimizer._engine.groups}
-
-    assert groups[(2, 2)].recipe is heavyball.kron
-    assert groups[(3,)].recipe is heavyball.psgd_nfactor
-    assert groups[(3,)].states[0]["Q_0"].ndim == 2  # slab axis plus a diagonal vector factor
-
-    matrix.grad.copy_(torch.tensor(((1.0, -0.5), (0.25, 2.0))))
-    vector.grad.copy_(torch.tensor((0.5, -1.0, 2.0)))
+    optimizer = heavyball.PSGD(
+        [matrix, vector],
+        lr=0.1,
+        max_size_triangular=2,
+        preconditioner_update_probability=0.0,
+        weight_decay=0.0,
+    )
+    matrix_gradient = torch.tensor(((1.0, -0.5), (0.25, 2.0)))
+    vector_gradient = torch.tensor((0.5, -1.0, 2.0))
+    matrix_before = matrix.detach().clone()
+    vector_before = vector.detach().clone()
+    matrix.grad.copy_(matrix_gradient)
+    vector.grad.copy_(vector_gradient)
     optimizer.step()
 
-    assert torch.isfinite(matrix).all()
-    assert torch.isfinite(vector).all()
+    torch.testing.assert_close(matrix, matrix_before - 0.1 * matrix_gradient)
+    torch.testing.assert_close(vector, vector_before - 0.1 * vector_gradient)
 
 
 @pytest.mark.parametrize(
@@ -252,6 +254,8 @@ def test_route_defaults_prefer_primary_branch():
         "primary_only": 1.0,
         "fallback_only": 2.0,
     }
-    for group in optimizer._engine.groups:
-        assert torch.equal(group.hyper.lr, torch.tensor(0.3))
-        assert torch.equal(group.hyper.weight_decay, torch.tensor(0.2))
+    matrix.grad.zero_()
+    vector.grad.zero_()
+    optimizer.step()
+    torch.testing.assert_close(matrix, torch.full_like(matrix, 0.94))
+    torch.testing.assert_close(vector, torch.full_like(vector, 0.94))

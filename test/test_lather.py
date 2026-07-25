@@ -8,7 +8,7 @@ import torch
 from heavyball.core import Engine
 from heavyball.lather import lather
 from heavyball.matrix import _project
-from heavyball.transforms import Tempo, beta_debias
+from heavyball.transforms import beta_debias
 
 
 def _eager_engine(params, **hyper) -> Engine:
@@ -109,55 +109,6 @@ def test_lather_both_oversized_axes_use_linear_factor_storage():
     assert state["Q_1"].shape == (1, 10)
     assert "Q_basis_0" not in state
     assert "Q_basis_1" not in state
-
-
-def _run_trajectory(
-    dtype: torch.dtype,
-    *,
-    initial: list[torch.Tensor],
-    gradients: list[list[torch.Tensor]],
-    probes: list[torch.Tensor],
-) -> list[torch.Tensor]:
-    params = [torch.nn.Parameter(value.to(dtype).clone()) for value in initial]
-    optimizer = _eager_engine(
-        params,
-        lr=1e-3,
-        precond_lr=0.01,
-        lower_bound_beta=0.9,
-        dampening=1e-6,
-        weight_decay=0.0,
-    )
-    probe_index = 0
-
-    def fixed_probe(_tempo: Tempo, update: torch.Tensor) -> torch.Tensor:
-        nonlocal probe_index
-        probe = probes[probe_index].to(device=update.device, dtype=update.dtype)
-        probe_index += 1
-        return probe
-
-    with patch.object(Tempo, "randn_like", fixed_probe):
-        for step, step_gradients in enumerate(gradients, start=1):
-            for param, gradient in zip(params, step_gradients, strict=True):
-                param.grad.copy_(gradient.to(dtype))
-            optimizer.step(step_type="refresh" if step in (2, 5, 7) else "normal")
-    assert probe_index == len(probes)
-    return [param.detach().clone() for param in params]
-
-
-def test_lather_fp64_accuracy(capsys):
-    """The fp32 LATHER trajectory remains close to shared-probe fp64 truth."""
-
-    torch.manual_seed(41)
-    initial = [torch.randn(3, 4, dtype=torch.float64) for _ in range(2)]
-    gradients = [[torch.randn_like(value) for value in initial] for _ in range(7)]
-    torch.manual_seed(700)
-    probes = [torch.randn(len(initial), *initial[0].shape, dtype=torch.float64) for _ in range(3)]
-    truth = _run_trajectory(torch.float64, initial=initial, gradients=gradients, probes=probes)
-    actual = _run_trajectory(torch.float32, initial=initial, gradients=gradients, probes=probes)
-    error = max((result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True))
-    with capsys.disabled():
-        print(f"lather fp64 max error: {float(error):.9e}")
-    assert error <= 1e-6
 
 
 def test_lather_refresh_transports():

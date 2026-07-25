@@ -79,20 +79,6 @@ def _slab_dtype(value: Tensor, storage_dtype: "torch.dtype | None") -> torch.dty
     return _narrowed_dtype(value.dtype, storage_dtype)
 
 
-def _ecc_dtype(ecc: int | str | None) -> torch.dtype | None:
-    values = {
-        8: torch.int8,
-        16: torch.int16,
-        "bf16+8": torch.int8,
-        "bf16+16": torch.int16,
-    }
-    if ecc is None:
-        return None
-    if type(ecc) not in (int, str) or ecc not in values:
-        raise ValueError('ecc must be None, 8, 16, "bf16+8", or "bf16+16"')
-    return values[ecc]
-
-
 @dataclass
 class RefreshCadence:
     """Host-side cumulative-probability refresh selector, matching legacy cadence."""
@@ -1441,9 +1427,6 @@ def _scalar(value, reference: Tensor) -> Tensor:
         raise ValueError("hyperparameters must be 0-d tensors or Python scalars")
     return scalar
 
-def _sum_squares(value: Tensor) -> Tensor:
-    return value.double().square().sum()
-
 
 @torch.no_grad()
 def produce(param: Tensor, name: str, value: Tensor) -> None:
@@ -1475,7 +1458,15 @@ class Engine:
                  param_group_hypers: Mapping[int, Mapping[str, object]] | None = None,
                  **overrides) -> None:
         self.recipe = recipe_or_route
-        correction_dtype = _ecc_dtype(ecc)
+        ecc_dtypes = {
+            8: torch.int8,
+            16: torch.int16,
+            "bf16+8": torch.int8,
+            "bf16+16": torch.int16,
+        }
+        if ecc is not None and (type(ecc) not in (int, str) or ecc not in ecc_dtypes):
+            raise ValueError('ecc must be None, 8, 16, "bf16+8", or "bf16+16"')
+        correction_dtype = None if ecc is None else ecc_dtypes[ecc]
         if isinstance(storage_dtype, str):
             storage_dtype = getattr(torch, storage_dtype.removeprefix("torch."), storage_dtype)
         if correction_dtype is not None and storage_dtype is not None and storage_dtype is not torch.bfloat16:
@@ -2247,9 +2238,9 @@ class Engine:
 
             if clip_norm is not None:
                 squared = [
-                    _sum_squares(torch.where(
+                    torch.where(
                         broadcast_leaf(live, update), update, torch.zeros_like(update)
-                    ))
+                    ).double().square().sum()
                     for _, _, update, _, _, _, _, _, _, _, _, _, live, *_ in pending
                 ]
                 total = squared[0]

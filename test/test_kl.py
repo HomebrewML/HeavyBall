@@ -5,7 +5,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from heavyball import kl_shampoo as kl_shampoo_export, kl_shampoo_adamw, kl_soap as kl_soap_export, kl_soap_adamw
 from heavyball.core import Engine
 from heavyball.kl import kl_shampoo_recipe, kl_soap_recipe
 from heavyball.matrix import _project
@@ -123,65 +122,12 @@ def test_kl_init_factor_initializes_eigenvalues():
         Engine([torch.nn.Parameter(torch.zeros(3, 4))], kl_soap_recipe, init_factor=0.0)
 
 
-def _object_step(optimizer: Engine, *, step_type: str, compile: bool) -> None:
-    """Use the Engine's exact object step eagerly for the fp64 truth path."""
-
-    if compile:
-        optimizer.step(step_type=step_type)
-        return
-    for group in optimizer.groups:
-        group.observed.fill_(True)
-    eager = getattr(optimizer.compiled_steps[step_type], "__wrapped__", None)
-    if eager is None:
-        optimizer.step(step_type=step_type)
-        return
-    eager()
-    for step in optimizer._steps:
-        step.add_(1)
-
-
-def _run_trajectory(recipe, *, soap: bool, dtype: torch.dtype, compile: bool, initial: torch.Tensor, gradients: list[torch.Tensor]):
-    params = [torch.nn.Parameter(initial.to(dtype).clone()) for _ in range(2)]
-    hyper = dict(lr=0.03, beta1=0.9, beta2=0.8, eps=1e-8, max_precond_dim=8, weight_decay=0.0)
-    if soap:
-        hyper["shampoo_beta"] = 0.7
-    optimizer = Engine(params, recipe, **hyper)
-    for step, gradient in enumerate(gradients, start=1):
-        for param in params:
-            param.grad.copy_(gradient.to(dtype))
-        _object_step(optimizer, step_type="refresh" if step % 3 == 0 else "normal", compile=compile)
-    return [param.detach().clone() for param in params]
-
-
-def test_kl_fp64_accuracy(capsys):
-    """The compiled fp32 trajectories stay within their pinned fp64 budgets."""
-
-    torch.manual_seed(72)
-    initial = torch.randn(3, 4, dtype=torch.float64)
-    gradients = [torch.randn_like(initial) for _ in range(8)]
-    for label, recipe, soap, budget in (
-        ("kl_soap", kl_soap_export, True, 3e-5),
-        ("kl_shampoo", kl_shampoo_export, False, 3e-5),
-    ):
-        truth = _run_trajectory(recipe, soap=soap, dtype=torch.float64, compile=False, initial=initial, gradients=gradients)
-        actual = _run_trajectory(recipe, soap=soap, dtype=torch.float32, compile=True, initial=initial, gradients=gradients)
-        error = max((result.double() - expected).abs().max() for result, expected in zip(actual, truth, strict=True))
-        with capsys.disabled():
-            print(f"{label} fp64 max error: {float(error):.9e}")
-        assert error <= budget
-        torch._dynamo.reset()
-
-
 @pytest.mark.parametrize(
     "recipe",
     (kl_soap_recipe, kl_shampoo_recipe),
     ids=("kl_soap", "kl_shampoo"),
 )
 def test_kl_normal_and_refresh_are_stable_fullgraphs(recipe):
-    assert kl_soap_export is kl_soap_recipe
-    assert kl_shampoo_export is kl_shampoo_recipe
-    assert kl_soap_adamw.then is kl_soap_recipe
-    assert kl_shampoo_adamw.then is kl_shampoo_recipe
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
     try:

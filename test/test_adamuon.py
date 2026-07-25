@@ -6,31 +6,40 @@ SGD commit.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from heavyball import adamuon
-from heavyball.transforms import (
-    Tempo,
-    adamuon_rmsprop,
-    momentum,
-    orthogonalize,
-    rms_align,
-    sgd_commit,
-    sign,
-)
+import heavyball
+from heavyball.transforms import Tempo, adamuon_rmsprop
 
 
-def test_adamuon_is_sign_stabilized_raw_rmsprop_then_rms_aligned():
-    matrix = adamuon.then
-    assert matrix.chain == (
-        momentum,
-        sign,
-        orthogonalize,
-        adamuon_rmsprop,
-        rms_align,
+def test_adamuon_first_update_depends_only_on_gradient_sign():
+    gradient = torch.tensor(
+        ((1.0, -2.0, 3.0), (-4.0, 5.0, -6.0), (7.0, -8.0, 9.0)),
+        dtype=torch.float64,
     )
-    assert matrix.commit is sgd_commit
+    rescaled = gradient * torch.tensor(
+        ((9.0, 0.5, 3.0), (0.25, 7.0, 2.0), (4.0, 0.75, 6.0)),
+        dtype=torch.float64,
+    )
+    parameters = [
+        torch.nn.Parameter(torch.zeros_like(gradient)),
+        torch.nn.Parameter(torch.zeros_like(gradient)),
+    ]
+    with patch("heavyball.core.torch.compile", lambda function, **kwargs: function):
+        optimizers = [
+            heavyball.AdaMuon([parameter], lr=0.1, weight_decay=0.0)
+            for parameter in parameters
+        ]
+
+    for parameter, optimizer, value in zip(
+        parameters, optimizers, (gradient, rescaled), strict=True
+    ):
+        parameter.grad.copy_(value)
+        optimizer.step()
+
+    torch.testing.assert_close(parameters[0], parameters[1], rtol=0, atol=0)
 
 
 def test_adamuon_second_moment_uses_raw_beta_and_additive_epsilon():
@@ -57,4 +66,3 @@ def test_adamuon_second_moment_uses_raw_beta_and_additive_epsilon():
     variance = beta1 * previous.square() + (1 - beta1) * update.square()
     torch.testing.assert_close(state["exp_avg_sq"].square(), variance)
     torch.testing.assert_close(output, update / (variance.sqrt() + epsilon))
-
