@@ -562,7 +562,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     assert G.ndim >= 2
     assert steps == 5
-    G = G / G.norm(dim=(-2, -1)).clamp(min=eps)  # free if fused with casting
+    G = G / G.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)  # free if fused with casting
     x = G if G.dtype == torch.float64 else stochastic_round_(G)
     if G.size(-2) > G.size(-1):
         x = x.mT
@@ -620,7 +620,7 @@ def msign(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
     assert G.ndim >= 2
     should_transpose: bool = G.size(-2) > G.size(-1)
 
-    G = G / G.norm(dim=(-2, -1)).clamp(min=eps)  # free if fused with casting
+    G = G / G.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)  # free if fused with casting
     x = G if G.dtype == torch.float64 else stochastic_round_(G)
     if should_transpose:
         x = x.mT

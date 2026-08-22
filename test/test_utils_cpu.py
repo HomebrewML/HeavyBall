@@ -25,6 +25,7 @@ from heavyball.utils import (
     line_to_triu,
     mars_correction,
     merge_group,
+    msign,
     orthogonalize_grad_to_param,
     precond_update_prob_schedule,
     psgd_should_update,
@@ -35,6 +36,7 @@ from heavyball.utils import (
     stochastic_multiply_,
     triu_to_line,
     warn_once,
+    zeropower_via_newtonschulz5,
 )
 
 # Ensure Torch dynamo stays disabled on CI runners without GPU support.
@@ -388,3 +390,34 @@ def test_cautious_weight_decay_false_matches_standard():
     for pa, pb in zip(a.parameters(), b.parameters()):
         assert torch.equal(pa, pb)
     assert len(opt_a.fns) == len(opt_b.fns)
+
+
+ORTHOGONALIZERS = [zeropower_via_newtonschulz5, msign]
+
+
+@pytest.mark.parametrize("fn", ORTHOGONALIZERS)
+@pytest.mark.parametrize("shape", [(4, 8, 6), (3, 6, 6), (2, 5, 9)])
+def test_batched_orthogonalization_matches_per_matrix(fn, shape):
+    torch.manual_seed(0)
+    g = torch.randn(*shape, dtype=torch.float64)
+    looped = torch.stack([fn(g[i].clone()) for i in range(shape[0])])
+    torch.testing.assert_close(fn(g.clone()), looped, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("fn", ORTHOGONALIZERS)
+def test_batched_orthogonalization_with_batch_matching_last_dim(fn):
+    # A batch count equal to the trailing dimension broadcasts without
+    # raising, so this is the shape that misnormalizes silently.
+    torch.manual_seed(0)
+    g = torch.randn(6, 8, 6, dtype=torch.float64)
+    g[0] *= 100.0  # keep a shared normalizer from coinciding with the right one
+    looped = torch.stack([fn(g[i].clone()) for i in range(6)])
+    torch.testing.assert_close(fn(g.clone()), looped, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("fn", ORTHOGONALIZERS)
+def test_unbatched_orthogonalization_pushes_singular_values_to_one(fn):
+    torch.manual_seed(0)
+    g = torch.randn(8, 6, dtype=torch.float64)
+    sv = torch.linalg.svdvals(fn(g.clone()))
+    assert sv.max() < 1.5 and sv.min() > 0.4
