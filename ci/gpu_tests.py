@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import sys
@@ -87,7 +86,7 @@ if ! command -v g++ &>/dev/null; then apt-get update -qq && apt-get install -y -
 cd / && git clone --depth 1 -b "$HB_BRANCH" "$HB_REPO" /w &&
 cd /w && pip install -e LightBench -q --break-system-packages 2>&1 &&
 pip install -e ".[dev]" -q --break-system-packages 2>&1 &&
-python -m pytest "$HB_TEST" --tb=short -q 2>&1; echo HEAVYBALL_EXIT=$?
+bash -c "$HB_CMD" 2>&1; echo HEAVYBALL_EXIT=$?
 '
 sleep 3
 curl -s -X PUT "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" \\
@@ -98,7 +97,7 @@ kill 1 2>/dev/null || true
 """
 
 
-def create_instance(offer_id, test_file):
+def create_instance(offer_id, lane, command):
     payload = {
         "client_id": "me",
         "image": IMAGE,
@@ -107,7 +106,7 @@ def create_instance(offer_id, test_file):
         "env": {
             "HB_BRANCH": BRANCH,
             "HB_REPO": REPO_URL,
-            "HB_TEST": test_file,
+            "HB_CMD": command,
         },
         "runtype": "ssh_direc ssh_proxy",
     }
@@ -116,7 +115,7 @@ def create_instance(offer_id, test_file):
     if not rj.get("success"):
         return None
     instance_id = rj["new_contract"]
-    print(f"  Created instance {instance_id} for {test_file} on offer {offer_id}")
+    print(f"  Created instance {instance_id} for {lane} on offer {offer_id}")
     return instance_id
 
 
@@ -217,35 +216,38 @@ def _error_result(test_file, log=""):
     return {"file": test_file, "status": "error", "exit_code": -1, "duration": 0, "log": log}
 
 
-def _try_recycle(test_file, spare_offers, instance_map, created_at, pending):
+def _try_recycle(lane, lane_command, spare_offers, instance_map, created_at, pending):
     while spare_offers:
         offer = spare_offers.pop(0)
         try:
-            new_iid = create_instance(offer["id"], test_file)
+            new_iid = create_instance(offer["id"], lane, lane_command)
         except Exception:
             continue
         if new_iid:
-            instance_map[new_iid] = test_file
+            instance_map[new_iid] = lane
             created_at[new_iid] = time.time()
             pending.add(new_iid)
             return True
     return False
 
 
-def _recycle_or_fail(iid, test_file, reason, retries, spare_offers, instance_map, created_at, pending, results):
+def _recycle_or_fail(iid, reason, retries, spare_offers, lane_commands, instance_map, created_at, pending, results):
+    lane = instance_map[iid]
     pending.discard(iid)
     destroy(iid)
-    retries[test_file] = retries.get(test_file, 0) + 1
-    attempt = retries[test_file]
-    if attempt <= MAX_RETRIES and _try_recycle(test_file, spare_offers, instance_map, created_at, pending):
-        _log("!", test_file, f"{reason}, retry {attempt}/{MAX_RETRIES}")
+    retries[lane] = retries.get(lane, 0) + 1
+    attempt = retries[lane]
+    if attempt <= MAX_RETRIES and _try_recycle(
+        lane, lane_commands[lane], spare_offers, instance_map, created_at, pending
+    ):
+        _log("!", lane, f"{reason}, retry {attempt}/{MAX_RETRIES}")
     else:
         give_up = "max retries" if attempt > MAX_RETRIES else "no spare offers"
-        results[iid] = _error_result(test_file, reason)
-        _log("!", test_file, f"{reason}, {give_up}")
+        results[iid] = _error_result(lane, reason)
+        _log("!", lane, f"{reason}, {give_up}")
 
 
-def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
+def wait_and_collect(instance_map, lane_commands, spare_offers, timeout=TIMEOUT):
     results = {}
     pending = set(instance_map.keys())
     total = len(instance_map)
@@ -280,9 +282,9 @@ def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
                 to_fetch[iid] = (inst, False)
                 stuck_candidates.add(iid)
 
-        ctx = (retries, spare_offers, instance_map, created_at, pending, results)
+        ctx = (retries, spare_offers, lane_commands, instance_map, created_at, pending, results)
         for iid, reason in to_recycle:
-            _recycle_or_fail(iid, instance_map[iid], reason, *ctx)
+            _recycle_or_fail(iid, reason, *ctx)
 
         logs = {}
         threads = [threading.Thread(target=lambda i=iid: logs.__setitem__(i, get_logs(i))) for iid in to_fetch]
@@ -302,7 +304,7 @@ def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
                 _log(_ICONS[result["status"]], instance_map[iid], f"{result['status']} ({result['duration']}s)")
             elif iid in stuck_candidates and not log.strip():
                 age = int(time.time() - created_at[iid])
-                _recycle_or_fail(iid, instance_map[iid], f"no logs after {age}s", *ctx)
+                _recycle_or_fail(iid, f"no logs after {age}s", *ctx)
 
         _print_progress(results, total)
 
@@ -321,43 +323,57 @@ def wait_and_collect(instance_map, spare_offers, timeout=TIMEOUT):
     return list(results.values())
 
 
+def _build_lanes():
+    """The matrix is the test suite: every accuracy and speed claim lives there.
+    The lane provisions its pinned upstream oracles first (references/ is
+    untracked), then samples cells single-GPU -- distributed tiers run on
+    release boxes, not on 1-GPU offers."""
+    return {
+        "benchmarks/matrix.py": (
+            "python benchmarks/matrix.py ensure-references && "
+            "python benchmarks/matrix.py sample --count 8 --seed 42 --max-world 1 "
+            "--fresh-processes 1 --timeout 600 --measure /root/matrix.jsonl && "
+            "python benchmarks/matrix.py report --measure /root/matrix.jsonl"
+        )
+    }
+
+
 def main():
     if not API_KEY:
         print("Set VASTAI_API_KEY or VAST_AI_API_KEY", file=sys.stderr)
         sys.exit(1)
-    test_files = sorted(glob.glob("test/test_*.py"))
-    if not test_files:
-        print("No test files found", file=sys.stderr)
-        sys.exit(1)
-    print(f"Found {len(test_files)} test files")
+    lanes = _build_lanes()
+    lane_names = list(lanes)
+    print(f"Found {len(lane_names)} lanes")
 
-    all_offers = find_offers(len(test_files))
-    offers = all_offers[: len(test_files)]
-    spare_offers = list(all_offers[len(test_files) :])
-    if len(offers) < len(test_files):
-        print(f"Warning: only {len(offers)} offers for {len(test_files)} tests, some skipped")
-        test_files = test_files[: len(offers)]
+    all_offers = find_offers(len(lane_names))
+    offers = all_offers[: len(lane_names)]
+    spare_offers = list(all_offers[len(lane_names) :])
+    if len(offers) < len(lane_names):
+        print(f"Warning: only {len(offers)} offers for {len(lane_names)} lanes, some skipped")
+        lane_names = lane_names[: len(offers)]
     print(f"{len(offers)} primary, {len(spare_offers)} spare offers")
 
     instance_map = {}
     try:
-        for test_file, offer in zip(test_files, offers):
+        for lane in lane_names:
+            offer = offers[lane_names.index(lane)]
             try:
-                iid = create_instance(offer["id"], test_file)
+                iid = create_instance(offer["id"], lane, lanes[lane])
             except Exception as e:
-                print(f"  Failed to create for {test_file}: {e}")
+                print(f"  Failed to create for {lane}: {e}")
                 continue
             if iid:
-                instance_map[iid] = test_file
+                instance_map[iid] = lane
             else:
-                print(f"  Failed to create for {test_file}")
+                print(f"  Failed to create for {lane}")
 
         if not instance_map:
             print("No instances created", file=sys.stderr)
             sys.exit(1)
 
         print(f"\nWaiting for {len(instance_map)} instances (timeout={TIMEOUT}s)...")
-        results = wait_and_collect(instance_map, spare_offers)
+        results = wait_and_collect(instance_map, lanes, spare_offers)
     finally:
         print("\nCleaning up...")
         destroy_all(instance_map)

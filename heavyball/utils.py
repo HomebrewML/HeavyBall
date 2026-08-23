@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 from torch._dynamo.exc import TorchDynamoException
 from torch.backends import cudnn, opt_einsum
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn import functional as F
 from torch.utils._pytree import tree_map
 
@@ -417,7 +418,7 @@ def _nadam_compute_update(
 
 
 def eps_sqrt(item, eps):
-    return item.sqrt().clamp(min=eps)
+    return item.clamp_min(0).sqrt().clamp(min=eps)
 
 
 @decorator_knowngood
@@ -501,6 +502,25 @@ def is_compiling():
 
 def set_(dst: Tensor, src: Tensor):
     dst.copy_(src)
+
+
+def _copy_full_to_local(target: DTensor, source: Tensor) -> DTensor:
+    """Write into existing shard storage without constructing a DTensor inside the compiled graph."""
+    local = source
+    coordinate = target.device_mesh.get_coordinate()
+    if coordinate is None:
+        raise RuntimeError("the current rank is not part of the DTensor device mesh")
+    for mesh_dim, placement in enumerate(target.placements):
+        if isinstance(placement, Replicate):
+            continue
+        if not isinstance(placement, Shard):
+            raise TypeError(f"unsupported DTensor placement for optimizer writeback: {placement}")
+        size = local.shape[placement.dim]
+        chunk = -(-size // target.device_mesh.size(mesh_dim))
+        start = min(coordinate[mesh_dim] * chunk, size)
+        local = local.narrow(placement.dim, start, min(chunk, size - start))
+    target._local_tensor.copy_(local)
+    return target
 
 
 def capture_param_shapes(params):
@@ -836,9 +856,14 @@ def _compilable_scatter_set(target, source, index):
     target[:] = source.contiguous()[index].reshape_as(target)
 
 
-@decorator_no_fullgraph
+@decorator_knowngood
 def get_orthogonal_matrix_QR(
-    GG: List[Tensor], Q: List[Tensor], *exp_avg: Tensor, exp_avg_sq: Tensor = None, heavy: bool = False
+    GG: List[Tensor],
+    Q: List[Tensor],
+    *exp_avg: Tensor,
+    exp_avg_sq: Tensor = None,
+    heavy: bool = False,
+    floor: float = 1e-8,
 ):
     if isinstance(Q, list) and not Q:
         return
@@ -857,18 +882,27 @@ def get_orthogonal_matrix_QR(
             new_qs.append(None)
             continue
         m = promote(m.data)
-        if heavy:
-            oriented = inplace_orthogonal_(m @ promote(q.data), precise_zeroth_power_mode)
-            eig = compiled_einsum("...ij,...ij->...j", oriented, m @ oriented)
-            idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(oriented)
-            new_qs.append(oriented.gather(-1, idx))
-            continue
         q_old = promote(q.data)
-        tmp = m @ q_old
-        eig = compiled_einsum("...ij,...ij->...j", q_old, tmp)
-        idx = torch.argsort(eig, descending=True).unsqueeze(-2).expand_as(tmp)
-        tmp.scatter_(-1, idx, inplace_orthogonal_(tmp.gather(-1, idx), precise_zeroth_power_mode))
-        new_qs.append(tmp)
+        gram_basis = m @ q_old
+        eig = compiled_einsum("...ij,...ij->...j", q_old, gram_basis)
+        magnitude = eig.abs().amax(dim=-1, keepdim=True).clamp_min(torch.finfo(m.dtype).tiny)
+        # A rank-deficient Gram makes QR's completion depend on rounding noise.
+        # Lift its null space by the algorithm floor or a wide representation-
+        # noise margin, whichever is larger; cap that margin so coarse dtypes
+        # do not freeze the basis.
+        noise = min(64 * m.shape[-1] * torch.finfo(m.dtype).eps, 0.125)
+        lift = torch.maximum(
+            torch.as_tensor(floor, dtype=m.dtype, device=m.device),
+            torch.as_tensor(noise, dtype=m.dtype, device=m.device),
+        )
+        work = gram_basis + (lift * magnitude).unsqueeze(-1) * q_old
+        order = torch.argsort(eig, descending=True)
+        index = order.unsqueeze(-2).expand_as(work)
+        orthogonal, triangular = torch.linalg.qr(work.gather(-1, index))
+        signs = triangular.diagonal(dim1=-2, dim2=-1).sign()
+        signs = torch.where(signs != 0, signs, torch.ones_like(signs))
+        orthogonal = orthogonal * signs.unsqueeze(-2)
+        new_qs.append(work.scatter(-1, index, orthogonal))
 
     if ref is None:
         for q, q_new in zip(Q, new_qs):
@@ -1377,6 +1411,7 @@ def init_preconditioner(grad, state, max_precond_dim, precondition_1d, init_fact
     to avoid the rank-1 explosion: 1/sqrt(eps) along null directions). Otherwise, seeds with one
     outer product of grad (standard SOAP behavior).
     """
+    grad = promote(grad)
     state["GG"] = []  # Will hold all the preconditioner matrices (L and R in the paper).
     if grad.numel() > 1 and (grad.ndim > 2 or precondition_1d):
         n = grad.shape[0]
@@ -1483,6 +1518,8 @@ use_default = object()
 
 
 def _tensor_key(x: Tensor):
+    if isinstance(x, DTensor):
+        return "dtensor", id(x)
     return x.data_ptr(), x.numel(), x.dtype, x.device
 
 
@@ -3202,6 +3239,7 @@ def _householder_vec_e1_to_v(v: Tensor, eps: float = 1e-12) -> Tensor:
     Applying from the right: G @ H = G - 2 (G @ w) w^T.
     If v is (numerically) e1, returns w=0 and H=I.
     """
+    v = promote(v)
     v = v / v.norm().clamp(min=eps)
     e1 = torch.zeros_like(v)
     e1[0] = 1.0
@@ -3227,8 +3265,12 @@ def eigvecs_product_rank1(
           Y has shape (..., d) and equals G @ eigenvectors(P),
           w is the Householder vector you can cache & reuse.
     """
+    G = promote(G)
+    v = promote(v)
     if w is None:
         w = _householder_vec_e1_to_v(v, eps)
+    else:
+        w = promote(w)
     Y = G - 2.0 * compiled_einsum("...i,i,j->...j", G, w, w)
     return Y, w
 
@@ -3239,6 +3281,7 @@ def oja_update(v: Tensor, g: Tensor, lr: float = 1e-2, eps: float = 1e-12) -> Te
     One Oja step to track the top eigendirection of the gradient covariance.
     v <- v + lr * ((g^T v) g - (g^T v)^2 v); then renormalize.
     """
+    v, g = promote(v), promote(g)
     gv = g @ v
     v = v + lr * (gv * g - (gv * gv) * v)
     return v / v.norm().clamp(min=eps)
@@ -3540,9 +3583,11 @@ def precond_grad_cached_(
     if caution:
         ea = _compilable_cautioning(grad, ea)
     args = [promote(q) for q in cached_q]
-    args = args + [promote(ea)]
+    output_dtype = ea.dtype
+    compute_dtype = args[0].dtype if args else promote(ea).dtype
+    args = [value.to(compute_dtype) for value in args] + [promote(ea).to(compute_dtype)]
     expr = cached_precond_grad_expr(ndim_tuple(cached_q), ea.ndim)
-    return compiled_einsum(expr, *args)
+    return compiled_einsum(expr, *args).to(output_dtype)
 
 
 TriuOrLine = Union[List[Tensor], List[Tuple[Optional[List[int]], Tensor]]]
@@ -3591,10 +3636,14 @@ def psgd_precond_grad(
     if store_triu_as_line:
         preconds = line_to_triu(preconds)
     args = [promote(q) for q in preconds]
+    output_dtype = ea.dtype
+    compute_dtype = args[0].dtype if args else promote(ea).dtype
+    args = [value.to(compute_dtype) for value in args]
+    ea_compute = promote(ea).to(compute_dtype)
     if sqrt:
-        return compiled_einsum(cached_precond_grad_expr(ndim_tuple(args), ea.ndim), *args, promote(ea))
+        return compiled_einsum(cached_precond_grad_expr(ndim_tuple(args), ea.ndim), *args, ea_compute).to(output_dtype)
     expr = precond_grad_expr(ndim_tuple(args), ea.ndim)
-    return compiled_einsum(expr, *[a for a in args for _ in (0, 1)], promote(ea))
+    return compiled_einsum(expr, *[a for a in args for _ in (0, 1)], ea_compute).to(output_dtype)
 
 
 @decorator_knowngood

@@ -441,6 +441,34 @@ class SqueezeGrad(FunctionTransform):
         return [o.view(s) for o, s in zip(out, original_shapes)]
 
 
+def _full_tensor(value):
+    if isinstance(value, utils.DTensor):
+        full = value.full_tensor()
+        ecc = getattr(value, "_ecc", None)
+        if ecc is not None:
+            correction = ecc.correction.full_tensor() if isinstance(ecc.correction, utils.DTensor) else ecc.correction
+            full._ecc = utils._ULPState(correction, ecc.smax)
+        return full
+    if isinstance(value, list):
+        return [_full_tensor(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_full_tensor(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _full_tensor(item) for key, item in value.items()}
+    return value
+
+
+def _write_full_tensor(target, source):
+    if not isinstance(target, utils.DTensor):
+        return source
+    output = target if target.dtype == source.dtype else torch.empty_like(target, dtype=source.dtype)
+    utils._copy_full_to_local(output, source)
+    target_ecc, source_ecc = getattr(target, "_ecc", None), getattr(source, "_ecc", None)
+    if target_ecc is not None and source_ecc is not None and isinstance(target_ecc.correction, utils.DTensor):
+        utils._copy_full_to_local(target_ecc.correction, source_ecc.correction)
+    return output
+
+
 class TagGuard(FunctionTransform):
     def __init__(self, fn, **tags):
         super().__init__(fn)
@@ -451,7 +479,22 @@ class TagGuard(FunctionTransform):
         pass
 
     def _call(self, state, group, update, grad, param, vars, *args, **kwargs):
-        return self.fn(state, group, update, grad, param, *args, **kwargs)
+        if not getattr(self, "needs_full_param", False) or not any(
+            isinstance(value, utils.DTensor) for value in (*update, *grad, *param)
+        ):
+            return self.fn(state, group, update, grad, param, *args, **kwargs)
+
+        full_update = _full_tensor(update)
+        full_grad = _full_tensor(grad)
+        full_param = _full_tensor(param)
+        result = self.fn(state, group, full_update, full_grad, full_param, *args, **kwargs)
+        if result is _SKIP:
+            for target, source in zip((*param, *update), (*full_param, *full_update), strict=True):
+                _write_full_tensor(target, source)
+            return _SKIP
+        if result is None:
+            return None
+        return [_write_full_tensor(target, source) for target, source in zip(update, result, strict=True)]
 
 
 def _stack_value(vals):
@@ -1252,7 +1295,7 @@ def _apply_soap_preconditioner(
         else:
             utils.update_ggt(g, gg, max_dim, p1d, beta)
         if group["is_preconditioning"]:
-            utils.get_orthogonal_matrix_QR(gg, q, *ref, exp_avg_sq=ea_sq if heavy else None, heavy=heavy)
+            utils.get_orthogonal_matrix_QR(gg, q, *ref, exp_avg_sq=ea_sq if heavy else None, heavy=heavy, floor=eps)
 
 
 @needs_full_param
@@ -2573,13 +2616,7 @@ class ChainOpt(utils.StatefulOptimizer):
         return not ids.issubset(all_initialized)
 
     def _needs_eager(self, group, state):
-        if self._needs_init(state):
-            return True
-        if group.get("is_preconditioning", False):
-            return True
-        if group.get("ecc") or group.get("param_ecc"):
-            return True
-        return False
+        return self._needs_init(state)
 
     def _chain(self, group, g, p, caution):
         state = [self.state_(pi) for pi in p]
